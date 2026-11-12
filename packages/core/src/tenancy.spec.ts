@@ -141,8 +141,11 @@ describe('tenancy on: stamping', () => {
     const { engine, store } = setup({ tenancy: fakeTenancy() });
     engine.register('wf', '1', async () => 'ok');
     await asTenant('acme', () => startRun(engine, 'wf', {}, 'ctx'));
-    await asTenant('acme', () => startRun(engine, 'wf', {}, 'explicit', { tenantId: 'globex' }));
-    await asTenant('acme', () => startRun(engine, 'wf', {}, 'none', { tenantId: null }));
+    // A start for another tenant (or none) is not the caller's to wait on: wait outside the request.
+    await asTenant('acme', () => engine.start('wf', {}, 'explicit', { tenantId: 'globex' }));
+    await asTenant('acme', () => engine.start('wf', {}, 'none', { tenantId: null }));
+    await engine.waitForRun('explicit');
+    await engine.waitForRun('none');
     await tenantless(() => startRun(engine, 'wf', {}, 'orgless'));
     await startRun(engine, 'wf', {}, 'system');
     expect(await store.getRun('ctx')).toMatchObject({
@@ -378,5 +381,161 @@ describe('tenancy on: app-facing reads and control apply the matching rule', () 
     const { engine, store } = await seeded();
     const retried = await asTenant('acme', () => engine.retryWithInput('a', {}));
     expect((await store.getRun(retried?.runId as string))?.tenantId).toBe('acme');
+  });
+});
+
+describe('tenancy on: waiting and lookups learn nothing about another tenant', () => {
+  async function seeded() {
+    const env = setup({ tenancy: fakeTenancy() });
+    env.engine.register('done', '1', async () => ({ secret: 'acme-output' }));
+    env.engine.register('wf', '1', async (ctx) => ctx.waitForSignal(`go:${ctx.runId}`));
+    await asTenant('acme', () => startRun(env.engine, 'done', {}, 'a'));
+    return env;
+  }
+
+  it("waitForRun rejects 'not found' for another tenant's run, and resolves for its own", async () => {
+    const { engine } = await seeded();
+    await expect(asTenant('globex', () => engine.waitForRun('a'))).rejects.toThrow(
+      'run a not found',
+    );
+    await expect(tenantless(() => engine.waitForRun('a'))).rejects.toThrow('run a not found');
+    expect(await asTenant('acme', () => engine.waitForRun('a'))).toMatchObject({
+      status: 'completed',
+      output: { secret: 'acme-output' },
+    });
+    expect((await allTenants(() => engine.waitForRun('a'))).status).toBe('completed');
+  });
+
+  it('waitForRun keeps waiting for a missing run, then rejects if another tenant creates it', async () => {
+    const { engine } = await seeded();
+    const own = asTenant('acme', () => engine.waitForRun('later-own', { timeoutMs: 2_000 }));
+    const foreign = asTenant('globex', () =>
+      engine.waitForRun('later-foreign', { timeoutMs: 2_000 }),
+    );
+    const foreignOutcome = foreign.then(
+      () => 'resolved',
+      (error: Error) => error.message,
+    );
+    await asTenant('acme', () => engine.start('done', {}, 'later-own'));
+    await asTenant('acme', () => engine.start('done', {}, 'later-foreign'));
+    expect((await own).output).toEqual({ secret: 'acme-output' });
+    expect(await foreignOutcome).toBe('run later-foreign not found');
+  });
+
+  it('start with the id of an existing run of another tenant returns no output or error', async () => {
+    const { engine } = await seeded();
+    const result = await asTenant('globex', () => engine.start('done', {}, 'a'));
+    expect(result).toEqual({ runId: 'a', status: 'completed' });
+    expect((await asTenant('acme', () => engine.start('done', {}, 'a'))).output).toEqual({
+      secret: 'acme-output',
+    });
+  });
+
+  it('getRunChildren and triggeredRuns are empty for a parent the caller may not see', async () => {
+    const { engine, store } = setup({ tenancy: fakeTenancy() });
+    engine.register('child', '1', async () => 2);
+    engine.register('parent', '1', async (ctx) => ctx.child('child', {}));
+    await asTenant('acme', () => startRun(engine, 'parent', {}, 'p1'));
+    await poll(async () => (await store.getRun('p1'))?.status === 'completed');
+    await store.updateRun('p1', { tags: ['durable:triggered:sub'] });
+    expect(await asTenant('acme', () => engine.getRunChildren('p1'))).toHaveLength(1);
+    expect(await asTenant('acme', () => engine.triggeredRuns('p1'))).toHaveLength(1);
+    expect(await asTenant('globex', () => engine.getRunChildren('p1'))).toEqual([]);
+    expect(await asTenant('globex', () => engine.triggeredRuns('p1'))).toEqual([]);
+    const run = (await store.getRun('p1')) as WorkflowRun;
+    expect(await tenantless(() => engine.triggeredRuns(run))).toEqual([]);
+    // Deleting the parent still removes its whole subtree.
+    expect(await asTenant('acme', () => engine.deleteRun('p1'))).toBe(2);
+  });
+});
+
+describe('tenancy on: named events are per tenant', () => {
+  async function waiting(nullRows?: 'shared') {
+    const env = setup({ tenancy: fakeTenancy(nullRows ? { nullRows } : {}) });
+    env.engine.register('listener', '1', async (ctx) => ctx.waitForEvent('price', {}));
+    await asTenant('acme', () => startRun(env.engine, 'listener', {}, 'a'));
+    await asTenant('globex', () => startRun(env.engine, 'listener', {}, 'g'));
+    await tenantless(() => startRun(env.engine, 'listener', {}, 'n'));
+    return env;
+  }
+  const settled = async (store: InMemoryStateStore) =>
+    (
+      await Promise.all(
+        ['a', 'g', 'n'].map(async (id) => {
+          const run = await store.getRun(id);
+          return run?.status === 'completed' ? `${id}=${JSON.stringify(run.output)}` : undefined;
+        }),
+      )
+    ).filter(Boolean);
+
+  it("a tenant's publish resumes only its own waiters", async () => {
+    const { engine, store } = await waiting();
+    expect(await asTenant('acme', () => engine.publishEvent('price', 1))).toBe(1);
+    await poll(async () => (await settled(store)).length === 1);
+    expect(await settled(store)).toEqual(['a=1']);
+  });
+
+  it('a tenantless publish resumes only runs with no tenant', async () => {
+    const { engine, store } = await waiting();
+    expect(await tenantless(() => engine.publishEvent('price', 2))).toBe(1);
+    await poll(async () => (await settled(store)).length === 1);
+    expect(await settled(store)).toEqual(['n=2']);
+  });
+
+  it("nullRows: 'shared' lets a tenant's publish also reach runs with no tenant", async () => {
+    const { engine, store } = await waiting('shared');
+    expect(await asTenant('acme', () => engine.publishEvent('price', 3))).toBe(2);
+    await poll(async () => (await settled(store)).length === 2);
+    expect(await settled(store)).toEqual(['a=3', 'n=3']);
+  });
+
+  it('an all-tenants or system publish stays global', async () => {
+    const { engine, store } = await waiting();
+    expect(await allTenants(() => engine.publishEvent('price', 4))).toBe(3);
+    await poll(async () => (await settled(store)).length === 3);
+    const other = await waiting();
+    expect(await other.engine.publishEvent('price', 5)).toBe(3);
+    await poll(async () => (await settled(other.store)).length === 3);
+  });
+
+  it("a buffered event is consumed only by a run its publisher's tenant may see", async () => {
+    const { engine, store } = setup({ tenancy: fakeTenancy() });
+    engine.register('listener', '1', async (ctx) => ctx.waitForEvent('price', {}));
+    expect(await asTenant('acme', () => engine.publishEvent('price', 7))).toBe(0); // buffered
+    await asTenant('globex', () => startRun(engine, 'listener', {}, 'g'));
+    await tenantless(() => startRun(engine, 'listener', {}, 'n'));
+    expect((await store.getRun('g'))?.status).toBe('suspended');
+    expect((await store.getRun('n'))?.status).toBe('suspended');
+    await asTenant('acme', () => startRun(engine, 'listener', {}, 'a'));
+    const a = (await store.getRun('a')) as WorkflowRun;
+    expect([a.status, a.output]).toEqual(['completed', 7]);
+    expect(await store.listBufferedEvents('price', 10)).toEqual([]);
+  });
+
+  it('a tenant publish with no visible waiter buffers instead of waking another tenant', async () => {
+    const { engine, store } = setup({ tenancy: fakeTenancy() });
+    engine.register('listener', '1', async (ctx) => ctx.waitForEvent('price', {}));
+    await asTenant('globex', () => startRun(engine, 'listener', {}, 'g'));
+    expect(await asTenant('acme', () => engine.publishEvent('price', 8))).toBe(0);
+    expect((await store.getRun('g'))?.status).toBe('suspended');
+    expect(await store.listBufferedEvents('price', 10)).toHaveLength(1);
+    // globex's own publish reaches it.
+    expect(await asTenant('globex', () => engine.publishEvent('price', 9))).toBe(1);
+    await poll(async () => (await store.getRun('g'))?.status === 'completed');
+    expect((await store.getRun('g'))?.output).toBe(9);
+  });
+});
+
+describe('tenancy off: named events', () => {
+  it('fan out to every waiter and buffer the payload as is', async () => {
+    const { engine, store } = setup();
+    engine.register('listener', '1', async (ctx) => ctx.waitForEvent('price', {}));
+    await asTenant('acme', () => startRun(engine, 'listener', {}, 'a'));
+    await asTenant('globex', () => startRun(engine, 'listener', {}, 'g'));
+    expect(await asTenant('acme', () => engine.publishEvent('price', 1))).toBe(2);
+    expect(await asTenant('acme', () => engine.publishEvent('price', 2))).toBe(0);
+    expect((await store.listBufferedEvents('price', 10)).map((e) => e.payload)).toEqual([2]);
+    await asTenant('globex', () => startRun(engine, 'listener', {}, 'g2'));
+    expect((await store.getRun('g2'))?.output).toBe(2);
   });
 });

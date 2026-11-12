@@ -44,11 +44,14 @@ import {
   type EventSubscription,
   type OnEventEntry,
   acceptingSubscription,
+  bufferedEventReaches,
   eventMatchOf,
   eventMatches,
   eventNameOf,
   eventPrefix,
   isEventToken,
+  readBufferedEvent,
+  scopeBufferedEvent,
   toEventSubscription,
 } from './events';
 import { hasDurableExecutionWrappers, runDurableExecution } from './execution-hooks';
@@ -206,6 +209,7 @@ import {
   inheritTenant,
   rowTenant,
   scopeTenantQuery,
+  tenantIdsFor,
   tenantVisible,
 } from './tenancy';
 import { type TenantVerifier, resolveWireTenant } from './tenant-auth';
@@ -3013,7 +3017,10 @@ export class WorkflowEngine {
    */
   async triggeredRuns(source: string | WorkflowRun): Promise<string[]> {
     const run = typeof source === 'string' ? await this.store.getRun(source) : source;
-    return run ? triggeredRunsOf(run) : [];
+    if (!run) return [];
+    // Tenancy: the runs a run of another tenant started read as none.
+    const filter = this.restrictiveFilter();
+    return filter && !tenantVisible(run, filter) ? [] : triggeredRunsOf(run);
   }
 
   /** The live path of {@link publishSettled}: right after this instance settled the run. */
@@ -3764,9 +3771,7 @@ export class WorkflowEngine {
     // Idempotent by run id: a redelivered trigger (at-least-once queues) or a scheduler re-tick for
     // the same id is a no-op, returning the existing run's state instead of starting a duplicate.
     const prior = await this.store.getRun(runId);
-    if (prior) {
-      return { runId, status: prior.status, output: prior.output, error: prior.error };
-    }
+    if (prior) return this.existingStartResult(prior);
     // Start-time concurrency quota (per-start override, else the workflow's): reject BEFORE creating
     // anything when the key's in-flight runs already reach the limit. See {@link ConcurrencyQuota}.
     const quota = await resolveConcurrency(opts?.concurrency, registered.concurrency, input);
@@ -3824,7 +3829,7 @@ export class WorkflowEngine {
       // converge on its run instead of reporting a start that did not fail.
       const winner = await this.store.getRun(runId).catch(() => null);
       if (!winner) throw err;
-      return { runId, status: winner.status, output: winner.output, error: winner.error };
+      return this.existingStartResult(winner);
     }
     // A delayed run waits for its timer: the timer poller starts it, so nothing is dispatched now.
     if (delayed) {
@@ -3891,6 +3896,16 @@ export class WorkflowEngine {
     // Unfiltered: the bare store read, with no extra hop (call timing is unchanged with tenancy off).
     if (!filter) return this.store.getRun(runId);
     return this.store.getRun(runId).then((run) => (run && tenantVisible(run, filter) ? run : null));
+  }
+
+  /**
+   * What `start` returns for an id that already has a run. A run the caller may not see (tenancy)
+   * returns its id and status only: never its output or error.
+   */
+  private existingStartResult(run: WorkflowRun): RunResult {
+    const filter = this.restrictiveFilter();
+    if (filter && !tenantVisible(run, filter)) return { runId: run.id, status: run.status };
+    return { runId: run.id, status: run.status, output: run.output, error: run.error };
   }
 
   /** The caller's filter when it can hide rows (`tenant` / `tenantless`), else undefined. */
@@ -5007,10 +5022,13 @@ export class WorkflowEngine {
         await this.store.removeBufferedEvent(candidate.id); // expired — prune regardless of match
         continue;
       }
-      if (!eventMatches(candidate.payload, match)) continue;
+      const { payload, tenantIds } = readBufferedEvent(candidate.payload);
+      // Tenancy: an event published under a tenant reaches only the runs that tenant may see.
+      if (!bufferedEventReaches(tenantIds, run.tenantId)) continue;
+      if (!eventMatches(payload, match)) continue;
       if (!(await this.store.removeBufferedEvent(candidate.id))) continue; // raced away — try the next
       await this.store.removeSignalWaiter(waiter);
-      const settled = await this.deliverSignal(waiter, candidate.payload, true);
+      const settled = await this.deliverSignal(waiter, payload, true);
       return settled ?? { runId: run.id, status: run.status };
     }
     return undefined;
@@ -5334,6 +5352,8 @@ export class WorkflowEngine {
       output: run.output,
       error: run.error,
     });
+    // Read the caller's filter now: `check` runs later, outside the caller's async context.
+    const filter = this.restrictiveFilter();
     return new Promise<RunResult>((resolve, reject) => {
       let done = false;
       let off: () => void = () => {};
@@ -5366,6 +5386,12 @@ export class WorkflowEngine {
       const check = (): void => {
         if (done) return;
         void this.store.getRun(runId).then((run) => {
+          // Tenancy: a run the caller may not see reads as not found (no status, output or error).
+          // A run that does not exist yet keeps the wait going (start-then-wait races).
+          if (run && filter && !tenantVisible(run, filter)) {
+            fail(new Error(`run ${runId} not found`));
+            return;
+          }
           if (run && isSettled(run)) finish(run);
         }, fail);
       };
@@ -5523,9 +5549,17 @@ export class WorkflowEngine {
     opts?: { id?: string; buffer?: boolean },
   ): Promise<number> {
     let touched = 0;
+    // Tenancy: a named event is per-tenant. A publisher that can hide rows (`tenant`/`tenantless`)
+    // reaches only the waiting runs it may see, and its buffered copy only those runs too.
+    const filter = this.restrictiveFilter();
+    const reaches = async (runId: string): Promise<boolean> => {
+      if (!filter) return true;
+      const run = await this.store.getRun(runId);
+      return run !== null && tenantVisible(run, filter);
+    };
     const waiters = await this.store.listSignalWaiters(eventPrefix(name));
     for (const w of waiters) {
-      if (eventMatches(payload, eventMatchOf(w.token))) {
+      if (eventMatches(payload, eventMatchOf(w.token)) && (await reaches(w.runId))) {
         await this.signalUnchecked(w.token, payload);
         touched += 1;
       }
@@ -5550,14 +5584,25 @@ export class WorkflowEngine {
     // loop above, matching the "no one received it" condition the semantics doc promises.
     if (touched > 0 || opts?.buffer === false) return touched;
     const bufferedId = globalThis.crypto.randomUUID();
-    await this.store.bufferEvent({ name, payload, id: bufferedId, publishedAt: this.clock() });
+    await this.store.bufferEvent({
+      name,
+      payload: scopeBufferedEvent(payload, filter ? tenantIdsFor(filter) : undefined),
+      id: bufferedId,
+      publishedAt: this.clock(),
+    });
     // Re-check: a waiter may have registered in the window between the miss above and this buffer
     // write (see the interleaving proof at `signal` — this is the events-side mirror of it). Only the
     // FIRST late-registered matching waiter is considered: only one buffered copy exists, so once a
     // claim attempt below either succeeds or finds the buffer already gone, there is nothing left for
     // any other candidate regardless.
     const lateWaiters = await this.store.listSignalWaiters(eventPrefix(name));
-    const lateWaiter = lateWaiters.find((w) => eventMatches(payload, eventMatchOf(w.token)));
+    let lateWaiter: SignalWaiter | undefined;
+    for (const w of lateWaiters) {
+      if (eventMatches(payload, eventMatchOf(w.token)) && (await reaches(w.runId))) {
+        lateWaiter = w;
+        break;
+      }
+    }
     if (!lateWaiter) return touched;
     if (!(await this.store.removeBufferedEvent(bufferedId))) return touched; // claimed elsewhere already
     // `takeSignalWaiter` is safe here even though it deletes ANY row for the token: an event token
@@ -6321,7 +6366,7 @@ export class WorkflowEngine {
     if (!run) return 0;
     // Collect children BEFORE deleting this run's checkpoints (getRunChildren reads them).
     let deleted = 0;
-    for (const childId of await this.getRunChildren(runId)) {
+    for (const childId of await this.runChildrenUnchecked(runId)) {
       deleted += await this.deleteRunUnchecked(childId);
     }
     await this.store.deleteRun(runId);
@@ -6457,7 +6502,7 @@ export class WorkflowEngine {
     parentRunId: string,
     opts?: { compensate?: boolean },
   ): Promise<void> {
-    for (const id of await this.getRunChildren(parentRunId)) {
+    for (const id of await this.runChildrenUnchecked(parentRunId)) {
       // A child started with `parentClose: 'abandon'` outlives its parent, a cancelled one included.
       const child = await this.store.getRun(id).catch(() => null);
       if (child?.tags?.includes(`${PARENT_CLOSE_TAG_PREFIX}abandon`)) continue;
@@ -6517,7 +6562,14 @@ export class WorkflowEngine {
     );
   }
 
+  /** The child runs of `parentRunId`; empty for a parent the caller may not see. */
   async getRunChildren(parentRunId: string): Promise<string[]> {
+    if (this.restrictiveFilter() && (await this.hidden(parentRunId))) return [];
+    return this.runChildrenUnchecked(parentRunId);
+  }
+
+  /** {@link getRunChildren} without the tenancy check (the engine's own subtree walks). */
+  private async runChildrenUnchecked(parentRunId: string): Promise<string[]> {
     const childIds = new Set(await this.awaitedChildIds(parentRunId));
     // Targeted read: only the child-edge checkpoints, not the whole history. Falls
     // back to a full listCheckpoints + in-JS prefix scan for a custom store that omits the method.

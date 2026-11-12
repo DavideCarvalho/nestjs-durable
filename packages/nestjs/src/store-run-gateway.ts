@@ -389,9 +389,50 @@ export class StoreRunGateway implements RunGateway {
     return this.engine.republishLifecycle(target);
   }
 
+  /**
+   * Stream `runId`'s events. With tenancy, a run the caller may not see streams nothing; events of a
+   * run that does not exist yet are held until its row shows whose it is.
+   */
   subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void {
-    return this.engine.subscribe((event) => {
-      if (event.runId === runId) onEvent(event);
+    // Read the caller's tenant now: the events arrive outside its async context.
+    const { tenantIds } = this.scoped({} as RunQuery);
+    if (!tenantIds) {
+      return this.engine.subscribe((event) => {
+        if (event.runId === runId) onEvent(event);
+      });
+    }
+    let visible: boolean | undefined; // undefined until the run's row has been read
+    let held: EngineEvent[] = [];
+    let checking = false;
+    const check = (): void => {
+      if (checking || visible !== undefined) return;
+      checking = true;
+      void this.store
+        .getRun(runId)
+        .then(
+          (run) => {
+            if (run) visible = tenantIds.includes(run.tenantId ?? null);
+          },
+          () => undefined,
+        )
+        .finally(() => {
+          checking = false;
+          if (visible === undefined) return;
+          const pending = held;
+          held = [];
+          if (visible) for (const event of pending) onEvent(event);
+        });
+    };
+    const off = this.engine.subscribe((event) => {
+      if (event.runId !== runId || visible === false) return;
+      if (visible) return onEvent(event);
+      held.push(event);
+      check();
     });
+    check();
+    return () => {
+      held = [];
+      off();
+    };
   }
 }

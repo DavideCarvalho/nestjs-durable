@@ -92,10 +92,19 @@ With tenancy on, the engine's app-facing calls apply one rule:
 | `Context.allTenants(...)` | visible | visible | visible |
 | No request (pollers, scripts) | visible | visible | visible |
 
-This covers `getRun`, `listCheckpoints`, `getEvent`, `signal`, `cancel`, `cancelWhere`, `requeue`,
-`retryWithInput`, `redispatchPending`, `resume`, `continue`, `update`, `completeTask`/`failTask`,
-`deleteRun`, `purgeRuns` and `engine.schedules`. A run the caller may not see behaves exactly like a
-missing one (`null`, `0`, "not found"), never like a forbidden one, so ids of other tenants do not leak.
+This covers `getRun`, `waitForRun`, `listCheckpoints`, `getRunChildren`, `triggeredRuns`, `getEvent`,
+`signal`, `cancel`, `cancelWhere`, `requeue`, `retryWithInput`, `redispatchPending`, `resume`,
+`continue`, `update`, `completeTask`/`failTask`, `deleteRun`, `purgeRuns` and `engine.schedules`. A
+run the caller may not see behaves exactly like a missing one (`null`, `[]`, `0`, "not found"), never
+like a forbidden one, so ids of other tenants do not leak.
+
+`waitForRun` on a run of another tenant rejects with `run <id> not found`. On an id that has no run
+yet it keeps waiting, as before, so `start` then `waitForRun` still works.
+
+Run ids and schedule ids are unique across tenants. A `start` with an id another tenant already used
+returns that run's id and status but never its output or error, and creating a schedule with an id
+another tenant already used throws `ScheduleAlreadyExistsError`. Use ids nobody can guess (the
+default random ids are) when tenants must not learn which ids exist.
 
 To list runs from your own code, narrow the query the same way:
 
@@ -108,14 +117,32 @@ with no tenant.
 
 <Callout type="info">
   Callbacks from outside your app have no tenant. A `ctx.webhook()` URL keeps working (its token is the
-  credential). For `completeTask`/`failTask` or a `signal` sent from an endpoint that serves an
+  credential, for any caller, so keep run ids unguessable). For `completeTask`/`failTask` or a `signal` sent from an endpoint that serves an
   external system, run the call inside `Context.allTenants(...)` or `Context.withTenant(...)`.
 </Callout>
+
+## Named events
+
+With tenancy on, named events are **per tenant**. `publishEvent` resumes only the
+`ctx.waitForEvent` waiters whose run the publisher may see, under the same rule as the table above:
+
+| Publisher | Resumes waiting runs of |
+|-----------|-------------------------|
+| A request with a tenant | its tenant (plus runs with no tenant with `nullRows: 'shared'`) |
+| A request with no tenant | runs with no tenant |
+| `Context.allTenants(...)` or no request | every run |
+
+An event nobody received is buffered for the next matching `waitForEvent`, and only a run the
+publisher may see consumes that copy. Subscribers started by the event (`onEvent`) start in the
+publisher's tenant. To broadcast to every tenant, publish from `Context.allTenants(...)` or from code
+outside a request.
+
+With tenancy off, named events reach every waiting run, as before.
 
 ## Dashboard
 
 The dashboard reads through the same rule: a request with a tenant sees only that tenant's runs,
-counts and schedules, and a run of another tenant answers 404. Admin users who must see every tenant
+counts and schedules, and a run of another tenant answers 404 and streams no live events. Admin users who must see every tenant
 need `Context.allTenants` around the dashboard's requests, for example in an interceptor you add with
 the dashboard's `decorators` option.
 

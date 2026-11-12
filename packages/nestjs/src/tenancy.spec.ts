@@ -240,6 +240,46 @@ describe('DurableModule with tenancy on', () => {
     await close();
   });
 
+  it("waitForRun and the run event stream tell a tenant nothing about another tenant's run", async () => {
+    const { store, service, gateway, close } = await build();
+    await asTenant('acme', () => service.start('wf', {}, 'a'));
+    await settled(store, 'a', 'suspended');
+    await expect(asTenant('globex', () => service.waitForRun('a'))).rejects.toThrow(
+      'run a not found',
+    );
+    expect((await asTenant('acme', () => service.waitForRun('a'))).status).toBe('suspended');
+
+    const acmeSaw: string[] = [];
+    const globexSaw: string[] = [];
+    const offAcme = asTenant('acme', () => gateway.subscribe('a', (e) => acmeSaw.push(e.type)));
+    const offGlobex = asTenant('globex', () =>
+      gateway.subscribe('a', (e) => globexSaw.push(e.type)),
+    );
+    // Events of a run that does not exist yet are held until its row says whose it is.
+    const lateSaw: string[] = [];
+    const offLate = asTenant('globex', () =>
+      gateway.subscribe('late', (e) => lateSaw.push(e.type)),
+    );
+    const ownLateSaw: string[] = [];
+    const offOwnLate = asTenant('acme', () =>
+      gateway.subscribe('late', (e) => ownLateSaw.push(e.type)),
+    );
+    await service.signal('go:a', 1); // from no request
+    await settled(store, 'a', 'completed');
+    await asTenant('acme', () => service.start('wf', {}, 'late'));
+    await settled(store, 'late', 'suspended');
+    await new Promise((r) => setTimeout(r, 20));
+    expect(acmeSaw).toContain('run.completed');
+    expect(globexSaw).toEqual([]);
+    expect(lateSaw).toEqual([]);
+    expect(ownLateSaw).toContain('run.suspended');
+    offOwnLate();
+    offAcme();
+    offGlobex();
+    offLate();
+    await close();
+  });
+
   it('restores the carried tenant around a dispatched step handler on any transport', async () => {
     const { close } = await build();
     expect(hasDurableExecutionWrappers()).toBe(true);

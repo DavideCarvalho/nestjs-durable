@@ -111,3 +111,47 @@ export function acceptingSubscription(
   }
   return { errors };
 }
+
+/** The key a buffered event's stored payload carries the tenants that may consume it under. */
+const BUFFERED_EVENT_TENANTS = '__durableEventTenants';
+
+/**
+ * The payload to buffer for an event published under a tenant filter: `payload` plus the `tenant_id`
+ * values (`null` = no tenant) of the runs that may consume it. `undefined` buffers it as is, for
+ * every run (a publish with tenancy off, or from `system`/`all`).
+ */
+export function scopeBufferedEvent(
+  payload: unknown,
+  tenantIds: ReadonlyArray<string | null> | undefined,
+): unknown {
+  return tenantIds === undefined ? payload : { [BUFFERED_EVENT_TENANTS]: tenantIds, payload };
+}
+
+/** A buffered event's payload, and the tenants that may consume it (undefined: every run). */
+export function readBufferedEvent(stored: unknown): {
+  payload: unknown;
+  tenantIds?: Array<string | null>;
+} {
+  if (
+    stored !== null &&
+    typeof stored === 'object' &&
+    Array.isArray((stored as Record<string, unknown>)[BUFFERED_EVENT_TENANTS]) &&
+    Object.keys(stored).length === 2 &&
+    'payload' in stored
+  ) {
+    const scoped = stored as { payload: unknown } & Record<string, unknown>;
+    return {
+      payload: scoped.payload,
+      tenantIds: scoped[BUFFERED_EVENT_TENANTS] as Array<string | null>,
+    };
+  }
+  return { payload: stored };
+}
+
+/** May a run with `tenantId` consume a buffered event scoped to `tenantIds`? */
+export function bufferedEventReaches(
+  tenantIds: ReadonlyArray<string | null> | undefined,
+  tenantId: string | null | undefined,
+): boolean {
+  return tenantIds === undefined || tenantIds.includes(tenantId ?? null);
+}
