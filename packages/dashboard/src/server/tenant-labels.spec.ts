@@ -49,7 +49,7 @@ describe('withTenantLabels', () => {
   });
 
   it('asks nothing for a page without tenants', async () => {
-    const rows = [{ id: 'r1' }];
+    const rows: Array<{ id: string; tenantId?: string }> = [{ id: 'r1' }];
     expect(await withTenantLabels(rows)).toBe(rows);
   });
 });
