@@ -172,6 +172,23 @@ export class ScheduleEntity {
   updatedAt!: Date;
 }
 
+/** Postgres identifiers are at most 63 bytes; the name is written into every statement, quoted. */
+const SCHEMA_NAME = /^[A-Za-z_][A-Za-z0-9_$]*$/;
+
+/**
+ * Validate a durable `schema` option: an identifier of at most 63 characters. Returns it, or
+ * `undefined` when none is set.
+ */
+export function durableSchemaName(schema: string | undefined): string | undefined {
+  if (schema === undefined) return undefined;
+  if (!SCHEMA_NAME.test(schema) || schema.length > 63) {
+    throw new Error(
+      `[nestjs-durable] invalid schema ${JSON.stringify(schema)}: use letters, digits, _ or $ (not first), at most 63 characters.`,
+    );
+  }
+  return schema;
+}
+
 /**
  * Build the durable TypeORM entity schemas with column names pinned per `naming` (default
  * `'snake_case'`). Register the result in your `DataSource`/`TypeOrmModule.forFeature`. The JSON-blob
@@ -182,14 +199,24 @@ export class ScheduleEntity {
  * ```ts
  * entities: durableEntities({ naming: 'snake_case' })
  * ```
+ *
+ * `schema` puts every durable table in that database schema (Postgres) or database (MySQL), named in
+ * every statement: `durableEntities({ schema: 'durable' })`. Not supported on SQLite.
  */
-export function durableEntities(options: { naming?: DurableColumnNaming } = {}): EntitySchema[] {
+export function durableEntities(
+  options: { naming?: DurableColumnNaming; schema?: string } = {},
+): EntitySchema[] {
   const col = columnNamer(options.naming ?? 'snake_case');
+  const schema = durableSchemaName(options.schema);
+  // Postgres qualifies a table with `schema`, MySQL with `database`: set both, so one option works on
+  // either. Absent, the tables stay unqualified exactly as before.
+  const where = schema === undefined ? {} : { schema, database: schema };
 
   const workflowRuns = new EntitySchema<WorkflowRunEntity>({
     name: 'WorkflowRunEntity',
     target: WorkflowRunEntity,
     tableName: 'durable_workflow_runs',
+    ...where,
     columns: {
       id: { type: 'text', primary: true, name: col('id') },
       workflow: { type: 'text', name: col('workflow') },
@@ -270,6 +297,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     name: 'StepCheckpointEntity',
     target: StepCheckpointEntity,
     tableName: 'durable_step_checkpoints',
+    ...where,
     // A run's fan, in member order: `checkpointStats`/`queryCheckpoints` narrow by group and page by
     // seq. The DDL that actually creates it lives in `ensureTypeOrmDurableSchema`.
     indices: [
@@ -325,6 +353,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     name: 'RunAttributeEntity',
     target: RunAttributeEntity,
     tableName: 'durable_run_attributes',
+    ...where,
     columns: {
       runId: { type: 'text', primary: true, name: col('runId') },
       key: { type: 'text', primary: true, name: col('key') },
@@ -338,6 +367,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     name: 'SignalWaiterEntity',
     target: SignalWaiterEntity,
     tableName: 'durable_signal_waiters',
+    ...where,
     indices: [{ name: 'durable_signal_waiters_run_id_idx', columns: ['runId'] }],
     columns: {
       token: { type: 'text', primary: true, name: col('token') },
@@ -354,6 +384,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     name: 'BufferedSignalEntity',
     target: BufferedSignalEntity,
     tableName: 'durable_buffered_signals',
+    ...where,
     columns: {
       // Auto-increment PK for FIFO ordering. Left as TypeORM's default increment generation so it
       // maps to the driver-native auto-increment column (INTEGER on SQLite, BIGINT/SERIAL elsewhere).
@@ -372,6 +403,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     name: 'BufferedEventEntity',
     target: BufferedEventEntity,
     tableName: 'durable_buffered_events',
+    ...where,
     // No `indices` here (unlike MikroORM's EntitySchema, which does declare one): this store manages
     // its DDL — including the `(name, publishedAt)` index — via raw SQL in `schema.ts`'s
     // `ensureTypeOrmDurableSchema`, the same as every other durable_* table's indexes.
@@ -394,6 +426,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     name: 'SignalIdEntity',
     target: SignalIdEntity,
     tableName: 'durable_signal_ids',
+    ...where,
     // Its `(token, signal_id)` key and `expires_at` index are raw DDL in `schema.ts`, like every
     // other durable table's.
     columns: {
@@ -407,6 +440,7 @@ export function durableEntities(options: { naming?: DurableColumnNaming } = {}):
     name: 'ScheduleEntity',
     target: ScheduleEntity,
     tableName: 'durable_schedules',
+    ...where,
     columns: {
       id: { type: 'text', primary: true, name: col('id') },
       namespace: { type: 'text', name: col('namespace'), default: 'default' },

@@ -74,6 +74,7 @@ stop the pollers (wire it to `OnModuleDestroy`).
 | `executor` | — | Required. `mikroOrmExecutor(em)` / `typeOrmExecutor(ds)` / custom. |
 | `group` | — | Required to register `handle()`s (worker side). |
 | `prefix` | `durable` | Tables: `${prefix}_transport_tasks` / `_results`. |
+| `schema` | — | Postgres schema (MySQL: database) of the tables, written into every statement; created when `autoCreate` is on. |
 | `pollMs` | `500` | Poll interval when the queue is empty. |
 | `leaseMs` | `30000` | How long a claimed row is owned before it's reclaimable (crash recovery). |
 | `batchSize` | `10` | Max rows claimed per poll. |

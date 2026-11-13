@@ -14,6 +14,7 @@ See the table + claim-protocol contract in the docs; both libraries implement ag
 from __future__ import annotations
 
 import asyncio
+import re
 import json
 import time
 import uuid
@@ -55,14 +56,49 @@ class _Dialect:
         return f"INSERT IGNORE INTO {table} ({names}) VALUES ({values})"
 
 
+_SCHEMA_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+
+
+def _schema_name(schema: Optional[str]) -> Optional[str]:
+    """Validate the ``schema`` option: an identifier of at most 63 characters, or ``None``."""
+    if schema is None:
+        return None
+    if not _SCHEMA_NAME.match(schema) or len(schema) > 63:
+        raise ValueError(
+            f"invalid schema {schema!r}: use letters, digits, _ or $ (not first), at most 63 characters"
+        )
+    return schema
+
+
 class _Contract:
     """Builds the contract SQL (pure, no driver) for a given prefix + dialect — unit-testable."""
 
-    def __init__(self, prefix: str, dialect: _Dialect, batch_size: int) -> None:
+    def __init__(
+        self, prefix: str, dialect: _Dialect, batch_size: int, schema: Optional[str] = None
+    ) -> None:
         self.d = dialect
         self.batch_size = batch_size
-        self.tasks = dialect.q(f"{prefix}_transport_tasks")
-        self.results = dialect.q(f"{prefix}_transport_results")
+        self.schema = _schema_name(schema)
+        # Every statement names the schema when one is set (never ``search_path``).
+        def qualify(name: str) -> str:
+            if self.schema is None:
+                return dialect.q(name)
+            return f"{dialect.q(self.schema)}.{dialect.q(name)}"
+
+        self.tasks = qualify(f"{prefix}_transport_tasks")
+        self.results = qualify(f"{prefix}_transport_results")
+
+    def schema_exists(self) -> str:
+        """Whether the ``schema`` exists. Param: ``[schema]``."""
+        if self.d.kind == "postgres":
+            return "SELECT 1 FROM pg_namespace WHERE nspname = $1"
+        return "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s"
+
+    def create_schema(self) -> str:
+        """Create the ``schema`` (run only when :meth:`schema_exists` finds none: ``IF NOT EXISTS``
+        still needs the CREATE privilege on the database)."""
+        kind = "SCHEMA" if self.d.kind == "postgres" else "DATABASE"
+        return f"CREATE {kind} IF NOT EXISTS {self.d.q(self.schema or '')}"
 
     def create_tables(self) -> List[str]:
         q, txt = self.d.q, self.d.text
@@ -168,6 +204,8 @@ class _PostgresBackend(_Backend):
 
     async def ensure_schema(self) -> None:
         async with self.pool.acquire() as conn:
+            if self.c.schema and not await conn.fetch(self.c.schema_exists(), self.c.schema):
+                await conn.execute(self.c.create_schema())
             for ddl in self.c.create_tables():
                 await conn.execute(ddl)
 
@@ -196,6 +234,10 @@ class _MysqlBackend(_Backend):
     async def ensure_schema(self) -> None:
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cur:
+                if self.c.schema:
+                    await cur.execute(self.c.schema_exists(), (self.c.schema,))
+                    if not await cur.fetchall():
+                        await cur.execute(self.c.create_schema())
                 for ddl in self.c.create_tables():
                     await cur.execute(ddl)
             await conn.commit()
@@ -255,6 +297,7 @@ async def run_db_worker(
     dsn: str,
     dialect: str,
     prefix: str = "durable",
+    schema: Optional[str] = None,
     poll_ms: int = 500,
     lease_ms: int = 30_000,
     batch_size: int = 10,
@@ -267,10 +310,11 @@ async def run_db_worker(
 
     ``dialect`` is ``"postgres"`` or ``"mysql"``; ``dsn`` is the connection string. Pass ``backend``
     to inject a preconfigured one (for tests). The tables must match the engine's ``DbTransport``
-    ``prefix`` — they share the rows.
+    ``prefix`` and ``schema`` — they share the rows. ``schema`` is the Postgres schema (MySQL: the
+    database) the tables live in, written into every statement; never set ``search_path`` for it.
     """
 
-    contract = _Contract(prefix, _Dialect(dialect), batch_size)
+    contract = _Contract(prefix, _Dialect(dialect), batch_size, schema)
     backend = backend or await _make_backend(dialect, dsn, contract)
     instance_id = instance_id or f"py-{uuid.uuid4().hex[:8]}"
     stop = stop or asyncio.Event()

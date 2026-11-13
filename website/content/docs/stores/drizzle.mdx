@@ -54,6 +54,11 @@ DurableModule.forRoot({
 });
 ```
 
+<Callout>
+  SQLite has no schemas: `new DrizzleStateStore(db, { schema })` throws. To keep the durable tables
+  in a schema of their own, use the [Postgres flavour](/docs/stores/drizzle-postgres#database-schema).
+</Callout>
+
 ## Schema is owned by drizzle-kit
 
 Like the Prisma adapter, this one has **no auto-schema** — `drizzle-kit` owns your migrations. The

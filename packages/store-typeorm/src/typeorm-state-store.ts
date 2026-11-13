@@ -74,6 +74,7 @@ import {
 import {
   type DurableSchemaLogger,
   durableColumnResolver,
+  durableTableSchema,
   ensureTypeOrmDurableSchema,
 } from './schema';
 
@@ -123,6 +124,13 @@ export interface TypeOrmStateStoreOptions {
    * `blockingAlterRowLimit` on `ensureTypeOrmDurableSchema`.
    */
   schemaBlockingAlterRowLimit?: number | undefined;
+  /**
+   * The schema (Postgres) or database (MySQL) the durable tables live in. Register the entities with
+   * the same one (`durableEntities({ schema })`); a mismatch fails at `ensureSchema()`. Every
+   * statement names it, so it works behind PgBouncer in transaction mode; never set `search_path`
+   * for this. Default: whatever the registered entities carry (unqualified unless built with one).
+   */
+  schema?: string | undefined;
 }
 
 /**
@@ -154,10 +162,13 @@ export class TypeOrmStateStore implements StateStore {
     private readonly dataSource: DataSource,
     private readonly options: TypeOrmStateStoreOptions = {},
   ) {
+    // Fail at construction when the DataSource is already up (the usual NestJS order), else on the
+    // first statement / `ensureSchema()`.
+    if (dataSource.isInitialized) this.tableSchema();
     const type = String(dataSource.options.type);
     const dialect = type === 'postgres' ? 'postgres' : type === 'mysql' ? 'mysql' : undefined;
     if (!dialect) return;
-    const fast = new TypeOrmRoundTrips(dataSource, dialect, this);
+    const fast = new TypeOrmRoundTrips(dataSource, dialect, this, () => this.tableSchema());
     this.insertCheckpointIfAbsent = (cp) => fast.insertCheckpointIfAbsent(cp);
     this.settleResultsIfPending = (results) => fast.settleResultsIfPending(results);
     this.claimPendingRuns = (limit, owner, until, now, ns) =>
@@ -172,7 +183,16 @@ export class TypeOrmStateStore implements StateStore {
     await ensureTypeOrmDurableSchema(this.dataSource, {
       logger: this.options.schemaLogger,
       blockingAlterRowLimit: this.options.schemaBlockingAlterRowLimit,
+      schema: this.options.schema,
     });
+  }
+
+  private resolvedSchema?: { schema: string | undefined };
+
+  /** The durable tables' schema (see {@link TypeOrmStateStoreOptions.schema}), resolved once. */
+  private tableSchema(): string | undefined {
+    this.resolvedSchema ??= { schema: durableTableSchema(this.dataSource, this.options.schema) };
+    return this.resolvedSchema.schema;
   }
 
   private runs() {
@@ -898,7 +918,11 @@ export class TypeOrmStateStore implements StateStore {
     const runIdCol = wrap(resolve('durable_run_attributes', 'runId'));
     const keyCol = wrap(resolve('durable_run_attributes', 'key'));
     const runPkCol = wrap(resolve('durable_workflow_runs', 'id'));
-    const table = wrap('durable_run_attributes');
+    const schema = this.tableSchema();
+    const table =
+      schema === undefined
+        ? wrap('durable_run_attributes')
+        : `${wrap(schema)}.${wrap('durable_run_attributes')}`;
     // `<>` (ne) must also exclude rows where the attribute is absent: the missing-key-never-matches
     // contract (see core matchesAttributes). EXISTS already requires the key row to be present, and a
     // row only exists when the value is non-null, so EXISTS(... <> ...) gives exactly ne-with-present.
@@ -1683,6 +1707,8 @@ class TypeOrmRoundTrips {
     dialect: 'postgres' | 'mysql',
     /** The store itself, whose batched plain calls settle a MySQL batch. */
     private readonly store: StateStore,
+    /** The durable tables' schema, resolved by the store. */
+    private readonly schema: () => string | undefined,
   ) {
     this.pg = dialect === 'postgres';
   }
@@ -1703,8 +1729,10 @@ class TypeOrmRoundTrips {
   private async cpType(property: string): Promise<string> {
     this.cpTypes ??= this.ds
       .query(
-        'SELECT column_name AS name, data_type AS type FROM information_schema.columns WHERE table_name = $1 AND table_schema = current_schema()',
-        [this.cps.tableName],
+        this.schema() === undefined
+          ? 'SELECT column_name AS name, data_type AS type FROM information_schema.columns WHERE table_name = $1 AND table_schema = current_schema()'
+          : 'SELECT column_name AS name, data_type AS type FROM information_schema.columns WHERE table_name = $1 AND table_schema = $2',
+        this.schema() === undefined ? [this.cps.tableName] : [this.cps.tableName, this.schema()],
       )
       .then((rows: { name: string; type: string }[]) => new Map(rows.map((r) => [r.name, r.type])));
     const column = this.col(this.cps, property);
@@ -1730,7 +1758,10 @@ class TypeOrmRoundTrips {
   }
 
   private table(meta: EntityMetadata): string {
-    return this.q(meta.tableName);
+    const schema = this.schema();
+    return schema === undefined
+      ? this.q(meta.tableName)
+      : `${this.q(schema)}.${this.q(meta.tableName)}`;
   }
 
   /** `value` as the driver binds it for `property` (transformers and type conversion included). */

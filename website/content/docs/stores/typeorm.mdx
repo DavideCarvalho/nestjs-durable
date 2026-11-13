@@ -50,6 +50,32 @@ produce), or `(property: string) => string`. Same contract as the MikroORM adapt
 [`durableEntities`](/docs/stores/mikro-orm#column-naming) — the physical column names must agree
 across adapters so a run written by one store stays readable by another.
 
+### Database schema
+
+By default the tables live in the connection's current schema (Postgres) or database (MySQL). To keep
+them in one of their own, build the entities and the store with the same `schema`:
+
+```ts
+TypeOrmModule.forRoot({
+  // ...
+  entities: [...durableEntities({ schema: 'durable' })],
+});
+
+new TypeOrmStateStore(dataSource, { schema: 'durable' });
+```
+
+Every statement then names it: `"durable"."durable_workflow_runs"` on Postgres, and on MySQL the
+`durable` database (`` `durable`.`durable_workflow_runs` ``). Auto-schema creates the schema (or
+database) when it is missing; the role needs `CREATE` for that. If the store's `schema` doesn't match
+the entities', `ensureSchema()` fails and says which to change. SQLite has no schemas: there,
+`schema` fails at boot. The name must be a plain identifier of at most 63 characters.
+
+<Callout type="warn">
+  Don't put the tables in another schema with `search_path` (or a connection's `?schema=`). Behind
+  PgBouncer in transaction mode a `SET search_path` leaks to other clients' connections. The
+  `schema` option writes the schema into every statement instead.
+</Callout>
+
 ## 2. Wire the store into the module
 
 `TypeOrmStateStore` takes the `DataSource`:

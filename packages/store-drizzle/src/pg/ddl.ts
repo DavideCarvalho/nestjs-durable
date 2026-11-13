@@ -1,6 +1,7 @@
 import { sql } from 'drizzle-orm';
 import type { PgDatabase } from 'drizzle-orm/pg-core';
 import { rowsOf } from './executor';
+import { durableSchemaName } from './schema';
 
 /**
  * The durable tables as idempotent Postgres DDL — the exact SQL twin of the `pgTable` definitions in
@@ -130,6 +131,30 @@ export const DURABLE_PG_DDL: readonly string[] = [
   `CREATE INDEX IF NOT EXISTS "durable_signal_ids_expires_at_idx" ON "durable_signal_ids" USING btree ("expires_at")`,
 ];
 
+/**
+ * {@link DURABLE_PG_DDL} for the tables in the Postgres schema `schema`: every table reference is
+ * written as `"schema"."durable_…"` and the list starts with `CREATE SCHEMA IF NOT EXISTS`. Without a
+ * schema it is {@link DURABLE_PG_DDL} itself. Paste it into a migration when `autoSchema` is off:
+ *
+ * ```ts
+ * console.log(durablePgDdl('durable').join(';\n') + ';');
+ * ```
+ */
+export function durablePgDdl(schema?: string): readonly string[] {
+  const name = durableSchemaName(schema);
+  if (name === undefined) return DURABLE_PG_DDL;
+  const q = `"${name}"`;
+  return [
+    `CREATE SCHEMA IF NOT EXISTS ${q}`,
+    ...DURABLE_PG_DDL.map((statement) =>
+      statement.replace(
+        /^(CREATE TABLE IF NOT EXISTS |ALTER TABLE |(?:CREATE (?:UNIQUE )?INDEX (?:CONCURRENTLY )?IF NOT EXISTS "[^"]+" ON ))"(durable_[^"]+)"/i,
+        `$1${q}."$2"`,
+      ),
+    ),
+  ];
+}
+
 /** Key for the transaction-scoped advisory lock that serializes concurrent heals (several pods
  *  booting at once would otherwise race `CREATE INDEX IF NOT EXISTS` into a duplicate-key error). */
 const SCHEMA_LOCK_KEY = 'durable_schema';
@@ -146,6 +171,11 @@ export interface DurableSchemaLogger {
 export interface EnsureDrizzlePgDurableSchemaOptions {
   /** Sink for the schema-repair warning. Defaults to `console`. */
   logger?: DurableSchemaLogger | undefined;
+  /**
+   * The Postgres schema the durable tables live in. Created when missing; every statement and
+   * catalog lookup names it. Default: the connection's current schema, unqualified.
+   */
+  schema?: string | undefined;
 }
 
 /**
@@ -175,13 +205,16 @@ type DdlTarget =
   | { kind: 'column'; table: string; column: string };
 
 function ddlTarget(statement: string): DdlTarget | undefined {
-  const table = statement.match(/^CREATE TABLE IF NOT EXISTS "([^"]+)"/i);
+  // A table may be written schema-qualified (`"schema"."durable_…"`); the target is the table name.
+  const table = statement.match(/^CREATE TABLE IF NOT EXISTS (?:"[^"]+"\.)?"([^"]+)"/i);
   if (table?.[1]) return { kind: 'table', table: table[1] };
   const index = statement.match(
-    /^CREATE (?:UNIQUE )?INDEX (?:CONCURRENTLY )?IF NOT EXISTS "([^"]+)" ON "([^"]+)"/i,
+    /^CREATE (?:UNIQUE )?INDEX (?:CONCURRENTLY )?IF NOT EXISTS "([^"]+)" ON (?:"[^"]+"\.)?"([^"]+)"/i,
   );
   if (index?.[1] && index[2]) return { kind: 'index', index: index[1], table: index[2] };
-  const column = statement.match(/^ALTER TABLE "([^"]+)" ADD COLUMN IF NOT EXISTS "([^"]+)"/i);
+  const column = statement.match(
+    /^ALTER TABLE (?:"[^"]+"\.)?"([^"]+)" ADD COLUMN IF NOT EXISTS "([^"]+)"/i,
+  );
   if (column?.[1] && column[2]) return { kind: 'column', table: column[1], column: column[2] };
   return undefined;
 }
@@ -202,32 +235,51 @@ export async function ensureDrizzlePgDurableSchema(
   options: EnsureDrizzlePgDurableSchemaOptions = {},
 ): Promise<void> {
   const logger = options.logger ?? console;
+  const schema = durableSchemaName(options.schema);
+  // Two installs in two schemas of one database heal independently.
+  const lockKey = schema === undefined ? SCHEMA_LOCK_KEY : `${SCHEMA_LOCK_KEY}:${schema}`;
+  // The catalog lookups filter by the configured schema, never `current_schema()` when one is set.
+  const inSchema = (column: string) =>
+    schema === undefined
+      ? sql.raw(`${column} = current_schema()`)
+      : sql`${sql.raw(column)} = ${schema}`;
+  // The schema itself is created below, only when missing (`CREATE SCHEMA IF NOT EXISTS` needs the
+  // CREATE privilege on the database even when the schema exists).
+  const ddl = durablePgDdl(schema).filter((statement) => !statement.startsWith('CREATE SCHEMA'));
   const { repairs, freshInstall } = await db.transaction(async (tx) => {
-    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${SCHEMA_LOCK_KEY}))`);
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`);
+    const hasSchema =
+      schema === undefined ||
+      rowsOf(await tx.execute(sql`SELECT 1 FROM pg_namespace WHERE nspname = ${schema}`)).length >
+        0;
+    if (!hasSchema) {
+      // Under the lock (two pods racing CREATE SCHEMA collide on the catalog), before the catalog
+      // reads, so a role that cannot create it fails with a clear message.
+      await tx.execute(sql.raw(`CREATE SCHEMA IF NOT EXISTS "${schema}"`)).catch((err: unknown) => {
+        throw new Error(
+          `[nestjs-durable] store-drizzle could not create the schema "${schema}" for the durable tables. Create it ahead of time, or grant this role CREATE on the database (GRANT CREATE ON DATABASE <db> TO <role>). Cause: ${(err as Error).message}`,
+          { cause: err },
+        );
+      });
+    }
     const tables = new Set(
       rowsOf<{ name: string }>(
         await tx.execute(
-          sql.raw(
-            "SELECT tablename AS name FROM pg_tables WHERE schemaname = current_schema() AND left(tablename, 8) = 'durable_'",
-          ),
+          sql`SELECT tablename AS name FROM pg_tables WHERE ${inSchema('schemaname')} AND left(tablename, 8) = 'durable_'`,
         ),
       ).map((row) => row.name),
     );
     const indexes = new Set(
       rowsOf<{ name: string }>(
         await tx.execute(
-          sql.raw(
-            "SELECT indexname AS name FROM pg_indexes WHERE schemaname = current_schema() AND left(tablename, 8) = 'durable_'",
-          ),
+          sql`SELECT indexname AS name FROM pg_indexes WHERE ${inSchema('schemaname')} AND left(tablename, 8) = 'durable_'`,
         ),
       ).map((row) => row.name),
     );
     const columns = new Set(
       rowsOf<{ name: string }>(
         await tx.execute(
-          sql.raw(
-            "SELECT table_name || '.' || column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND left(table_name, 8) = 'durable_'",
-          ),
+          sql`SELECT table_name || '.' || column_name AS name FROM information_schema.columns WHERE ${inSchema('table_schema')} AND left(table_name, 8) = 'durable_'`,
         ),
       ).map((row) => row.name),
     );
@@ -235,7 +287,7 @@ export async function ensureDrizzlePgDurableSchema(
     const created = new Set<string>();
     const ddlTables = new Set<string>();
     const applied: string[] = [];
-    for (const statement of DURABLE_PG_DDL) {
+    for (const statement of ddl) {
       const target = ddlTarget(statement);
       await tx.execute(sql.raw(statement));
       if (!target) continue;

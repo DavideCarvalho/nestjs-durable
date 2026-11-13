@@ -229,6 +229,9 @@ tasks with `SELECT … FOR UPDATE SKIP LOCKED`, running the handler, writing a r
 task. Because both libraries target that one spec, a Node engine and a Python worker share the same
 two tables (the `prefix` must match). Requires Postgres 9.5+ or MySQL 8+ (SQLite has no `SKIP LOCKED`).
 
+When the engine's `DbTransport` keeps its tables in a [schema of their own](/docs/transports/db#database-schema),
+pass the same one: `run_db_worker(worker, ..., schema="durable")`. Every statement names it.
+
 ## The wire protocol
 
 The contract is plain JSON, identical across languages. The orchestrator dispatches a **task**:

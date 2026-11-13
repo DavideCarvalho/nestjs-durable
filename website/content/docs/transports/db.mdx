@@ -48,6 +48,7 @@ older than `leaseMs` is treated as abandoned and reclaimed by the next poll (see
 | `executor` | How to run SQL, built from the app's own connection. `mikroOrmExecutor(em)`, `typeOrmExecutor(dataSource)`, `drizzlePgExecutor(db)` (from `@dudousxd/nestjs-durable-store-drizzle/pg`), or a custom `SqlExecutor`. |
 | `group` | The queue token this instance serves — required to register `handle()`s. |
 | `prefix` | Table-name prefix. Default `durable`. |
+| `schema` | The Postgres schema (MySQL: the database) the tables live in, written into every statement: `"<schema>"."durable_transport_tasks"`. Created on first use when `autoCreate` is on. Default: the connection's current schema. See [Database schema](#database-schema). |
 | `pollMs` | Poll interval in ms when a queue is empty. Default `500`. |
 | `batchSize` | Max task rows claimed per poll. Default `10`. The task loop claims only as many rows as it has free `concurrency` slots (capped by this). The results loop claims rounds of up to 256 rows, or this if larger. |
 | `concurrency` | How many tasks this instance runs at once. Default `1`. |
@@ -56,13 +57,33 @@ older than `leaseMs` is treated as abandoned and reclaimed by the next poll (see
 | `autoCreate` | Create the tables on first use if missing. Default `true` — the `CREATE TABLE` statements in [The contract](#the-contract) are for reference/manual provisioning, not a required setup step. |
 | `instanceId` | Prefix of the claim token this instance stamps in `claimed_by`. Defaults to a random UUID. |
 
+## Database schema
+
+To keep the transport tables out of your app's schema, set `schema`:
+
+```ts
+new DbTransport({ executor: typeOrmExecutor(ds), group: 'api', schema: 'durable' });
+```
+
+Every statement then names it (`"durable"."durable_transport_tasks"`, on MySQL the `durable`
+database), and `autoCreate` creates it when it is missing (the role needs `CREATE` on the database
+for that). Give every engine and worker that shares the tables the same `schema` and `prefix`,
+including [Python workers](/docs/python#sql-database) (`run_db_worker(..., schema="durable")`). The
+name must be a plain identifier of at most 63 characters.
+
+<Callout type="warn">
+  Don't move the tables with `search_path`. Behind PgBouncer in transaction mode a
+  `SET search_path` leaks to other clients' connections. The `schema` option writes the schema into
+  every statement instead.
+</Callout>
+
 ## The contract
 
 This is the **single source of truth** for the table shape and the claim protocol. The TypeScript
 `DbTransport` and the [Python `db_runner`](/docs/python#sql-database) both implement against *this*
 spec — so a Node engine and a Python worker share the same two step tables without drift. Table
 names are `<prefix>_transport_tasks` and `<prefix>_transport_results` (default prefix `durable`),
-plus `<prefix>_transport_runs`, the engines' own [run queue](#run-queue), which workers never touch.
+qualified as `<schema>.<table>` when a `schema` is set, plus `<prefix>_transport_runs`, the engines' own [run queue](#run-queue), which workers never touch.
 
 ### Tables
 

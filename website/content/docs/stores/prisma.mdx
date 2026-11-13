@@ -136,6 +136,41 @@ DurableModule.forRootAsync({
 });
 ```
 
+## Database schema (Postgres)
+
+To keep the durable tables in a Postgres schema of their own, list it on your datasource, put
+`@@schema` on every durable model you copied in, and pass the same name to the store:
+
+```prisma title="schema.prisma"
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  schemas  = ["public", "durable"]
+}
+
+model DurableWorkflowRun {
+  // ...
+  @@map("durable_workflow_runs")
+  @@schema("durable")
+}
+// ...and the same @@schema("durable") on the other seven durable models
+```
+
+```ts
+new PrismaStateStore(prisma, { schema: 'durable' });
+```
+
+Prisma Migrate creates the schema and the tables in it; the store writes the schema into its own raw
+SQL (`"durable"."durable_workflow_runs"`). Prisma has no `@@schema` on MySQL and SQLite has no
+schemas, so `schema` fails at construction on both. The name must be a plain identifier of at most
+63 characters.
+
+<Callout type="warn">
+  Don't put the tables in another schema with `search_path` (or a connection's `?schema=`). Behind
+  PgBouncer in transaction mode a `SET search_path` leaks to other clients' connections. The
+  `schema` option writes the schema into every statement instead.
+</Callout>
+
 ## Schema is owned by Prisma Migrate
 
 Unlike the MikroORM and TypeORM adapters, this one has **no auto-schema** — Prisma already owns your

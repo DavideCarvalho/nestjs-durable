@@ -98,6 +98,13 @@ export interface DbTransportOptions {
    * `${prefix}_transport_runs` for the run queue. Default `durable`.
    */
   prefix?: string;
+  /**
+   * Database schema the transport tables live in (Postgres schema; on MySQL, the database name).
+   * Every statement names it explicitly (`"schema"."durable_transport_tasks"`), so it works behind
+   * PgBouncer in transaction mode; never set `search_path` for this. With `autoCreate` on, the schema
+   * is created if missing. Default: unqualified names (the connection's current schema).
+   */
+  schema?: string;
   /** Poll interval in ms when a queue is empty. Default 500. */
   pollMs?: number;
   /**
@@ -128,6 +135,17 @@ export interface DbTransportOptions {
   instanceId?: string;
 }
 
+/** Validate the `schema` option: an identifier of at most 63 characters, or `undefined`. */
+function validSchemaName(schema: string | undefined): string | undefined {
+  if (schema === undefined) return undefined;
+  if (!/^[A-Za-z_][A-Za-z0-9_$]*$/.test(schema) || schema.length > 63) {
+    throw new Error(
+      `[DbTransport] invalid schema ${JSON.stringify(schema)}: use letters, digits, _ or $ (not first), at most 63 characters.`,
+    );
+  }
+  return schema;
+}
+
 /**
  * A numeric option: `fallback` unless `value` is a finite number of at least `min`. `Math.max(1, NaN)`
  * is `NaN`, so a clamp alone would let a `NaN` through (to `LIMIT NaN`, or a `NaN` timer).
@@ -155,6 +173,7 @@ export class DbTransport implements Transport {
   private readonly tasksTable: string;
   private readonly resultsTable: string;
   private readonly runsTable: string;
+  private readonly schema: string | undefined;
   private readonly runConsumers = new Set<RunConsumer>();
   private readonly pollMs: number;
   private readonly leaseMs: number;
@@ -188,6 +207,7 @@ export class DbTransport implements Transport {
     this.tasksTable = `${prefix}_transport_tasks`;
     this.resultsTable = `${prefix}_transport_results`;
     this.runsTable = `${prefix}_transport_runs`;
+    this.schema = validSchemaName(options.schema);
     this.pollMs = numberOption(options.pollMs, 500, 0);
     this.leaseMs = numberOption(options.leaseMs, 30_000, 1);
     this.batchSize = Math.floor(numberOption(options.batchSize, 10, 1));
@@ -206,6 +226,10 @@ export class DbTransport implements Transport {
   }
   private q(id: string): string {
     return this.exec.escapeId(id);
+  }
+  /** A transport table's name, qualified with {@link DbTransportOptions.schema} when one is set. */
+  private qt(table: string): string {
+    return this.schema === undefined ? this.q(table) : `${this.q(this.schema)}.${this.q(table)}`;
   }
   private now(): number {
     return Math.floor(Date.now());
@@ -236,12 +260,35 @@ export class DbTransport implements Transport {
     }
   }
 
+  /**
+   * Create {@link DbTransportOptions.schema} (a Postgres schema, a MySQL database) when it does not
+   * exist yet. Looked up first: `CREATE … IF NOT EXISTS` needs the CREATE privilege on the database
+   * even when the schema is already there.
+   */
+  private async createSchemaIfMissing(schema: string): Promise<void> {
+    const found = await this.exec.query(
+      this.isPg
+        ? 'SELECT 1 AS found FROM pg_namespace WHERE nspname = $1'
+        : 'SELECT 1 AS found FROM information_schema.schemata WHERE schema_name = ?',
+      [schema],
+    );
+    if (found.length > 0) return;
+    const kind = this.isPg ? 'SCHEMA' : 'DATABASE';
+    await this.createIfMissing(`CREATE ${kind} IF NOT EXISTS ${this.q(schema)}`).catch((err) => {
+      throw new Error(
+        `[DbTransport] could not create the ${kind.toLowerCase()} "${schema}" for the transport tables. Create it ahead of time, or grant this role CREATE on the database. Cause: ${(err as Error).message}`,
+        { cause: err },
+      );
+    });
+  }
+
   private async createTables(): Promise<void> {
     if (!this.autoCreate) return;
+    if (this.schema !== undefined) await this.createSchemaIfMissing(this.schema);
     const str = 'varchar(191)';
     const txt = this.isPg ? 'text' : 'longtext';
-    const tasks = this.q(this.tasksTable);
-    const results = this.q(this.resultsTable);
+    const tasks = this.qt(this.tasksTable);
+    const results = this.qt(this.resultsTable);
     await this.createIfMissing(
       `CREATE TABLE IF NOT EXISTS ${tasks} (
         ${this.q('step_id')} ${str} PRIMARY KEY,
@@ -272,7 +319,7 @@ export class DbTransport implements Transport {
       )`,
     );
     await this.createIfMissing(
-      `CREATE TABLE IF NOT EXISTS ${this.q(this.runsTable)} (
+      `CREATE TABLE IF NOT EXISTS ${this.qt(this.runsTable)} (
         ${this.q('run_id')} ${str} PRIMARY KEY,
         ${this.q('ns')} ${str} NOT NULL,
         ${this.q('priority')} integer NOT NULL,
@@ -285,7 +332,7 @@ export class DbTransport implements Transport {
     );
     await this.exec
       .query(
-        `CREATE INDEX ${this.q(`${this.runsTable}_ns_idx`)} ON ${this.q(this.runsTable)} (${this.q('ns')}, ${this.q('priority')}, ${this.q('created_at')})`,
+        `CREATE INDEX ${this.q(`${this.runsTable}_ns_idx`)} ON ${this.qt(this.runsTable)} (${this.q('ns')}, ${this.q('priority')}, ${this.q('created_at')})`,
       )
       .catch(() => {});
     // Best-effort index for the group poll (MySQL has no CREATE INDEX IF NOT EXISTS < 8.0.13).
@@ -305,7 +352,7 @@ export class DbTransport implements Transport {
   async dispatchMany(tasks: RemoteTask[]): Promise<void> {
     if (tasks.length === 0) return;
     await this.ensureSchema();
-    const t = this.q(this.tasksTable);
+    const t = this.qt(this.tasksTable);
     const cols = [
       'step_id',
       'run_id',
@@ -381,7 +428,7 @@ export class DbTransport implements Transport {
     const unique = [...byRun.values()].sort((a, b) =>
       a.runId < b.runId ? -1 : a.runId > b.runId ? 1 : 0,
     );
-    const t = this.q(this.runsTable);
+    const t = this.qt(this.runsTable);
     const cols = ['run_id', 'ns', 'priority', 'wake', 'created_at'];
     const now = this.now();
     for (let at = 0; at < unique.length; at += RUNS_INSERT_CHUNK) {
@@ -483,7 +530,7 @@ export class DbTransport implements Transport {
             .then(() =>
               this.retryOnDeadlock(() =>
                 this.exec.query(
-                  `DELETE FROM ${this.q(this.runsTable)} WHERE ${this.q('claim_token')} = ${this.ph(1)}`,
+                  `DELETE FROM ${this.qt(this.runsTable)} WHERE ${this.q('claim_token')} = ${this.ph(1)}`,
                   [token],
                 ),
               ).catch(() => undefined),
@@ -520,7 +567,7 @@ export class DbTransport implements Transport {
   }
 
   private async claimRuns(ns: string, limit: number): Promise<ClaimedRun[]> {
-    const t = this.q(this.runsTable);
+    const t = this.qt(this.runsTable);
     const staleBefore = this.now() - this.leaseMs;
     return this.exec.transaction(async (tx) => {
       const rows = await tx.query<RunRow>(
@@ -558,7 +605,7 @@ export class DbTransport implements Transport {
     const tokens = [...consumer.inflight];
     if (tokens.length === 0) return;
     await this.exec.query(
-      `UPDATE ${this.q(this.runsTable)} SET ${this.q('claimed_at')} = ${this.ph(1)}
+      `UPDATE ${this.qt(this.runsTable)} SET ${this.q('claimed_at')} = ${this.ph(1)}
        WHERE ${this.q('claim_token')} IN (${tokens.map((_, i) => this.ph(i + 2)).join(', ')})`,
       [this.now(), ...tokens],
     );
@@ -652,7 +699,7 @@ export class DbTransport implements Transport {
 
   /** Whether the claim on `stepId` is still `token`'s (re-stamping it if so). */
   private async stillHolds(stepId: string, token: string): Promise<boolean> {
-    const t = this.q(this.tasksTable);
+    const t = this.qt(this.tasksTable);
     const rows = await this.exec.transaction(async (tx) => {
       const held = await tx.query<{ step_id: string }>(
         `SELECT ${this.q('step_id')} FROM ${t} WHERE ${this.q('step_id')} = ${this.ph(1)} AND ${this.q('claimed_by')} = ${this.ph(2)} FOR UPDATE`,
@@ -671,7 +718,7 @@ export class DbTransport implements Transport {
 
   /** Delete the task row and publish its result in ONE transaction, only while `token` holds it. */
   private async settleTask(stepId: string, token: string, result: StepResult): Promise<boolean> {
-    const t = this.q(this.tasksTable);
+    const t = this.qt(this.tasksTable);
     return this.exec.transaction(async (tx) => {
       const held = await tx.query<{ step_id: string }>(
         `SELECT ${this.q('step_id')} FROM ${t} WHERE ${this.q('step_id')} = ${this.ph(1)} AND ${this.q('claimed_by')} = ${this.ph(2)} FOR UPDATE`,
@@ -748,7 +795,7 @@ export class DbTransport implements Transport {
     try {
       const ids = delivered.map((_, i) => this.ph(i + 2)).join(', ');
       await this.exec.query(
-        `DELETE FROM ${this.q(this.resultsTable)} WHERE ${this.q('claimed_by')} = ${this.ph(1)} AND ${this.q('step_id')} IN (${ids})`,
+        `DELETE FROM ${this.qt(this.resultsTable)} WHERE ${this.q('claimed_by')} = ${this.ph(1)} AND ${this.q('step_id')} IN (${ids})`,
         [token, ...delivered],
       );
     } catch (err) {
@@ -769,7 +816,7 @@ export class DbTransport implements Transport {
     where: string,
     whereParams: unknown[],
   ): Promise<{ rows: T[]; token: string }> {
-    const t = this.q(table);
+    const t = this.qt(table);
     const staleBefore = this.now() - this.leaseMs;
     const token = `${this.instanceId}:${randomUUID()}`;
     const rows = await this.exec.transaction(async (tx) => {
@@ -832,7 +879,7 @@ export class DbTransport implements Transport {
       const list = [...tokens];
       const placeholders = list.map((_, i) => this.ph(i + 2)).join(', ');
       await this.exec.query(
-        `UPDATE ${this.q(table)} SET ${this.q('claimed_at')} = ${this.ph(1)} WHERE ${this.q('claimed_by')} IN (${placeholders})`,
+        `UPDATE ${this.qt(table)} SET ${this.q('claimed_at')} = ${this.ph(1)} WHERE ${this.q('claimed_by')} IN (${placeholders})`,
         [this.now(), ...list],
       );
     }
@@ -844,7 +891,7 @@ export class DbTransport implements Transport {
    * attempts, so keeping the old row would silently drop a retry's result.
    */
   private async insertResult(result: StepResult, tx: SqlTx = this.exec): Promise<void> {
-    const t = this.q(this.resultsTable);
+    const t = this.qt(this.resultsTable);
     const cols = [
       'step_id',
       'run_id',

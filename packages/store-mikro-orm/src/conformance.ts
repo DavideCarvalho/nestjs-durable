@@ -1,6 +1,6 @@
 import type { StateStoreContext } from '@dudousxd/nestjs-durable-testing';
 import type { MikroORM, Options } from '@mikro-orm/core';
-import { ENTITIES } from './entities';
+import { ENTITIES, durableEntities } from './entities';
 import { MikroOrmStateStore } from './mikro-orm-state-store';
 
 /** Init a MikroORM instance from `options` using the supplied driver's `MikroORM.init`. Kept generic
@@ -16,13 +16,15 @@ type MikroOrmInit = (options: Options) => Promise<MikroORM>;
 export function makeMikroOrmStoreFactory(
   init: MikroOrmInit,
   options: Options,
+  durable: { schema?: string } = {},
 ): () => Promise<StateStoreContext> {
+  const entities = durable.schema === undefined ? ENTITIES : durableEntities(durable);
   return async () => {
     let statements = 0;
     const log: string[] = [];
     const orm = await init({
       ...options,
-      entities: [...ENTITIES],
+      entities: [...entities],
       allowGlobalContext: true,
       debug: ['query', 'query-params'],
       logger: (message) => {
@@ -30,16 +32,16 @@ export function makeMikroOrmStoreFactory(
         log.push(message);
       },
     });
-    const store = new MikroOrmStateStore(orm);
+    const store = new MikroOrmStateStore(orm, { schema: durable.schema });
     await store.ensureSchema();
-    await truncateAll(orm);
+    await truncateAll(orm, durable.schema);
     return {
       store,
-      peerStore: new MikroOrmStateStore(orm),
+      peerStore: new MikroOrmStateStore(orm, { schema: durable.schema }),
       statements: () => statements,
       statementLog: () => log,
       cleanup: async () => {
-        await truncateAll(orm);
+        await truncateAll(orm, durable.schema);
         await orm.close(true);
       },
     };
@@ -57,14 +59,14 @@ const TABLES = [
   'durable_workflow_runs',
 ];
 
-async function truncateAll(orm: MikroORM): Promise<void> {
+async function truncateAll(orm: MikroORM, schema?: string): Promise<void> {
   const em = orm.em.fork();
   const platform = String(em.getPlatform().constructor.name).toLowerCase();
   const ch = platform.includes('mysql') || platform.includes('mariadb') ? '`' : '"';
   for (const t of TABLES) {
     await em
       .getConnection()
-      .execute(`DELETE FROM ${ch}${t}${ch}`)
+      .execute(`DELETE FROM ${schema === undefined ? '' : `${ch}${schema}${ch}.`}${ch}${t}${ch}`)
       .catch(() => undefined);
   }
 }

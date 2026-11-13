@@ -133,6 +133,44 @@ recovery, `(workflow, status)` for the dashboard, `(status, updated_at)` for ret
 `jsonb_path_ops` index on `tags`**, `(key, num_value)` / `(key, str_value)` on the search-attribute
 side table, plus the per-token / per-name scans of the signal and event buffers.
 
+## Database schema
+
+By default the tables live in the connection's current schema (usually `public`). To keep them in a
+schema of their own, pass `schema` to the store and build your drizzle-kit tables with
+`durablePgTables(schema)`:
+
+```ts title="db/schema.ts"
+import { durablePgTables } from '@dudousxd/nestjs-durable-store-drizzle/pg';
+import { pgSchema } from 'drizzle-orm/pg-core';
+
+export const durable = pgSchema('durable'); // drizzle-kit creates the schema
+export const {
+  durableWorkflowRuns,
+  durableStepCheckpoints,
+  durableRunAttributes,
+  durableSignalWaiters,
+  durableBufferedSignals,
+  durableBufferedEvents,
+  durableSignalIds,
+  durableSchedules,
+} = durablePgTables('durable');
+```
+
+```ts
+new DrizzlePgStateStore(db, { schema: 'durable' });
+```
+
+Every statement then names the schema (`"durable"."durable_workflow_runs"`). With auto-schema on,
+boot creates the schema when it is missing (the role needs `CREATE` on the database for that). For a
+hand-written migration, `durablePgDdl('durable')` is the DDL with the schema written in, starting
+with `CREATE SCHEMA IF NOT EXISTS`. The name must be a plain identifier of at most 63 characters.
+
+<Callout type="warn">
+  Don't put the tables in another schema with `search_path` (or a connection's `?schema=`). Behind
+  PgBouncer in transaction mode a `SET search_path` leaks to other clients' connections. The
+  `schema` option writes the schema into every statement instead.
+</Callout>
+
 ## What the Postgres flavour adds
 
 - **Atomic leases.** `tryLockRun` / `renewRunLock` are one conditional `UPDATE … RETURNING`: of N
@@ -203,7 +241,6 @@ DurableModule.forRoot({
 </Callout>
 
 <Callout>
-  **Tables live in the connection's `search_path` schema** (usually `public`); there is no option to
-  put them in a separate Postgres schema yet. Wakeups are poll-based like every other store — there
-  is no `LISTEN/NOTIFY` yet; tune `timerPollMs` if you need sub-second timer resolution.
+  Wakeups are poll-based like every other store — there is no `LISTEN/NOTIFY` yet; tune
+  `timerPollMs` if you need sub-second timer resolution.
 </Callout>
