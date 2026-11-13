@@ -329,6 +329,14 @@ export class DashboardService {
     return { controlPlane, schedules: controlPlane && this.engine?.schedules?.supported === true };
   }
 
+  /** A run's id, workflow and status, or null when no run the caller may see has that id. */
+  async findRun(runId: string): Promise<{ id: string; workflow: string; status: string } | null> {
+    const run = this.gateway.getRun
+      ? await this.gateway.getRun(runId)
+      : (await this.gateway.getRunDetail(runId, { summarizeFansOver: 0 }))?.run;
+    return run ? { id: run.id, workflow: run.workflow, status: run.status } : null;
+  }
+
   /** Whether `runId` names a run the caller may see (tenancy applies). */
   async runExists(runId: string): Promise<boolean> {
     if (this.gateway.getRun) return (await this.gateway.getRun(runId)) !== null;
