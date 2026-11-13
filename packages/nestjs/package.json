@@ -38,7 +38,7 @@
     "@nestjs/outbox": ">=0.1.4 <0.2.0",
     "@nestjs/workflows": ">=0.0.5 <0.1.0",
     "class-transformer": "^0.5.0",
-    "class-validator": "^0.14.0",
+    "class-validator": "^0.14.0 || ^0.15.0",
     "reflect-metadata": "^0.2.0",
     "zod": "^3.0.0 || ^4.0.0"
   },
@@ -93,7 +93,7 @@
     "@testcontainers/redis": "10.18.0",
     "@types/supertest": "6.0.3",
     "class-transformer": "0.5.1",
-    "class-validator": "0.14.2",
+    "class-validator": "0.15.1",
     "eventemitter2": "6.4.9",
     "jose": "6.2.14",
     "reflect-metadata": "0.2.2",
