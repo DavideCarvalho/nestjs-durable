@@ -1,5 +1,34 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.61.0
+
+### Minor Changes
+
+- [#462](https://github.com/DavideCarvalho/nestjs-durable/pull/462) [`93989eb`](https://github.com/DavideCarvalho/nestjs-durable/commit/93989eb5e74fe9cdb0084c8050e7ad2a68398e7f) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Global search across the Aviary consoles. With another console mounted, Ctrl/Cmd+K (or "Search all
+  consoles" in the switcher menu) searches every console the viewer may open. Here it finds a run by id
+  and workflows by name. The endpoint is `GET <api>/consoles/search?q=`: 300 ms and 5 hits per console,
+  and `partial: true` when a console didn't answer in time. A registry entry can now carry
+  `search(context, q, limit)`.
+
+  While the switcher runs another console's `authorize` (or `search`), the request carries
+  `aviaryProbe: true`, so an authorizer that writes audit logs can skip those checks.
+
+- [#462](https://github.com/DavideCarvalho/nestjs-durable/pull/462) [`93989eb`](https://github.com/DavideCarvalho/nestjs-durable/commit/93989eb5e74fe9cdb0084c8050e7ad2a68398e7f) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Data tenancy follows the full nestjs-context 2.1 contract, and still works with older contexts.
+
+  - Nested tenants: `tenancy: { kinds }` stamps and filters by that level of the request's tenant chain,
+    so a clinic's runs are shared by its units. `family` reads a secondary tenant instead.
+  - `required` (or the context's `tenancy.required`): an app-facing start, read or control call in a
+    request with no tenant fails with `TenantRequiredError` (403), returned as a rejection. Durable's own
+    work never fails for it: turns, resumes, recovery, schedule fires and worker steps.
+  - A run's tenant is restored through the context's tenancy slot when it is published (context 2.1+),
+    in the configured `family`.
+  - Console: runs with a tenant show an organization chip labelled by the context's `tenancy.label`
+    resolver, else the slug, else the id.
+  - Tenant processes: `start` sends the customer tenant as an optional `tenantId` / `tenantKind` on the
+    start-run message. The control plane keeps it only when the verified token's `capabilities` grant
+    `tenancy:*` or `tenancy:<id>`. The process's own run gateway narrows its reads and control calls to
+    the request's tenant.
+
 ## 0.60.0
 
 ### Minor Changes
