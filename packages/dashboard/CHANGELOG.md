@@ -1,5 +1,18 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.60.0
+
+### Minor Changes
+
+- [#461](https://github.com/DavideCarvalho/nestjs-durable/pull/461) [`1918363`](https://github.com/DavideCarvalho/nestjs-durable/commit/19183630de82fef6da708c2b3051445ae49c6bed) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Global search across the Aviary consoles. With another console mounted, Ctrl/Cmd+K (or "Search all
+  consoles" in the switcher menu) searches every console the viewer may open. Here it finds a run by id
+  and workflows by name. The endpoint is `GET <api>/consoles/search?q=`: 300 ms and 5 hits per console,
+  and `partial: true` when a console didn't answer in time. A registry entry can now carry
+  `search(context, q, limit)`.
+
+  While the switcher runs another console's `authorize` (or `search`), the request carries
+  `aviaryProbe: true`, so an authorizer that writes audit logs can skip those checks.
+
 ## 0.59.0
 
 ### Minor Changes
