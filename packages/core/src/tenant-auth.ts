@@ -24,9 +24,10 @@ export interface VerifiedTenant {
   /** The tenant the token authenticates as. The responder trusts THIS, never the request body. */
   tenant: string;
   /**
-   * Capabilities the token grants, if the issuer scopes them. Carried for custom verifiers and for
-   * wire parity with Agora; the built-in responder does NOT enforce them yet. A verified tenant can
-   * call every verb, scoped to its own namespace.
+   * Capabilities the token grants, if the issuer scopes them. `tenancy:*` or `tenancy:<id>` lets the
+   * process claim that customer tenant for the runs it starts (see `StartRunMessage.tenantId`). The
+   * run-request responder does not enforce them: a verified tenant can call every verb, scoped to
+   * its own namespace.
    */
   capabilities?: string[] | undefined;
 }
@@ -124,6 +125,28 @@ export function hmacTenantVerifier(
     }
     return capabilities !== undefined ? { tenant: claim, capabilities } : { tenant: claim };
   };
+}
+
+/**
+ * Verify a wire message's `tenant`: with a verifier, the {@link VerifiedTenant} it derives (`null` on
+ * reject); without one, the wire value trusted verbatim, with no capabilities.
+ */
+export async function verifyWireTenant(
+  wireTenant: string,
+  verifyTenant: TenantVerifier | undefined,
+): Promise<VerifiedTenant | null> {
+  if (!verifyTenant) return { tenant: wireTenant };
+  return (await verifyTenant({ token: wireTenant, tenant: wireTenant })) ?? null;
+}
+
+/**
+ * Whether a verified tenant process may claim the customer `tenantId` for a run it starts: its
+ * `capabilities` hold `tenancy:*` (any customer) or `tenancy:<tenantId>`. An unverified process (no
+ * verifier) holds none, so it never may.
+ */
+export function grantsClientTenant(verified: VerifiedTenant | null, tenantId: string): boolean {
+  const capabilities = verified?.capabilities ?? [];
+  return capabilities.includes('tenancy:*') || capabilities.includes(`tenancy:${tenantId}`);
 }
 
 /**

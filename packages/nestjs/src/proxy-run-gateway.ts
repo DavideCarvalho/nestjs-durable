@@ -27,10 +27,13 @@ import type {
 } from '@dudousxd/nestjs-durable-core';
 import {
   SUMMARY_CHILD_LIMIT,
+  type TenantFilter,
   childIdsOf,
   pageFan,
   resolveTenantToken,
+  scopeTenantQuery,
   summarizeTimeline,
+  tenantVisible,
 } from '@dudousxd/nestjs-durable-core';
 import { Injectable } from '@nestjs/common';
 import { BAD_RUN_REQUEST, UNSUPPORTED_RUN_REQUEST } from './run-request-responder';
@@ -112,8 +115,68 @@ export class ProxyRunGateway implements RunGateway {
      * stays keyed by `tenant`, never the token: the operator republishes by the run's namespace.
      */
     private readonly tenantToken?: TenantTokenSource,
+    /**
+     * The customer-tenancy filter of the request being served (durable's `tenancy` on this process).
+     * The control plane answers for this process's namespace; this narrows it to the request's
+     * customer tenant: lists and counts get the tenant predicate, and a run of another tenant reads
+     * (and is controlled) as missing. Absent: no narrowing.
+     */
+    private readonly tenantFilter?: () => TenantFilter,
   ) {
     this.transport.onRunReply?.((reply: RunReply) => this.handleReply(reply));
+  }
+
+  /** The request's tenant filter when it can hide runs (`tenant` / `tenantless`), else undefined. */
+  private restrictive(): TenantFilter | undefined {
+    const filter = this.tenantFilter?.();
+    return filter && filter.mode !== 'system' && filter.mode !== 'all' ? filter : undefined;
+  }
+
+  /**
+   * Send `query`, narrowed to the runs the request may see. A tenant-required request with no
+   * tenant rejects (never throws synchronously).
+   */
+  private scoped<Q extends RunQuery | RunFacetQuery, T>(
+    query: Q,
+    send: (q: Q) => Promise<T>,
+  ): Promise<T> {
+    let filter: TenantFilter | undefined;
+    try {
+      filter = this.restrictive();
+    } catch (err) {
+      return Promise.reject(err);
+    }
+    return send(filter ? scopeTenantQuery(query, filter) : query);
+  }
+
+  /** `run` when the request may see it, else null (an invisible run reads like a missing one). */
+  private visible<T extends { tenantId?: string | null | undefined }>(
+    run: T | null | undefined,
+    filter = this.restrictive(),
+  ): T | null {
+    if (!run) return null;
+    return !filter || tenantVisible(run, filter) ? run : null;
+  }
+
+  /** Run a control call unless the request may not act on `runId` (then `null`, like a missing run).
+   *  Sent at once when nothing narrows the request. */
+  private guarded<T>(runId: string, call: () => Promise<T | null>): Promise<T | null> {
+    let filter: TenantFilter | undefined;
+    try {
+      filter = this.restrictive();
+    } catch (err) {
+      // A tenant-required request with no tenant: reject, like every other read.
+      return Promise.reject(err);
+    }
+    if (!filter) return call();
+    return this.hidden(runId).then((hidden) => (hidden ? null : call()));
+  }
+
+  /** Before a control call: true when the request may NOT act on `runId`. */
+  private async hidden(runId: string): Promise<boolean> {
+    const filter = this.restrictive();
+    if (!filter) return false;
+    return this.visible(await this.getRunUnscoped(runId), filter) === null;
   }
 
   private handleReply(reply: RunReply): void {
@@ -170,11 +233,13 @@ export class ProxyRunGateway implements RunGateway {
    * a summarized detail always carries `fans`, so its absence means the summary is made here.
    */
   async getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
+    const filter = this.restrictive();
     const detail = await this.request<RunDetail | null>(
       options === undefined
         ? { kind: 'getRunDetail', runId }
         : { kind: 'getRunDetail', runId, options },
     );
+    if (detail && filter && !this.visible(detail.run, filter)) return null;
     const over = options?.summarizeFansOver;
     if (over === undefined || !detail || detail.fans !== undefined) return detail;
     const { timeline, fans } = summarizeTimeline(detail.timeline, over);
@@ -190,6 +255,7 @@ export class ProxyRunGateway implements RunGateway {
 
   /** Paged from the full detail when the control plane is too old to page a fan itself. */
   async getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null> {
+    if (this.restrictive() && (await this.hidden(runId))) return null;
     if (!this.knownUnsupported('getFanMembers')) {
       try {
         const page = await this.request<FanPage | null | undefined>({
@@ -213,6 +279,10 @@ export class ProxyRunGateway implements RunGateway {
    * to know the verb: it then answers with no data, or with an unsupported-request error.
    */
   async getRun(runId: string): Promise<WorkflowRun | null> {
+    return this.visible(await this.getRunUnscoped(runId));
+  }
+
+  private async getRunUnscoped(runId: string): Promise<WorkflowRun | null> {
     if (!this.knownUnsupported('getRun')) {
       try {
         const run = await this.request<WorkflowRun | null | undefined>({ kind: 'getRun', runId });
@@ -237,12 +307,12 @@ export class ProxyRunGateway implements RunGateway {
   /** The control plane's `StoreRunGateway` resolves each run's `waiting` descriptor; the reply carries
    *  it through as plain JSON, so a tenant's list rows name the wait too. */
   listRuns(query: RunQuery): Promise<RunListItem[]> {
-    return this.request<RunListItem[]>({ kind: 'listRuns', query });
+    return this.scoped(query, (q) => this.request<RunListItem[]>({ kind: 'listRuns', query: q }));
   }
 
   /** Counted on the operator, over the same tenant-scoped predicates its `listRuns` reply obeys. */
   runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
-    return this.request<RunFacetRow[]>({ kind: 'runFacets', query });
+    return this.scoped(query, (q) => this.request<RunFacetRow[]>({ kind: 'runFacets', query: q }));
   }
 
   /** Enumerated on the operator, over the same tenant-scoped predicates its `listRuns` reply obeys —
@@ -252,7 +322,9 @@ export class ProxyRunGateway implements RunGateway {
     query: RunFacetQuery,
     opts?: RunValueFacetOptions,
   ): Promise<RunValueFacetRow[]> {
-    return this.request<RunValueFacetRow[]>({ kind: 'runValueFacets', axis, query, opts });
+    return this.scoped(query, (q) =>
+      this.request<RunValueFacetRow[]>({ kind: 'runValueFacets', axis, query: q, opts }),
+    );
   }
 
   /** Round-trips to the operator, which scopes the result to this tenant's own `@<tenant>` groups. */
@@ -267,28 +339,31 @@ export class ProxyRunGateway implements RunGateway {
   }
 
   cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null> {
-    return this.request<RunResult | null>(
-      opts === undefined ? { kind: 'cancel', runId } : { kind: 'cancel', runId, opts },
+    return this.guarded(runId, () =>
+      this.request<RunResult | null>(
+        opts === undefined ? { kind: 'cancel', runId } : { kind: 'cancel', runId, opts },
+      ),
     );
   }
 
   retry(runId: string): Promise<RunResult | null> {
-    return this.request<RunResult | null>({ kind: 'retry', runId });
+    return this.guarded(runId, () => this.request<RunResult | null>({ kind: 'retry', runId }));
   }
 
   continue(runId: string): Promise<RunResult | null> {
-    return this.request<RunResult | null>({ kind: 'continue', runId });
+    return this.guarded(runId, () => this.request<RunResult | null>({ kind: 'continue', runId }));
   }
 
   retryWithInput(runId: string, input: unknown): Promise<{ runId: string } | null> {
-    return this.request<{ runId: string } | null>({ kind: 'retryWithInput', runId, input });
+    return this.guarded(runId, () =>
+      this.request<{ runId: string } | null>({ kind: 'retryWithInput', runId, input }),
+    );
   }
 
   redispatchPending(runId: string): Promise<(RunResult & { redispatched: number }) | null> {
-    return this.request<(RunResult & { redispatched: number }) | null>({
-      kind: 'redispatch',
-      runId,
-    });
+    return this.guarded(runId, () =>
+      this.request<(RunResult & { redispatched: number }) | null>({ kind: 'redispatch', runId }),
+    );
   }
 
   /**

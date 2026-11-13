@@ -212,7 +212,12 @@ import {
   tenantIdsFor,
   tenantVisible,
 } from './tenancy';
-import { type TenantVerifier, resolveWireTenant } from './tenant-auth';
+import {
+  type TenantVerifier,
+  type VerifiedTenant,
+  grantsClientTenant,
+  verifyWireTenant,
+} from './tenant-auth';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group';
 import { TransportPool } from './transport-pool';
 import {
@@ -1555,13 +1560,14 @@ export class WorkflowEngine {
       // the namespace is DERIVED from it; a rejected (or throwing) verification creates nothing. The
       // start channel has no reply, so a rejection is logged and the message acknowledged, never
       // retried into a hot loop.
-      let tenant: string | null;
+      let verified: VerifiedTenant | null;
       try {
-        tenant = await resolveWireTenant(message.tenant, verifyTenant);
+        verified = await verifyWireTenant(message.tenant, verifyTenant);
       } catch {
-        tenant = null;
+        verified = null;
       }
-      if (tenant === null) {
+      const tenant = verified?.tenant ?? null;
+      if (verified === null || tenant === null) {
         console.warn(
           `[nestjs-durable] dropped a start-run for "${message.workflow}": invalid or unauthorized tenant token`,
         );
@@ -1575,6 +1581,15 @@ export class WorkflowEngine {
           namespace: tenant,
           tags: message.tags,
           searchAttributes: message.searchAttributes,
+          // The customer a tenant process claims for the run (A4): kept only when its verified
+          // token grants `tenancy:*` or `tenancy:<id>`, else the run gets no customer tenant.
+          ...(message.tenantId !== undefined
+            ? grantsClientTenant(verified, message.tenantId)
+              ? message.tenantKind !== undefined
+                ? { tenantId: message.tenantId, tenantKind: message.tenantKind }
+                : { tenantId: message.tenantId }
+              : { tenantId: null }
+            : {}),
         },
       );
     });
@@ -3942,7 +3957,13 @@ export class WorkflowEngine {
    * invisible run reads exactly like a missing one (not found, never forbidden).
    */
   private visibleRun(runId: string): Promise<WorkflowRun | null> {
-    const filter = this.restrictiveFilter();
+    let filter: TenantFilter | undefined;
+    try {
+      filter = this.restrictiveFilter();
+    } catch (err) {
+      // A host that requires a tenant throws here: surface it as a rejection, like any read.
+      return Promise.reject(err);
+    }
     // Unfiltered: the bare store read, with no extra hop (call timing is unchanged with tenancy off).
     if (!filter) return this.store.getRun(runId);
     return this.store.getRun(runId).then((run) => (run && tenantVisible(run, filter) ? run : null));
@@ -3987,8 +4008,12 @@ export class WorkflowEngine {
    * timer, a signal, recovery or a worker. A run with no tenant, or tenancy off, runs `fn` as is.
    */
   private inRunTenant<T>(run: Pick<WorkflowRun, 'tenantId' | 'tenantKind'>, fn: () => T): T {
-    const tenant = this.tenancy ? rowTenant(run) : undefined;
-    return tenant && this.tenancy ? this.tenancy.run(tenant, fn) : fn();
+    const tenancy = this.tenancy;
+    if (!tenancy) return fn();
+    const tenant = rowTenant(run);
+    const turn = tenant ? () => tenancy.run(tenant, fn) : fn;
+    // A turn is durable's own work: a tenant-required host does not reject a run with no tenant.
+    return tenancy.system ? tenancy.system(turn) : turn();
   }
 
   /**

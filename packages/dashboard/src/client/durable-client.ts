@@ -102,6 +102,8 @@ export type WorkflowRun = Omit<WireDates<CoreRunListItem>, 'input' | 'error'> & 
   input?: unknown;
   /** See {@link StepCheckpoint.error} — same widen-not-narrow convergence. */
   error?: StepError;
+  /** Display label of the run's customer tenant (the app's label resolver, else slug, else id). */
+  tenantLabel?: string;
 };
 
 export interface RunDetail {

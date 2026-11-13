@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WorkflowEngine } from './engine';
 import type { Heartbeat, StartRunMessage, StepResult, Transport } from './interfaces';
-import { hmacTenantVerifier, signTenantToken } from './tenant-auth';
+import { grantsClientTenant, hmacTenantVerifier, signTenantToken } from './tenant-auth';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
 const SECRET = 'start-run-secret';
@@ -20,7 +20,10 @@ class StartRunTransport implements Transport {
   }
 }
 
-function setup(verifyTenant?: Parameters<typeof hmacTenantVerifier>[0] | 'throws') {
+function setup(
+  verifyTenant?: Parameters<typeof hmacTenantVerifier>[0] | 'throws',
+  capabilities?: string[],
+) {
   const store = new InMemoryStateStore();
   const transport = new StartRunTransport();
   const engine = new WorkflowEngine({
@@ -33,7 +36,7 @@ function setup(verifyTenant?: Parameters<typeof hmacTenantVerifier>[0] | 'throws
             throw new Error('verifier down');
           }
         : verifyTenant !== undefined
-          ? hmacTenantVerifier(verifyTenant)
+          ? hmacTenantVerifier(verifyTenant, capabilities)
           : undefined,
   });
   engine.register('processing', '1', async (_ctx, input) => input);
@@ -78,5 +81,61 @@ describe('WorkflowEngine — start-run tenant verification', () => {
     const { store, transport } = setup();
     await transport.deliver({ tenant: 'acme', workflow: 'processing', input: {} });
     expect((await store.listRuns({}))[0]?.namespace).toBe('acme');
+  });
+});
+
+describe('WorkflowEngine — a customer tenant claimed on a start-run (A4)', () => {
+  const claim = (tenantId: string) => ({
+    tenant: signTenantToken('acme', SECRET),
+    workflow: 'processing',
+    input: {},
+    tenantId,
+    tenantKind: 'organization',
+  });
+
+  it('keeps the claim when the verified token grants tenancy:* or tenancy:<id>', async () => {
+    for (const grant of ['tenancy:*', 'tenancy:org_1']) {
+      const { store, transport } = setup(SECRET, [grant]);
+      await transport.deliver(claim('org_1'));
+      const [run] = await store.listRuns({});
+      expect(run).toMatchObject({
+        namespace: 'acme',
+        tenantId: 'org_1',
+        tenantKind: 'organization',
+      });
+    }
+  });
+
+  it('drops the claim (the run gets no customer tenant) without a matching capability', async () => {
+    for (const capabilities of [undefined, ['gpu'], ['tenancy:org_2']]) {
+      const { store, transport } = setup(SECRET, capabilities);
+      await transport.deliver(claim('org_1'));
+      const [run] = await store.listRuns({});
+      expect(run?.namespace).toBe('acme');
+      expect(run?.tenantId ?? null).toBeNull();
+    }
+  });
+
+  it('keeps a claim with no kind without inventing one', async () => {
+    const { store, transport } = setup(SECRET, ['tenancy:*']);
+    const { tenantKind: _kind, ...withoutKind } = claim('org_1');
+    await transport.deliver(withoutKind);
+    const [run] = await store.listRuns({});
+    expect(run?.tenantId).toBe('org_1');
+    expect(run && 'tenantKind' in run).toBe(false);
+  });
+
+  it('never trusts a claim from an unverified process', async () => {
+    const { store, transport } = setup();
+    await transport.deliver({ ...claim('org_1'), tenant: 'acme' });
+    expect((await store.listRuns({}))[0]?.tenantId ?? null).toBeNull();
+  });
+
+  it('grantsClientTenant reads only the tenancy capabilities', () => {
+    expect(grantsClientTenant({ tenant: 'a', capabilities: ['tenancy:*'] }, 'x')).toBe(true);
+    expect(grantsClientTenant({ tenant: 'a', capabilities: ['tenancy:x'] }, 'x')).toBe(true);
+    expect(grantsClientTenant({ tenant: 'a', capabilities: ['tenancy:y'] }, 'x')).toBe(false);
+    expect(grantsClientTenant({ tenant: 'a' }, 'x')).toBe(false);
+    expect(grantsClientTenant(null, 'x')).toBe(false);
   });
 });

@@ -26,6 +26,7 @@ import { NotModifiedException, NotModifiedFilter, setEtag } from './not-modified
 import { type RunListRow, toRunListRow } from './run-list-row.js';
 import type { RunQueryDraft } from './run-query-draft.js';
 import { RunFilter } from './run.filter.js';
+import { withTenantLabels } from './tenant-labels.js';
 
 /**
  * JSON API consumed by the control-plane SPA. The mounted {@link DurableApiController} sits at
@@ -64,7 +65,8 @@ export class DurableApiControllerBase {
   async runs(@ApplyFilter(RunFilter) draft: RunQueryDraft): Promise<RunListRow[]> {
     const runs = await this.dashboard.listRuns(draft.query);
     // Rows only — the three payload fields are the bulk of a large listing and belong to `runs/:id`.
-    return runs.map(toRunListRow);
+    // Each row with a customer tenant also gets its display label.
+    return withTenantLabels(runs.map(toRunListRow));
   }
 
   /**
@@ -195,7 +197,8 @@ export class DurableApiControllerBase {
       if (notModified) throw new NotModifiedException(etag);
       setEtag(response, etag);
     }
-    return body;
+    const [run = body.run] = await withTenantLabels([body.run]);
+    return { ...body, run };
   }
 
   /** One page of a summarized fan's members, in seq order. Versioned like {@link run}. */

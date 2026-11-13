@@ -1547,6 +1547,14 @@ export interface StartRunMessage {
   tags?: string[] | undefined;
   /** Typed, queryable run data to stamp on the run (same as {@link StartOptions.searchAttributes}). */
   searchAttributes?: SearchAttributes | undefined;
+  /**
+   * The customer (data tenant) the run belongs to, as the tenant process sees it. Only a claim: the
+   * control plane keeps it when the process's verified token grants `tenancy:*` or
+   * `tenancy:<tenantId>` in its `capabilities`, else the run gets no customer tenant.
+   */
+  tenantId?: string | undefined;
+  /** The kind of {@link tenantId} (`organization`, `clinic`, …). */
+  tenantKind?: string | undefined;
 }
 
 /**
