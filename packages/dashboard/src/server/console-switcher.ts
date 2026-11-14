@@ -291,7 +291,8 @@ export async function listVisibleConsoles(
  * Global search: `q` goes to every console the viewer may open that has a `search` (this one
  * included: the viewer is already in it), in parallel, `timeoutMs` each, at most
  * {@link CONSOLE_SEARCH_HITS} same-origin hits per console. Consoles with no hit are left out; a
- * console that did not answer in time sets `partial`. The probe marker is on the request while the
+ * console that did not answer in time sets `partial`. `only` (a console id) limits the search to
+ * that one console, still behind its own `authorize`. The probe marker is on the request while the
  * other consoles' `authorize` and every `search` run.
  */
 export async function searchConsoles(
@@ -300,12 +301,18 @@ export async function searchConsoles(
   context: ExecutionContext,
   q: unknown,
   timeoutMs = CONSOLE_PROBE_TIMEOUT_MS,
+  only?: unknown,
 ): Promise<ConsoleSearchResults> {
   const query = typeof q === 'string' ? q.trim().slice(0, 200) : '';
   if (!registry || query === '') return { version: 1, q: query, partial: false, results: [] };
+  // `only`: one console's hits (⌘K asks each console on its own and streams the groups in).
+  const one = typeof only === 'string' && only !== '' ? only : undefined;
   const searchable = sorted(
     registry.entries.filter(
-      (entry) => typeof entry.search === 'function' && isSameOriginPath(entry.path),
+      (entry) =>
+        typeof entry.search === 'function' &&
+        isSameOriginPath(entry.path) &&
+        (one === undefined || entry.id === one),
     ),
   );
   const self = searchable.filter((entry) => entry.id === selfId);
@@ -468,14 +475,23 @@ export class DurableConsolesController {
 
   /**
    * `GET <api>/consoles/search?q=`: `q` across this console and every other one the viewer may
-   * open that can search (runs by id and workflows here), 5 hits each.
+   * open that can search (runs by id and workflows here), 5 hits each. `&console=<id>` answers for
+   * that one console only, so the SPA can stream each console's group in as it arrives.
    */
   @Get('consoles/search')
   @Header('Cache-Control', 'private, no-store')
   search(
     @CurrentExecutionContext() current: CurrentContext,
     @Query('q') q: unknown,
+    @Query('console') only: unknown,
   ): Promise<ConsoleSearchResults> {
-    return searchConsoles(readAviaryConsoles(), DURABLE_CONSOLE_ID, current.context, q);
+    return searchConsoles(
+      readAviaryConsoles(),
+      DURABLE_CONSOLE_ID,
+      current.context,
+      q,
+      CONSOLE_PROBE_TIMEOUT_MS,
+      only,
+    );
   }
 }

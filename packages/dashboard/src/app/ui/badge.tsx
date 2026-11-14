@@ -1,45 +1,48 @@
-import { type VariantProps, cva } from 'class-variance-authority';
 import { forwardRef } from 'react';
+import { badgeVariants as kitBadgeVariants } from '../../aviary-kit/ui/badge';
 import { cn } from './cn';
 
 /**
  * A non-interactive label chip: tags, the tenant/partition, `dlq`, search attributes, the workflow
- * version. The `status` variant is colourless on purpose — a run/step badge takes its hue from the
- * `s-<status>` class in `index.css`, which is the single place run status colour is defined.
+ * version. The kit's shadcn `Badge` look (authkit `.badge`), under this console's own variant names,
+ * each mapped onto a kit tone. The `status` variant is colourless on purpose — a run/step badge takes
+ * its hue from the `s-<status>` class in `index.css`, the single place run status colour is defined.
  */
-export const badgeVariants = cva(
-  'inline-flex items-center gap-1.5 rounded border px-1.5 text-[10px] leading-relaxed',
-  {
-    variants: {
-      variant: {
-        outline: 'border-line bg-zinc-800/40 text-zinc-400',
-        /** Tenant / worker-pool partition. */
-        tenant: 'border-sky-500/30 bg-sky-500/10 text-sky-300',
-        /** The customer (organization) the run belongs to — data tenancy, not the worker pool. */
-        organization: 'border-violet-500/30 bg-violet-500/10 text-violet-300',
-        /** The package that declared the run's workflow (`WorkflowRun.origin`) — a CODE-provenance
-         *  axis, so it gets its own hue rather than sharing the tenant's sky. */
-        origin: 'border-teal-500/30 bg-teal-500/10 text-teal-300',
-        /** No package origin — the app's own workflow (`origin app`). Drawn dim, with no hue, instead
-         *  of borrowing the `origin` teal — an app-own run must not look like a package's. */
-        'origin-unknown': 'border-line bg-zinc-800/40 italic text-zinc-500',
-        /** Typed search attribute. */
-        attr: 'border-indigo-500/30 bg-indigo-500/10 text-indigo-300',
-        /** Dead-letter marker. */
-        danger: 'border-rose-500/40 bg-rose-500/10 text-rose-300',
-        /** Saga compensation marker. */
-        warn: 'border-warn/40 bg-warn/10 text-warn',
-        /** Run/step status — colour comes from the caller's `s-<status>` class. */
-        status: 'border-transparent px-0 uppercase tracking-wider',
-      },
-    },
-    defaultVariants: { variant: 'outline' },
-  },
-);
+const VARIANT = {
+  outline: 'neutral',
+  /** Tenant / worker-pool partition. */
+  tenant: 'info',
+  /** The customer (organization) the run belongs to — data tenancy, not the worker pool. */
+  organization: 'violet',
+  /** The package that declared the run's workflow (`WorkflowRun.origin`): code provenance. */
+  origin: 'teal',
+  /** No package origin — the app's own workflow. Dim, with no hue. */
+  'origin-unknown': 'neutral',
+  /** Typed search attribute. */
+  attr: 'violet',
+  /** Dead-letter marker. */
+  danger: 'destructive',
+  /** Saga compensation marker. */
+  warn: 'warn',
+  /** Run/step status — colour comes from the caller's `s-<status>` class. */
+  status: 'bare',
+} as const;
 
-export interface BadgeProps
-  extends React.HTMLAttributes<HTMLSpanElement>,
-    VariantProps<typeof badgeVariants> {}
+export type BadgeVariant = keyof typeof VARIANT;
+
+export function badgeVariants({
+  variant = 'outline',
+}: { variant?: BadgeVariant | null | undefined } = {}) {
+  return cn(
+    kitBadgeVariants({ variant: VARIANT[variant ?? 'outline'] }),
+    variant === 'origin-unknown' && 'italic',
+    variant === 'status' && 'gap-1.5',
+  );
+}
+
+export interface BadgeProps extends React.HTMLAttributes<HTMLSpanElement> {
+  variant?: BadgeVariant | null;
+}
 
 export const Badge = forwardRef<HTMLSpanElement, BadgeProps>(
   ({ className, variant, ...props }, ref) => (

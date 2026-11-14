@@ -8,6 +8,7 @@ import {
   UseConsoleAuthorize,
   resolveConsoleAuthorize,
 } from './console-authorize.js';
+import type { ConsoleSignOutOption, ConsoleViewerResolver } from './console-shell.js';
 import { DurableConsoleRegistration, DurableConsolesController } from './console-switcher.js';
 import { controllerFor, markOpenToAuthorization } from './controller-decorators.js';
 import { DashboardService } from './dashboard.service.js';
@@ -20,7 +21,7 @@ import {
 } from './durable-ui.controller.js';
 import { RUN_QUERY_ADAPTER, RunQueryAdapter } from './run-query.adapter.js';
 import { RunFilter } from './run.filter.js';
-import { DASHBOARD_DEV_TOOLS } from './tokens.js';
+import { DASHBOARD_DEV_TOOLS, DASHBOARD_SHELL } from './tokens.js';
 
 // Every controller this module mounts is open to `@nestjs/authorization`'s global guard, which
 // denies by default: access is decided by `authorize` (the console's own guard), and a `@Can()`
@@ -123,6 +124,28 @@ export interface DurableDashboardOptions {
    * the console's routes are mounted, off with `routes: false`.
    */
   devTools?: boolean;
+  /**
+   * Who the console's sidebar footer says is signed in: `(request) => ({ label, email?, role? })`,
+   * sync or async. `null`/`undefined` or a throw shows no user row.
+   *
+   * Omitted: `request.user` is read structurally — whatever your guards (`decorators`) already put
+   * there: `fullName` → `name` → `email` for the label, and `role` or the first of `roles` (a
+   * string or `{ name }`). Reading it never triggers an authentication.
+   */
+  viewer?: ConsoleViewerResolver;
+  /**
+   * The sidebar footer's sign-out. One of:
+   *
+   * - `'/logout'`: a POST form to that path (with `_csrf` when the request exposes
+   *   `req.csrfToken()`);
+   * - `{ href: '/logout' }`: a plain link;
+   * - `{ action: '/logout', csrfToken: (request) => token }`: a POST form with your token as `_csrf`;
+   * - `false`: none, even when an account console announced one.
+   *
+   * Omitted: the sign-out an account console announced on the Aviary consoles registry
+   * (`account.signOut`), else none. Only same-origin paths (`/x`) are ever sent to the page.
+   */
+  signOut?: ConsoleSignOutOption;
 }
 
 /** `routes: false` mounts nothing, so `decorators` would decorate nothing. Refuse it at boot. */
@@ -244,6 +267,13 @@ export class DurableDashboardModule {
     const pathProviders: Provider[] = [
       { provide: DASHBOARD_BASE_PATH, useValue: basePath },
       { provide: DASHBOARD_API_PATH, useValue: apiBasePath },
+      {
+        provide: DASHBOARD_SHELL,
+        useValue: {
+          ...(options.viewer ? { viewer: options.viewer } : {}),
+          ...(options.signOut !== undefined ? { signOut: options.signOut } : {}),
+        },
+      },
     ];
     if (options.routes === false) {
       assertNothingToDecorate(options);
@@ -261,7 +291,7 @@ export class DurableDashboardModule {
         // What a host's subclasses of `DurableUiControllerBase` / `DurableApiControllerBase` inject:
         // the SPA's paths, the read/action service, the filter runner and the resolved `authorize`
         // (for `@UseConsoleAuthorize()`) via the API module.
-        exports: [DurableApiModule, DASHBOARD_BASE_PATH, DASHBOARD_API_PATH],
+        exports: [DurableApiModule, DASHBOARD_BASE_PATH, DASHBOARD_API_PATH, DASHBOARD_SHELL],
       };
     }
     return {

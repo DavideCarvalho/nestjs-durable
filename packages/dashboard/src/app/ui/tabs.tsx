@@ -18,10 +18,7 @@ export const TabsList = forwardRef<
 >(({ className, ...props }, ref) => (
   <TabsPrimitive.List
     ref={ref}
-    className={cn(
-      'flex items-center gap-0.5 rounded border border-line bg-zinc-900/60 p-0.5',
-      className,
-    )}
+    className={cn('flex items-center gap-0.5 rounded border border-line bg-hover p-0.5', className)}
     {...props}
   />
 ));
@@ -34,7 +31,7 @@ export const TabsTab = forwardRef<
   <TabsPrimitive.Tab
     ref={ref}
     className={cn(
-      'mono cursor-pointer rounded px-1.5 py-0.5 text-[10px] text-zinc-500 transition-colors hover:text-zinc-300 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring data-[active]:bg-zinc-700 data-[active]:text-zinc-100',
+      'mono cursor-pointer rounded px-1.5 py-0.5 text-[10px] text-dim transition-colors hover:text-fg-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring data-[active]:bg-line-strong data-[active]:text-fg',
       className,
     )}
     {...props}

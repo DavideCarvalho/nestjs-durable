@@ -1,4 +1,4 @@
-import type { SVGProps } from 'react';
+import type { JSX, SVGProps } from 'react';
 
 /** Crisp 1.6px-stroke line icons — no icon-font dependency, tuned for the control-plane aesthetic. */
 const base = {
