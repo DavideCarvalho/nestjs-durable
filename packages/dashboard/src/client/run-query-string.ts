@@ -79,17 +79,29 @@ export function runQueryString(
   if (predicates.origin === null) filter.unattributed = 'true';
   else if (predicates.origin) filter.origin = predicates.origin;
 
+  // An attribute `in` set goes as repeated `filter[attr.<key>][in][]=` params, never comma-joined:
+  // the server splits a comma-joined `in` operand, so a value holding a comma would become two.
+  // `flatObjectToQueryString` joins an array under an operator with commas, so these are emitted
+  // here instead.
+  const inSets: string[] = [];
   for (const entry of predicates.attr ?? []) {
     const [key, op, ...rest] = entry.split(':');
     if (!key || !op || !ATTR_OPERATORS.has(op) || rest.length === 0) continue;
     const operand = rest.join(':');
     const field = `attr.${key}`;
+    if (op === 'in') {
+      const name = `filter[${encodeURIComponent(field)}][in][]`;
+      for (const value of operand.split('|').filter(Boolean)) {
+        inSets.push(`${name}=${encodeURIComponent(value)}`);
+      }
+      continue;
+    }
     const ops = (filter[field] ?? {}) as Record<string, string>;
-    ops[op] = op === 'in' ? operand.split('|').filter(Boolean).join(',') : operand;
+    ops[op] = operand;
     filter[field] = ops;
   }
 
-  const parts = [flatObjectToQueryString(filter, { prefix: 'filter' })];
+  const parts = [flatObjectToQueryString(filter, { prefix: 'filter' }), ...inSets];
   if (paging.page !== undefined) parts.push(`page=${paging.page}`);
   if (paging.size !== undefined) parts.push(`size=${paging.size}`);
   if (groupByCount) {

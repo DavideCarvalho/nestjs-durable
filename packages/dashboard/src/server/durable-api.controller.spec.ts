@@ -218,13 +218,18 @@ describe('DurableApiController: run-list filters', () => {
     ]);
   });
 
-  it('no longer reads the removed flat params', async () => {
+  it.each([
+    [{ status: 'dead' }, /filter\[status\]/],
+    [{ limit: '5' }, /"size"/],
+    [{ offset: '10' }, /"page"/],
+  ])('answers 400 for the removed flat param %j instead of ignoring it', async (query, message) => {
     const c = await makeConsole();
 
-    await c.list({ status: 'dead', limit: '5', offset: '10' });
-
-    expect(c.queries[0]?.status).toBeUndefined();
-    expect(c.queries[0]).toMatchObject({ limit: 100, offset: 0 });
+    await expect(c.list(query)).rejects.toMatchObject({
+      status: 400,
+      message: expect.stringMatching(message),
+    });
+    expect(c.queries).toEqual([]);
   });
 });
 
@@ -394,14 +399,16 @@ describe('DurableApiController: bulk scoping', () => {
     expect(c.queries[0]?.origin).toBeUndefined();
   });
 
-  it('ignores page params, so "retry all" is not "retry the first page"', async () => {
+  it('refuses page params, so "retry all" is never mistaken for "retry the first page"', async () => {
     const c = await makeConsole();
 
-    await c.bulk('retry', { filter: { status: 'dead' }, page: '3', size: '100' });
+    await expect(
+      c.bulk('retry', { filter: { status: 'dead' }, page: '3', size: '100' }),
+    ).rejects.toMatchObject({ status: 400 });
+    expect(c.queries).toEqual([]);
 
+    await c.bulk('retry', { filter: { status: 'dead' } });
     expect(c.queries[0]?.offset).toBeUndefined();
-    // `bulk` applies its own bound; what matters is that the operator's 100 is gone.
-    expect(c.queries[0]?.limit).not.toBe(100);
   });
 });
 
@@ -472,11 +479,17 @@ describe('DurableApiController: facets', () => {
     // Counting "how many are failed" inside a query already filtered to failed answers itself.
     const c = await makeConsole();
 
-    await c.facets({ filter: { status: 'failed', origin: '@acme/billing' }, size: '10' });
+    await c.facets({ filter: { status: 'failed', origin: '@acme/billing' } });
 
     expect(c.facetQueries[0]).not.toHaveProperty('status');
     expect(c.facetQueries[0]).not.toHaveProperty('origin');
     expect(c.facetQueries[0]).not.toHaveProperty('limit');
+  });
+
+  it('answers 400 for a paging param, which a set of counts does not take', async () => {
+    const c = await makeConsole();
+
+    await expect(c.facets({ size: '10' })).rejects.toMatchObject({ status: 400 });
   });
 
   it('wraps the cells as { data }', async () => {
