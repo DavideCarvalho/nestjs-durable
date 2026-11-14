@@ -1,4 +1,10 @@
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import {
+  keepPreviousData,
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query';
 import { type Dispatch, type SetStateAction, useCallback, useMemo, useState } from 'react';
 import { ActionDialog } from '../../aviary-kit/blocks/action-dialog';
 import { EmptyState } from '../../aviary-kit/blocks/empty-state';
@@ -6,7 +12,12 @@ import { ErrorBoundary } from '../../aviary-kit/blocks/error-boundary';
 import { Toolbar } from '../../aviary-kit/blocks/page-header';
 import { ChevronLeftIcon, FilterIcon } from '../../aviary-kit/icons';
 import { cn } from '../../aviary-kit/lib/utils';
-import { type RunStatus, durableClient } from '../../client/durable-client';
+import {
+  type RunStatus,
+  type WorkflowRun,
+  durableClient,
+  hasNextPage,
+} from '../../client/durable-client';
 import {
   ALL_ORIGINS,
   type OriginFilter,
@@ -35,7 +46,7 @@ import { anySingleton, useSingletonSiblings } from './singleton';
  * How many runs one page of the list holds. Bounded deliberately: a control plane accumulates runs
  * for as long as its retention policy keeps them (tens of thousands is ordinary), and an unbounded
  * listing costs the browser both the transfer and a DOM node per row. 100 fills the pane several
- * times over; scrolling raises the ceiling for an operator who wants to go further back.
+ * times over; scrolling loads the next `page` for an operator who wants to go further back.
  */
 const PAGE_SIZE = 100;
 
@@ -149,10 +160,6 @@ export function RunsPage({
   const [filtersOpen, setFiltersOpen] = useState(
     () => typeof window === 'undefined' || window.innerWidth >= 1024,
   );
-  // How many pages of the list are loaded, and for WHICH result set. One piece of state rather than
-  // two, so that `pages` can be DERIVED below: reset it from an effect instead and the render that
-  // changes the filters still asks for every page the previous view had loaded.
-  const [paging, setPaging] = useState({ key: '', pages: 1 });
   const qc = useQueryClient();
   const attrPredicates = attrFilter;
   const attrKey = attrPredicates.join('|');
@@ -174,28 +181,45 @@ export function RunsPage({
     namespace: namespaceFilter.join('|'),
     origin: originKey,
   });
-  // Every filter change starts at page one.
-  const pages = paging.key === runsListResetKey ? paging.pages : 1;
-  const limit = PAGE_SIZE * pages;
+  // Load-more over `page`: each filter change is a new query key, so it starts at page one; scrolling
+  // appends the next page. Every loaded page is refetched on the live interval.
   const {
-    data: runs = [],
+    data: runPages,
     isPending: runsPending,
     isFetching: runsFetching,
-  } = useQuery({
-    queryKey: ['runs', filter, tagFilter, attrKey, namespaceFilter, originKey, limit],
-    queryFn: () =>
+    fetchNextPage,
+    hasNextPage: runsHaveNextPage,
+  } = useInfiniteQuery({
+    queryKey: ['runs', filter, tagFilter, attrKey, namespaceFilter, originKey],
+    queryFn: ({ pageParam }) =>
       durableClient.runs(
         filter === 'all' ? undefined : filter,
         tagFilter,
         attrPredicates.length ? attrPredicates : undefined,
         // An empty selection sends NO `namespace` predicate — all tenants, the historical default.
-        { namespace: namespaceFilter, origin: originParam, limit },
+        { namespace: namespaceFilter, origin: originParam, page: pageParam, size: PAGE_SIZE },
       ),
+    initialPageParam: 1,
+    getNextPageParam: (last) => (hasNextPage(last) ? last.meta.currentPage + 1 : undefined),
     refetchInterval: 3000, // keep the run list live
-    // Loading more and every filter change move the query key. Without this the list would blank
-    // back to its skeleton on each one, which reads as "the runs went away".
+    // Every filter change moves the query key. Without this the list would blank back to its
+    // skeleton on each one, which reads as "the runs went away".
     placeholderData: keepPreviousData,
   });
+  // The loaded pages as one list. New runs arriving between two page fetches shift the offsets, so a
+  // run can show up at the end of one page and the start of the next: keep its first appearance.
+  const runs = useMemo(() => {
+    const seen = new Set<string>();
+    const out: WorkflowRun[] = [];
+    for (const page of runPages?.pages ?? []) {
+      for (const run of page.data) {
+        if (seen.has(run.id)) continue;
+        seen.add(run.id);
+        out.push(run);
+      }
+    }
+    return out;
+  }, [runPages]);
   // The chips' numbers, counted server-side over the WHOLE matching set: the page bounds what is
   // rendered, never what the operator is told exists.
   const { data: facets = [] } = useQuery({
@@ -302,11 +326,8 @@ export function RunsPage({
     [setNamespaceFilter],
   );
   const loadMore = useCallback(() => {
-    setPaging((p) => ({
-      key: runsListResetKey,
-      pages: p.key === runsListResetKey ? p.pages + 1 : 2,
-    }));
-  }, [runsListResetKey]);
+    if (runsHaveNextPage) void fetchNextPage();
+  }, [runsHaveNextPage, fetchNextPage]);
 
   const filterSummary =
     [

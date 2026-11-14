@@ -1,5 +1,5 @@
 import 'reflect-metadata';
-import { ApplyFilterInterceptor, FilterRunner } from '@dudousxd/nestjs-filter';
+import { FilterRunner } from '@dudousxd/nestjs-filter';
 import { type DynamicModule, Module, type Provider, type Type } from '@nestjs/common';
 import { ModuleRef, RouterModule } from '@nestjs/core';
 import {
@@ -233,7 +233,6 @@ export class DurableApiModule {
             new FilterRunner(moduleRef, { validation: 'off' }, null),
           inject: [ModuleRef],
         },
-        ApplyFilterInterceptor,
         RunQueryAdapter,
         { provide: RUN_QUERY_ADAPTER, useExisting: RunQueryAdapter },
         RunFilter,

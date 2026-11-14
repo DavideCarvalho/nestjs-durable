@@ -140,24 +140,36 @@ function serve(route: string, query: URLSearchParams): unknown {
       if (cell) cell.count += 1;
       else cells.set(key, { status: run.status, origin, count: 1 });
     }
-    return [...cells.values()];
+    return { data: [...cells.values()] };
   }
   if (route !== '/runs') return undefined;
   window.__bench.polls += 1;
   churn();
-  const statuses = query.getAll('status');
-  const origin = query.get('origin');
-  const limit = query.get('limit');
+  const statuses = [...query.getAll('filter[status]'), ...query.getAll('filter[status][]')].flatMap(
+    (s) => s.split(','),
+  );
+  const origin = query.get('filter[origin]');
+  const page = Math.max(1, Number(query.get('page') ?? 1) || 1);
+  const size = Math.max(1, Number(query.get('size') ?? 100) || 100);
   let rows = all;
   if (statuses.length) rows = rows.filter((r) => statuses.includes(r.status));
-  if (query.get('unattributed') === 'true') rows = rows.filter((r) => !r.origin?.trim());
+  if (query.get('filter[unattributed]') === 'true') rows = rows.filter((r) => !r.origin?.trim());
   else if (origin) rows = rows.filter((r) => r.origin === origin);
   // The list endpoint's projection — the payloads the console never renders in a row.
-  const page = limit ? rows.slice(0, Number(limit)) : rows;
-  return page.map((r) => {
+  const data = rows.slice((page - 1) * size, page * size).map((r) => {
     const { input: _i, output: _o, error: _e, ...row } = r;
     return row;
   });
+  return {
+    data,
+    meta: {
+      total: rows.length,
+      perPage: size,
+      currentPage: page,
+      lastPage: Math.max(1, Math.ceil(rows.length / size)),
+      firstPage: 1,
+    },
+  };
 }
 
 const real = window.fetch.bind(window);

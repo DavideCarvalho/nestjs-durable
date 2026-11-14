@@ -143,7 +143,7 @@ describe('cutover from @nestjs/workflows through MigrationClient', () => {
     await router.start(DurableApproval, { orderId: 'new' }, 'new-3');
     await router.result('new-3', { timeoutMs: 50 }).catch(() => undefined); // let it park
     const res = await request(http).get('/durable/api/runs').expect(200);
-    const ids = ((res.body.runs ?? res.body) as Array<{ id: string }>).map((r) => r.id);
+    const ids = (res.body.data as Array<{ id: string }>).map((r) => r.id);
     expect(ids).toEqual(expect.arrayContaining(['old-1', 'new-3']));
 
     const legacy = (await request(http).get('/durable/api/runs/old-1').expect(200)).body;

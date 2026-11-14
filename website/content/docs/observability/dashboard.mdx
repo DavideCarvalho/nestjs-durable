@@ -477,8 +477,8 @@ and offers a jump into the app's own runs. A run's detail header states `origin 
 same reason, instead of leaving the field blank.
 
 Both filters push down to the store, including the `app` (no-origin) one. `RunQuery.origin` accepts **`null`**
-for exactly that bucket (`origin IS NULL`), which the console sends as `?unattributed=true` — its own
-param rather than a reserved `origin` value, because any reserved string is a package name someone can
+for exactly that bucket (`origin IS NULL`), which the console sends as `filter[unattributed]=true` — its own
+filter field rather than a reserved `origin` value, because any reserved string is a package name someone can
 legitimately publish. The chips' counts come from [`GET runs/facets`](#counting-without-listing), not
 from the rows on screen, so the `app` count stays visible and exact while a package is selected —
 the property the facet exists for. **Retry all** / **cancel all** send the same predicate, so a bulk
@@ -497,12 +497,13 @@ action is scoped to precisely the set the list was showing, unattributed runs in
 A control plane accumulates runs for as long as its retention policy keeps them, so "list the runs" is
 not a bounded request. The console treats it as a **page**:
 
-- `GET runs` takes `limit` / `offset`, and the SPA asks for 100 rows at a time, extending the page as
-  the last rows scroll into view. Every store adapter implements both. The load starts a lookahead
-  before the bottom, so the list reads as continuous rather than stalling at each boundary, and it is
-  gated on the fetch in flight and on the count the page was last requested at — otherwise a control
-  plane whose `total` briefly runs ahead of its own listing would walk the page size up on every
-  render, which is the failure paging exists to prevent.
+- `GET runs` takes `page` / `size` (default 100, at most 500) and answers
+  `{ data, meta: { total, perPage, currentPage, lastPage, firstPage } }`. The SPA loads page 1, then
+  appends the next page as the last rows scroll into view. The load starts a lookahead before the
+  bottom, so the list reads as continuous rather than stalling at each boundary, and it is gated on
+  the fetch in flight and on the count the page was last requested at — otherwise a control plane
+  whose `total` briefly runs ahead of its own listing would request pages on every render. New runs
+  arriving between two page fetches shift the offsets, so the SPA drops a run it already holds.
 - The list is **virtualised**: only the rows in the viewport are mounted, so a deep page costs the same
   DOM as a shallow one.
 - `GET runs` returns list **rows**, not whole runs — `input`, `output` and `error` are omitted, because
@@ -515,8 +516,8 @@ which the list never shows. Rendering it mounted 115,636 DOM nodes and blocked t
 for 26.9 out of every 30 seconds.
 
 <Callout>
-  The list endpoint is unbounded when you send no bound, so an existing API consumer is never silently
-  truncated. It is the console that always sends a `limit`.
+  The list endpoint is always bounded: no `size` means 100 rows, and a larger `size` is clamped to
+  500. Walk `page` up to `meta.lastPage` to read every matching run.
 </Callout>
 
 #### Counting without listing
@@ -530,9 +531,11 @@ const facets = await durableClient.facets(tag, attrs, namespace);
 // → [{ status: 'failed', origin: '@acme/billing', count: 3658 }, { status: 'failed', origin: null, count: 12 }, …]
 ```
 
-`origin: null` is the unattributed bucket — a real, countable cell rather than the absence a value
-match cannot express. `status` and `origin` are deliberately **not** accepted as params: they are the
-axes being counted, so narrowing by them would report the answer back to itself.
+Over HTTP the route answers `{ data: [...] }` with the same cells. `origin: null` is the unattributed
+bucket — a real, countable cell rather than the absence a value match cannot express.
+`filter[status]`, `filter[origin]` and `filter[unattributed]` are accepted but **dropped** before
+counting: they are the axes being counted, so narrowing by them would report the answer back to
+itself.
 
 It is backed by `StateStore.runFacets` (optional on the port; a store without it falls back to counting
 a listing) and `RunGateway.runFacets`, which a tenant deployment round-trips to the control plane the
@@ -600,8 +603,8 @@ import { durableClient } from '@dudousxd/nestjs-durable-dashboard/client';
 
 const detail = await durableClient.run(runId); // summarized: detail.fans, detail.childCount
 for (const fan of detail.fans ?? []) {
-  const page = await durableClient.fanMembers(runId, fan.group, { offset: 0, limit: 100, failed: true });
-  console.log(fan.label, `${page.total} failed`, page.items.map((cp) => cp.seq));
+  const page = await durableClient.fanMembers(runId, fan.group, { page: 1, size: 100, failed: true });
+  console.log(fan.label, `${page.meta.total} failed`, page.data.map((cp) => cp.seq));
 }
 ```
 
@@ -985,18 +988,19 @@ same routes with full types instead of hand-rolling `fetch`:
 ```ts
 import { durableClient } from '@dudousxd/nestjs-durable-dashboard/client';
 
-const runs = await durableClient.runs('failed', undefined, undefined, { limit: 100 });
-const detail = await durableClient.run(runs[0].id);
+const { data: runs, meta } = await durableClient.runs('failed', undefined, undefined, { page: 1, size: 100 });
+const detail = await durableClient.run(runs[0].id); // meta.total counts every failed run
 await durableClient.retry(detail.run.id);
 ```
 
 | Method | Route | |
 | --- | --- | --- |
-| `GET` | `/durable/api/runs` | list runs — `?status=` (repeat any of these to match a SET), `?workflow=`, `?tag=`, `?attr=`, `?namespace=`, `?origin=`, `?unattributed=true`, `?limit=`, `?offset=`. Also takes [nestjs-filter](https://www.npmjs.com/package/@dudousxd/nestjs-filter)'s structured form (`?filter[where][0][field]=tag&…`), which is what the console sends. Returns list ROWS: no `input` / `output` / `error` |
-| `GET` | `/durable/api/runs/facets` | `(status, origin)` counts over the same tag / tenant / attribute predicates — the chips' numbers, whole-set rather than per-page |
-| `GET` | `/durable/api/runs/values` | the distinct values of one filter field over the runs the other predicates select — `?groupByCount[field]=tag&groupByCount[limit]=20`. Answers `{ value, count }[]`; this is what fills the [pickers](#filter-pickers) |
+| `GET` | `/durable/api/runs` | one page of runs, newest first, as `{ data, meta }`. Filters: `filter[status]`, `filter[workflow]`, `filter[namespace]`, `filter[tag]`, `filter[origin]` (each takes one value, `a,b` or `filter[x][]=a&filter[x][]=b` for a SET, or `[eq]` / `[in]`), `filter[unattributed]=true`, and `filter[attr.<key>][op]=value` with `op` one of `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`. Paging: `page` (default 1) and `size` (default 100, at most 500). `sort` accepts only `-createdAt`. An unknown field or operator is a `400`. Returns list ROWS: no `input` / `output` / `error` |
+| `GET` | `/durable/api/runs/facets` | `(status, origin)` counts over the same tag / tenant / attribute predicates, as `{ data }` — the chips' numbers, whole-set rather than per-page |
+| `GET` | `/durable/api/runs/values` | the distinct values of one filter field over the runs the other `filter[...]` predicates select — `?groupByCount[field]=tag&groupByCount[limit]=20` ([nestjs-filter](https://www.npmjs.com/package/@dudousxd/nestjs-filter)'s own facet wire). Answers `{ value, count }[]`; this is what fills the [pickers](#filter-pickers) |
 | `GET` | `/durable/api/runs/:id` | run + step timeline, payloads included. Fans wider than 50 come back as `fans: FanSummary[]` instead of their members, and `children` is capped at 200 with `childCount` as the total; `?full=true` returns everything. Sends an `ETag` when the gateway can version it, and answers a matching `If-None-Match` with `304`. See [Wide fans](#wide-fans) |
-| `GET` | `/durable/api/runs/:id/fans/:group` | one page of a fan's members in seq order, `{ items, total }` — `?offset=` (default 0), `?limit=` (default 100, at most 500), `?failed=true` for failed members only. `:group` is the fan's URL-encoded `parallelGroup`. 404 for an unknown run, or when the gateway cannot page fans. `ETag` / `304` as above |
+| `GET` | `/durable/api/runs/:id/fans/:group` | one page of a fan's members in seq order, `{ data, meta }` — `page` (default 1), `size` (default 100, at most 500), `filter[failed]=true` for failed members only. `:group` is the fan's URL-encoded `parallelGroup`. 404 for an unknown run, or when the gateway cannot page fans. `ETag` / `304` as above |
+| `GET` | `/durable/api/schedules` | the persisted schedules, soonest-due first, as `{ data }` — `filter[namespace]`, `filter[workflow]`, `filter[tag]`, `filter[paused]=true\|false`, and `size` (default 200, at most 1000). Not paged: the store cannot count schedules, and the soonest-due order moves each time one fires |
 | `GET` (SSE) | `/durable/api/runs/:id/stream` | live-tail the run's lifecycle events |
 | `POST` | `/durable/api/runs/:id/retry` | re-enqueue the run (→ `pending`, a worker resumes it) |
 | `POST` | `/durable/api/runs/:id/retry-with-input` | fix-and-replay: start a fresh linked run from a dead/failed run with a corrected input (body: `{ input }`) |

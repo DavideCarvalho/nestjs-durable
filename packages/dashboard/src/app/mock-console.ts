@@ -283,33 +283,32 @@ const workers: GroupHealth[] = [
 
 const topology: DurableTopology = { role: 'control-plane' };
 
-/** One decoded `filter[where]` clause from the console's query string. */
+/** One decoded `filter[...]` predicate from the console's query string. */
 interface MockClause {
   field: string;
   operator: string;
-  value: string | string[];
+  value: string[];
 }
 
-/** Decode the structured filter the console sends (`filter[where][0][field]=tag&…`). */
+/** Decode the filter the console sends (`filter[tag][]=etl&filter[attr.tier][in]=pro,ent&…`). */
 function clauses(search: string | undefined): MockClause[] {
-  const byIndex = new Map<string, MockClause>();
+  const byKey = new Map<string, MockClause>();
   for (const [key, value] of new URLSearchParams(search ?? '')) {
-    const match = /^filter\[where\]\[(\d+)\]\[(field|operator|value)\](?:\[(\d+)\])?$/.exec(key);
+    const match = /^filter\[([^[\]]+)\](?:\[([^[\]]+)\])?(\[\])?$/.exec(key);
     if (!match) continue;
-    const [, index, part, member] = match;
-    const clause = byIndex.get(index as string) ?? { field: '', operator: '', value: '' };
-    if (part === 'value' && member !== undefined) {
-      const list = Array.isArray(clause.value) ? clause.value : [];
-      list[Number(member)] = value;
-      clause.value = list;
-    } else if (part === 'value') {
-      clause.value = value;
-    } else {
-      clause[part as 'field' | 'operator'] = value;
+    const [, rawField, op, list] = match as unknown as [string, string, string?, string?];
+    if (rawField === 'unattributed') {
+      if (value === 'true')
+        byKey.set('origin:isNull', { field: 'origin', operator: 'isNull', value: [] });
+      continue;
     }
-    byIndex.set(index as string, clause);
+    const operator = op ?? (list || value.includes(',') ? 'in' : 'eq');
+    const id = `${rawField}:${operator}`;
+    const clause = byKey.get(id) ?? { field: rawField, operator, value: [] };
+    clause.value.push(...(list ? [value] : value.split(',')));
+    byKey.set(id, clause);
   }
-  return [...byIndex.entries()].sort(([a], [b]) => Number(a) - Number(b)).map(([, c]) => c);
+  return [...byKey.values()];
 }
 
 /** The values one run has on a filter axis — several for `tag`, one (or none) for the columns. */
@@ -333,14 +332,41 @@ function valuesOn(run: WorkflowRun, field: string): (string | null)[] {
  * preview would look broken, and a screenshot of them would be a lie.
  */
 function matching(search: string | undefined): WorkflowRun[] {
-  return runs.filter((run) =>
-    clauses(search).every((clause) => {
-      const held = valuesOn(run, clause.field);
-      if (clause.operator === 'isNull') return held.includes(null);
-      const wanted = Array.isArray(clause.value) ? clause.value : [clause.value];
-      return held.some((value) => value !== null && wanted.includes(value));
-    }),
-  );
+  const all = clauses(search);
+  // `filter[origin]` and `filter[unattributed]` together are a UNION, like the server's.
+  const unattributed = all.some((c) => c.operator === 'isNull');
+  const named = all.find((c) => c.field === 'origin' && c.operator !== 'isNull');
+  return runs.filter((run) => {
+    if (unattributed || named) {
+      const origin = run.origin ?? null;
+      const ok =
+        (unattributed && origin === null) || (named?.value.includes(origin ?? '') ?? false);
+      if (!ok) return false;
+    }
+    return all
+      .filter((clause) => clause.field !== 'origin')
+      .every((clause) => {
+        const held = valuesOn(run, clause.field);
+        return held.some((value) => value !== null && clause.value.includes(value));
+      });
+  });
+}
+
+/** An offset page of `rows`, the way the server answers `GET runs` and the fan pages. */
+function offsetPage<T>(rows: T[], search: string | undefined, defaultSize: number) {
+  const params = new URLSearchParams(search ?? '');
+  const page = Math.max(1, Number(params.get('page') ?? 1) || 1);
+  const size = Math.max(1, Number(params.get('size') ?? defaultSize) || defaultSize);
+  return {
+    data: rows.slice((page - 1) * size, page * size),
+    meta: {
+      total: rows.length,
+      perPage: size,
+      currentPage: page,
+      lastPage: Math.max(1, Math.ceil(rows.length / size)),
+      firstPage: 1,
+    },
+  };
 }
 
 const schedules: ScheduleSummary[] = [
@@ -453,7 +479,7 @@ function searchBody(search: string | undefined): unknown {
 
 function body(path: string): unknown | undefined {
   const [route, search] = path.split('?');
-  if (route === '/runs') return matching(search);
+  if (route === '/runs') return offsetPage(matching(search), search, 100);
   if (route === '/runs/facets') {
     const cells = new Map<string, { status: string; origin: string | null; count: number }>();
     for (const run of matching(search)) {
@@ -463,7 +489,7 @@ function body(path: string): unknown | undefined {
       cell.count += 1;
       cells.set(key, cell);
     }
-    return [...cells.values()];
+    return { data: [...cells.values()] };
   }
   if (route === '/runs/values') {
     const params = new URLSearchParams(search ?? '');
@@ -479,7 +505,7 @@ function body(path: string): unknown | undefined {
       .slice(0, limit);
   }
   if (route === '/workers') return workers;
-  if (route === '/schedules') return schedules;
+  if (route === '/schedules') return { data: schedules };
   if (route === '/consoles') return consoles;
   if (route === '/consoles/search') return searchBody(search);
   if (route === '/topology') return topology;

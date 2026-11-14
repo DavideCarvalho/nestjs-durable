@@ -1,4 +1,4 @@
-import { ApplyFilter, ApplyFilterInterceptor, FilterRunner } from '@dudousxd/nestjs-filter';
+import { FilterRunner } from '@dudousxd/nestjs-filter';
 import {
   BadRequestException,
   Body,
@@ -14,17 +14,31 @@ import {
   Res,
   Sse,
   UseFilters,
-  UseInterceptors,
 } from '@nestjs/common';
 import { ConsolePublic } from './console-authorize.js';
 import { DashboardService } from './dashboard.service.js';
 
 /** Fans with more members than this come back summarized in a run's detail. */
 const FAN_INLINE_MAX = 50;
+/** Fan member pages: the default and the largest `size` (the store's own ceiling). */
+const FAN_PAGE_SIZE = 100;
+const FAN_PAGE_MAX = 500;
+/** Schedules are a short top-N list (no count, no stable keyset): default and largest `size`. */
+const SCHEDULES_SIZE = 200;
+const SCHEDULES_MAX = 1_000;
 import { DurableRun } from './durable-run.js';
+import {
+  ListQueryError,
+  type OffsetPage,
+  offsetPage,
+  parseFilterParams,
+  parsePageParams,
+  rejectUnknownParams,
+} from './list-api.js';
 import { NotModifiedException, NotModifiedFilter, setEtag } from './not-modified.js';
+import { runColumnFilters, runFilterInput, runPageParams } from './run-list-query.js';
 import { type RunListRow, toRunListRow } from './run-list-row.js';
-import type { RunQueryDraft } from './run-query-draft.js';
+import { RunQueryDraft } from './run-query-draft.js';
 import { RunFilter } from './run.filter.js';
 import { withTenantLabels } from './tenant-labels.js';
 
@@ -37,13 +51,11 @@ import { withTenantLabels } from './tenant-labels.js';
  * extends DurableApiControllerBase {}`. It carries no guards and no `@nestjs/authorization` mark,
  * so a subclass is protected only by what the host puts on it.
  *
- * The filter interceptor (what resolves `@ApplyFilter` into a query) is bound HERE rather than as
- * the app-wide `APP_INTERCEPTOR` that `FilterModule.forRoot()` registers: a library must not add a
- * global interceptor to its host, and on an app that already has one this would be the second copy,
- * running every filter in the app twice.
+ * Every list route speaks Aviary's list wire: `filter[field]=v` / `filter[field][op]=v`, `page` +
+ * `size` (offset) and `{ data, meta }` back, or `{ data }` for a short list. An unknown filter field,
+ * an unsupported operator or a bad page param is a 400.
  */
 @Controller()
-@UseInterceptors(ApplyFilterInterceptor)
 @UseFilters(NotModifiedFilter)
 export class DurableApiControllerBase {
   constructor(
@@ -52,21 +64,31 @@ export class DurableApiControllerBase {
   ) {}
 
   /**
-   * The run list, filtered by whatever the operator asked for.
+   * The run list, filtered by whatever the operator asked for, newest first, one page at a time.
    *
-   * The predicates are parsed, validated and translated by `@dudousxd/nestjs-filter` (see
-   * `RunFilter` for the two spellings it accepts, and `RunQueryAdapter` for how they become a
-   * `RunQuery`). Every predicate is OPTIONAL and an omitted one means "don't narrow on this axis" —
-   * in particular `namespace`, whose absence keeps the historical, deliberate behaviour that read
-   * paths are NOT namespace-scoped (core, `WorkflowRun.namespace`): the console shows every tenant's
-   * runs until an operator chooses one.
+   * `filter[...]` is translated by `runColumnFilters` and applied through `@dudousxd/nestjs-filter`'s
+   * {@link RunFilter} (see `RunQueryAdapter` for how each clause becomes a `RunQuery` predicate).
+   * Every predicate is OPTIONAL and an omitted one means "don't narrow on this axis" — in particular
+   * `namespace`, whose absence keeps the historical, deliberate behaviour that read paths are NOT
+   * namespace-scoped (core, `WorkflowRun.namespace`): the console shows every tenant's runs until an
+   * operator chooses one.
+   *
+   * `page`/`size` (default 100, at most 500) window the list; `meta.total` counts the whole matching
+   * set from the facet aggregate. `sort` accepts only `-createdAt`, the one order a run list has.
    */
   @Get('runs')
-  async runs(@ApplyFilter(RunFilter) draft: RunQueryDraft): Promise<RunListRow[]> {
-    const runs = await this.dashboard.listRuns(draft.query);
+  async runs(@Query() query: Record<string, unknown> = {}): Promise<OffsetPage<RunListRow>> {
+    rejectUnknownParams(query, ['page', 'size', 'sort', 'filter']);
+    const { page, size, offset } = runPageParams(query);
+    const draft = await this.runDraft(query);
+    const { rows, total } = await this.dashboard.listRunsPage({
+      ...draft.query,
+      limit: size,
+      offset,
+    });
     // Rows only — the three payload fields are the bulk of a large listing and belong to `runs/:id`.
     // Each row with a customer tenant also gets its display label.
-    return withTenantLabels(runs.map(toRunListRow));
+    return offsetPage(await withTenantLabels(rows.map(toRunListRow)), { total, page, size });
   }
 
   /**
@@ -74,23 +96,25 @@ export class DurableApiControllerBase {
    * `GET runs`. This is what lets that listing be PAGED at all: the page bounds what the console
    * renders, this bounds nothing and keeps its status and origin chips exact.
    *
-   * `status`, `origin` and the page bounds are accepted (the route takes the same filter) but
-   * deliberately DROPPED before counting — they are the axes being counted, so narrowing by them
-   * would report the answer back to itself.
+   * `filter[status]`, `filter[origin]` and `filter[unattributed]` are accepted (the route takes the
+   * same filter) but deliberately DROPPED before counting — they are the axes being counted, so
+   * narrowing by them would report the answer back to itself.
    */
   @Get('runs/facets')
-  facets(@ApplyFilter(RunFilter) draft: RunQueryDraft) {
-    return this.dashboard.runFacets(draft.facetQuery());
+  async facets(@Query() query: Record<string, unknown> = {}) {
+    rejectUnknownParams(query, ['filter']);
+    const draft = await this.runDraft(query);
+    return { data: await this.dashboard.runFacets(draft.facetQuery()) };
   }
 
   /**
    * The distinct values one filter field takes across the runs matching every OTHER active
    * predicate, with counts — what the console's tenant/tag/attribute pickers list.
    *
-   * `?groupByCount[field]=tag&groupByCount[limit]=20`, with the filters in the structured
-   * `filter[where][...]` form (what `filterQuery()` builds). Scoping the values to the active
-   * filters is the point: picking a tenant leaves the tag picker offering only that tenant's tags,
-   * so a picker never offers a value whose result set is empty.
+   * `?groupByCount[field]=tag&groupByCount[limit]=20` (`@dudousxd/nestjs-filter`'s own facet wire,
+   * kept by design), with the filters in the same `filter[...]` form as `GET runs`. Scoping the
+   * values to the active filters is the point: picking a tenant leaves the tag picker offering only
+   * that tenant's tags, so a picker never offers a value whose result set is empty.
    *
    * `limit` matters rather than being a nicety — tag and attribute cardinality grows with the data
    * (a `singleton:<key>` tag is minted per key), so the unbounded answer is a listing. `offset` and
@@ -98,8 +122,9 @@ export class DurableApiControllerBase {
    * operator types, both server-side, so a value outside the first page is still reachable.
    */
   @Get('runs/values')
-  values(@Query() query: Record<string, unknown>) {
-    return this.runner.groupByCount(DurableRun, query, { filterClass: RunFilter });
+  async values(@Query() query: Record<string, unknown> = {}) {
+    rejectUnknownParams(query, ['filter', 'groupByCount']);
+    return this.runner.groupByCount(DurableRun, runFilterInput(query), { filterClass: RunFilter });
   }
 
   /** Prometheus-text metrics (runs/steps by outcome, per-workflow counts) for a scrape. */
@@ -116,24 +141,35 @@ export class DurableApiControllerBase {
   }
 
   /**
-   * The persisted schedules (`engine.schedules`), soonest-due first, optionally narrowed by
-   * `namespace`/`workflow`/`tag`/`paused`. Empty on a tenant or a store without schedules.
+   * The persisted schedules (`engine.schedules`), soonest-due first, as `{ data }`: a short list
+   * bounded by `size` (default 200, at most 1000), optionally narrowed by `filter[namespace]`,
+   * `filter[workflow]`, `filter[tag]` and `filter[paused]=true|false`. Not paged: the store cannot
+   * count schedules, and its soonest-due order moves every time one fires, so neither an offset
+   * page nor a cursor over it would be stable. Empty on a tenant or a store without schedules.
    */
   @Get('schedules')
-  schedules(
-    @Query('namespace') namespace?: string,
-    @Query('workflow') workflow?: string,
-    @Query('tag') tag?: string,
-    @Query('paused') paused?: string,
-    @Query('limit') limit?: string,
-  ) {
-    return this.dashboard.listSchedules({
-      ...(namespace ? { namespace } : {}),
-      ...(workflow ? { workflow } : {}),
-      ...(tag ? { tag } : {}),
-      ...(paused === 'true' || paused === 'false' ? { paused: paused === 'true' } : {}),
-      limit: Math.min(Number(limit) || 200, 1_000),
+  async schedules(@Query() query: Record<string, unknown> = {}) {
+    rejectUnknownParams(query, ['filter', 'size']);
+    const filters = parseFilterParams(query, {
+      fields: { namespace: ['eq'], workflow: ['eq'], tag: ['eq'], paused: ['eq'] },
     });
+    const narrow: { namespace?: string; workflow?: string; tag?: string; paused?: boolean } = {};
+    for (const { field, value } of filters) {
+      const text = String(value);
+      if (field === 'paused') {
+        if (text !== 'true' && text !== 'false') {
+          throw new ListQueryError('Invalid filter: "filter[paused]" must be true or false.');
+        }
+        narrow.paused = text === 'true';
+      } else {
+        narrow[field] = text;
+      }
+    }
+    const { size } = parsePageParams(
+      { size: query.size },
+      { defaultSize: SCHEDULES_SIZE, maxSize: SCHEDULES_MAX },
+    );
+    return { data: await this.dashboard.listSchedules({ ...narrow, limit: size }) };
   }
 
   @Post('schedules/:id/pause')
@@ -201,30 +237,44 @@ export class DurableApiControllerBase {
     return { ...body, run };
   }
 
-  /** One page of a summarized fan's members, in seq order. Versioned like {@link run}. */
+  /**
+   * One page of a summarized fan's members, in seq order: `page`/`size` (default 100, at most 500)
+   * and `filter[failed]=true` for the failed members only, as an offset page. Versioned like
+   * {@link run}.
+   */
   @Get('runs/:id/fans/:group')
   async fanMembers(
     @Param('id') id: string,
     @Param('group') group: string,
-    @Query('offset') offset?: string,
-    @Query('limit') limit?: string,
-    @Query('failed') failed?: string,
+    @Query() query: Record<string, unknown> = {},
     @Headers('if-none-match') ifNoneMatch?: string,
     @Res({ passthrough: true }) response?: unknown,
-  ) {
-    const page = await this.dashboard.getFanMembers(id, group, {
-      offset: offset === undefined ? undefined : Number(offset),
-      limit: limit === undefined ? undefined : Number(limit),
-      failedOnly: failed === 'true',
+  ): Promise<OffsetPage<unknown>> {
+    rejectUnknownParams(query, ['page', 'size', 'filter']);
+    const { page, size, offset } = parsePageParams(query, {
+      defaultSize: FAN_PAGE_SIZE,
+      maxSize: FAN_PAGE_MAX,
+    });
+    let failedOnly = false;
+    for (const { value } of parseFilterParams(query, { fields: { failed: ['eq'] } })) {
+      if (value !== 'true' && value !== 'false') {
+        throw new ListQueryError('Invalid filter: "filter[failed]" must be true or false.');
+      }
+      failedOnly = value === 'true';
+    }
+    const result = await this.dashboard.getFanMembers(id, group, {
+      offset,
+      limit: size,
+      failedOnly,
       ...(ifNoneMatch && { ifNoneMatch }),
     });
-    if (!page) throw new NotFoundException(`fan ${group} of run ${id} not found`);
-    const { etag, notModified, ...body } = page;
+    if (!result) throw new NotFoundException(`fan ${group} of run ${id} not found`);
+    const { etag, notModified, items, total } = result;
     if (etag) {
       if (notModified) throw new NotModifiedException(etag);
       setEtag(response, etag);
     }
-    return body;
+    return offsetPage(items, { total, page, size });
   }
 
   /** Server-Sent Events stream of a run's live lifecycle events — the dashboard tails it instead
@@ -247,21 +297,19 @@ export class DurableApiControllerBase {
 
   /**
    * Bulk retry/cancel every run matching a filter (status / tag / workflow / namespace / origin).
-   * The filter takes the SAME params as `GET runs` and is parsed identically, so "retry all" acts on
-   * exactly the set the operator was looking at rather than a wider one.
+   * The filter takes the SAME `filter[...]` params as `GET runs` and is parsed identically, so
+   * "retry all" acts on exactly the set the operator was looking at rather than a wider one. Page
+   * params are not part of it: `bulk` acts on the whole matching SET (it applies its own bound).
    */
   @Post('bulk/:action')
-  bulk(
+  async bulk(
     @Param('action') action: 'retry' | 'cancel',
-    @ApplyFilter(RunFilter) draft: RunQueryDraft,
-    @Query('compensate') compensate?: string,
+    @Query() query: Record<string, unknown> = {},
   ) {
-    // The operator's page window is dropped, and only it: `bulk` acts on the whole matching SET (it
-    // applies its own bound), so carrying a `limit` of 100 over from the list would silently retry
-    // the first page and report success for the rest.
-    const { limit, offset, ...filter } = draft.query;
-    return this.dashboard.bulk(action === 'cancel' ? 'cancel' : 'retry', filter, {
-      compensate: compensate === 'true',
+    rejectUnknownParams(query, ['filter', 'compensate']);
+    const draft = await this.runDraft(query);
+    return this.dashboard.bulk(action === 'cancel' ? 'cancel' : 'retry', draft.query, {
+      compensate: query.compensate === 'true',
     });
   }
 
@@ -335,6 +383,13 @@ export class DurableApiControllerBase {
   @Post('runs/:id/updates/:name')
   update(@Param('id') id: string, @Param('name') name: string, @Body() body: unknown) {
     return this.dashboard.update(id, name, body);
+  }
+
+  /** The request's `filter[...]` as a {@link RunQueryDraft}, applied through {@link RunFilter}. */
+  private async runDraft(query: Record<string, unknown>): Promise<RunQueryDraft> {
+    const draft = new RunQueryDraft();
+    await this.runner.apply(RunFilter, { filter: { where: runColumnFilters(query) } }, draft);
+    return draft;
   }
 }
 
