@@ -16,10 +16,15 @@ export function workflowHash(workflow: string): string {
   return `#/workflow/${encodeURIComponent(workflow)}`;
 }
 
-/** The workflow whose page the URL hash names, or undefined on any other hash. */
+/** The workflow whose page the URL hash names, or undefined on any other hash or a malformed escape. */
 export function workflowFromHash(hash: string): string | undefined {
   const match = hash.match(/^#\/workflow\/(.+)$/);
-  return match?.[1] ? decodeURIComponent(match[1]) : undefined;
+  if (!match?.[1]) return undefined;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return undefined;
+  }
 }
 
 /** What one subscription does beyond starting the run: the chips drawn after its workflow. */

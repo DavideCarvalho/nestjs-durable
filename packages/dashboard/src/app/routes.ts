@@ -14,7 +14,14 @@ export type Route =
 
 export function parseRoute(hash: string): Route {
   const run = hash.match(/^#\/run\/(.+)$/)?.[1];
-  if (run) return { page: 'runs', runId: decodeURIComponent(run) };
+  if (run) {
+    // A malformed escape (`#/run/%E0%A4%A`) falls back to the runs board, not a blank console.
+    try {
+      return { page: 'runs', runId: decodeURIComponent(run) };
+    } catch {
+      return { page: 'runs' };
+    }
+  }
   const workflow = workflowFromHash(hash);
   if (workflow !== undefined) return { page: 'workflow', workflow };
   if (hash === '#/workers') return { page: 'workers' };

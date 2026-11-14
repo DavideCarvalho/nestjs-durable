@@ -126,9 +126,20 @@ export const CONSOLE_PROBE_TIMEOUT_MS: number = 300;
 /** Hits per console in a global search. */
 export const CONSOLE_SEARCH_HITS: number = 5;
 
-/** Whether `path` is a same-origin absolute path (`/x`; never `//host` or a URL). */
+/**
+ * Whether `path` is a same-origin absolute path (`/x`): never `//host`, a URL, a backslash (for
+ * http(s) bases `/\evil` parses as `//evil`) or a control character. The kit's `isSafeHref` applies
+ * the same rule in the browser.
+ */
 export function isSameOriginPath(path: unknown): path is string {
-  return typeof path === 'string' && path.startsWith('/') && !path.startsWith('//');
+  return (
+    typeof path === 'string' &&
+    path.startsWith('/') &&
+    !path.startsWith('//') &&
+    !path.includes('\\') &&
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: rejecting control characters is the point
+    !/[\u0000-\u001f\u007f]/.test(path)
+  );
 }
 
 /** The registry, when one is set with a version this copy reads. */

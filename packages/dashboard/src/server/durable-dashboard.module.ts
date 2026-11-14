@@ -316,7 +316,7 @@ export class DurableDashboardModule {
       // The console switcher lists this console only where it serves its own page.
       providers: [...pathProviders, DurableConsoleRegistration],
       // Re-export the API module so its DashboardService reaches importers (e.g. flip's own controllers).
-      exports: [DurableApiModule],
+      exports: [DurableApiModule, DASHBOARD_SHELL],
     };
   }
 }

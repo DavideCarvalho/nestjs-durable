@@ -39,16 +39,6 @@ export type ConsoleSignOutOption =
   | { action: string; csrfToken?: (request: unknown) => string | undefined }
   | false;
 
-/** A same-origin path with no backslash or control character (what the SPA will follow). */
-function safePath(path: unknown): path is string {
-  return (
-    isSameOriginPath(path) &&
-    !path.includes('\\') &&
-    // biome-ignore lint/suspicious/noControlCharactersInRegex: rejecting control characters is the point
-    !/[\u0000-\u001f\u007f]/.test(path)
-  );
-}
-
 function text(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined;
 }
@@ -153,10 +143,10 @@ export function resolveConsoleSignOut(
   const option = configured ?? announcedSignOut(registry);
   if (option === undefined || option === false) return undefined;
   if (typeof option === 'object' && 'href' in option) {
-    return safePath(option.href) ? { href: option.href } : undefined;
+    return isSameOriginPath(option.href) ? { href: option.href } : undefined;
   }
   const action = typeof option === 'string' ? option : option.action;
-  if (!safePath(action)) return undefined;
+  if (!isSameOriginPath(action)) return undefined;
   let csrfToken: string | undefined;
   if (typeof option === 'object' && typeof option.csrfToken === 'function') {
     try {
