@@ -9,35 +9,23 @@ import {
   type RunValueFacetRow,
   type RunWaiting,
 } from '@dudousxd/nestjs-durable-core';
-import {
-  APPLY_FILTER_REQ_KEY,
-  ApplyFilterInterceptor,
-  FilterRunner,
-} from '@dudousxd/nestjs-filter';
-import {
-  BadRequestException,
-  type ExecutionContext,
-  NotImplementedException,
-} from '@nestjs/common';
-import { INTERCEPTORS_METADATA } from '@nestjs/common/constants.js';
-import { firstValueFrom, from } from 'rxjs';
+import { FilterRunner } from '@dudousxd/nestjs-filter';
+import { BadRequestException, NotImplementedException } from '@nestjs/common';
 import { describe, expect, it } from 'vitest';
 import { DashboardService } from './dashboard.service.js';
 import { DurableApiController } from './durable-api.controller.js';
-import { DurableRun } from './durable-run.js';
-import type { RunQueryDraft } from './run-query-draft.js';
 import { RUN_QUERY_ADAPTER, RunQueryAdapter } from './run-query.adapter.js';
 import { RunFilter } from './run.filter.js';
 
+type Query = Record<string, unknown>;
+
 interface Console {
-  /** Request → the whole path a real one takes: filter parsing, adapter translation, controller. */
-  list(input?: unknown): Promise<Awaited<ReturnType<DurableApiController['runs']>>>;
-  facets(input?: unknown): Promise<RunFacetRow[]>;
-  values(input: Record<string, unknown>): Promise<unknown>;
-  bulk(action: 'retry' | 'cancel', input?: unknown, compensate?: string): Promise<unknown>;
+  /** Request query → the whole path a real one takes: wire parsing, filter, adapter, controller. */
+  list(query?: Query): Promise<Awaited<ReturnType<DurableApiController['runs']>>>;
+  facets(query?: Query): Promise<RunFacetRow[]>;
+  values(query: Query): Promise<unknown>;
+  bulk(action: 'retry' | 'cancel', query?: Query): Promise<unknown>;
   controller: DurableApiController;
-  /** Bound to the controller (not app-wide) — see `throughInterceptor`. */
-  interceptor: ApplyFilterInterceptor;
   queries: RunQuery[];
   facetQueries: RunFacetQuery[];
   valueFacets: Array<{ axis: RunValueAxis; query: RunFacetQuery; limit?: number }>;
@@ -125,64 +113,25 @@ async function makeConsole(runs: RunListItem[] = []): Promise<Console> {
   } as unknown as ConstructorParameters<typeof FilterRunner>[0];
   const runner = new FilterRunner(moduleRef, { validation: 'off' }, null);
   const controller = new DurableApiController(new DashboardService(gateway), runner);
-  const interceptor = new ApplyFilterInterceptor(moduleRef);
-  const draftFor = async (input: unknown): Promise<RunQueryDraft> => {
-    const draft = adapter.createQueryBuilder(DurableRun) as RunQueryDraft;
-    await runner.apply(RunFilter, input ?? {}, draft);
-    return draft;
-  };
 
   return {
     controller,
-    interceptor,
     queries,
     facetQueries,
     valueFacets,
-    async list(input) {
-      return controller.runs(await draftFor(input));
+    list(query = {}) {
+      return controller.runs(query);
     },
-    async facets(input) {
-      return controller.facets(await draftFor(input));
+    async facets(query = {}) {
+      return (await controller.facets(query)).data;
     },
-    values(input) {
-      return controller.values(input);
+    values(query) {
+      return controller.values(query);
     },
-    async bulk(action, input, compensate) {
-      return controller.bulk(action, await draftFor(input), compensate);
+    bulk(action, query = {}) {
+      return controller.bulk(action, query);
     },
   };
-}
-
-/**
- * Drive a route the way a REQUEST does: through `ApplyFilterInterceptor`, which is what turns the
- * `@ApplyFilter` parameter into a query. The controller's own tests hand it a draft directly; this
- * one proves the step that BUILDS that draft is actually bound to the route, since the console binds
- * the interceptor to its controller rather than as the app-wide `APP_INTERCEPTOR` a host would own.
- */
-async function throughInterceptor(
-  c: Console,
-  route: 'runs' | 'facets',
-  query: Record<string, unknown>,
-): Promise<unknown> {
-  const request: Record<string | symbol, unknown> = { query, body: {} };
-  const context = {
-    getHandler: () => (c.controller as unknown as Record<string, unknown>)[route],
-    getClass: () => DurableApiController,
-    switchToHttp: () => ({ getRequest: () => request }),
-  } as unknown as ExecutionContext;
-  const handler = {
-    handle: () =>
-      // The param decorator reads the slot the interceptor filled, by position.
-      from(
-        Promise.resolve(
-          (c.controller[route] as (draft: RunQueryDraft) => unknown)(
-            (request[APPLY_FILTER_REQ_KEY] as RunQueryDraft[])[0] as RunQueryDraft,
-          ),
-        ),
-      ),
-  };
-  const observable = await firstValueFrom(c.interceptor.intercept(context, handler));
-  return observable;
 }
 
 /** A run as the gateway hands it over, payloads and all — the shape the list endpoint must strip. */
@@ -207,7 +156,7 @@ describe('DurableApiController: run-list filters', () => {
   it('narrows by namespace and origin when the operator asks', async () => {
     const c = await makeConsole();
 
-    await c.list({ namespace: 'acme', origin: '@dudousxd/agent' });
+    await c.list({ filter: { namespace: 'acme', origin: '@dudousxd/agent' } });
 
     expect(c.queries[0]?.namespace).toBe('acme');
     expect(c.queries[0]?.origin).toBe('@dudousxd/agent');
@@ -225,27 +174,27 @@ describe('DurableApiController: run-list filters', () => {
   });
 
   it('treats a blank param as absent, not as a tenant named ""', async () => {
-    // `?namespace=` is what a cleared filter box sends. Passing '' through would be an exact match
-    // against a namespace nothing has — a console that goes empty for no visible reason.
+    // `filter[namespace]=` is what a cleared filter box sends. Passing '' through would be an exact
+    // match against a namespace nothing has — a console that goes empty for no visible reason.
     const c = await makeConsole();
 
-    await c.list({ namespace: '', origin: '' });
+    await c.list({ filter: { namespace: '', origin: '' } });
 
     expect(c.queries[0]?.namespace).toBeUndefined();
     expect(c.queries[0]?.origin).toBeUndefined();
   });
 
-  it('keeps the existing flat predicates working alongside the new ones', async () => {
-    // The console has always sent these, and a run row's tag chip is still a plain link that sets
-    // one. The structured spelling is additive, never a replacement.
+  it('reads every predicate from the filter[...] wire', async () => {
     const c = await makeConsole();
 
     await c.list({
-      status: 'dead',
-      workflow: 'checkout',
-      tag: 'tier:pro',
-      attr: 'amount:gte:200',
-      namespace: 'acme',
+      filter: {
+        status: 'dead',
+        workflow: 'checkout',
+        tag: 'tier:pro',
+        'attr.amount': { gte: '200' },
+        namespace: 'acme',
+      },
     });
 
     expect(c.queries[0]).toMatchObject({
@@ -256,75 +205,69 @@ describe('DurableApiController: run-list filters', () => {
     });
     expect(c.queries[0]?.attributes).toEqual([{ key: 'amount', op: 'gte', value: 200 }]);
   });
-});
 
-describe('DurableApiController: the filter interceptor is bound to this controller', () => {
-  // The console wires `@dudousxd/nestjs-filter` privately — its own runner and its own interceptor,
-  // scoped to this module — because `FilterModule.forRoot()` is a GLOBAL registration and a library
-  // must not add an app-wide interceptor to its host (on an app that already has one, that would be
-  // a second copy running every filter in the app twice). Which means the binding below is the only
-  // thing making `@ApplyFilter` resolve at all: drop it and every list route gets `undefined`.
-  it('declares the interceptor on the controller itself', () => {
-    expect(Reflect.getMetadata(INTERCEPTORS_METADATA, DurableApiController)).toContain(
-      ApplyFilterInterceptor,
-    );
-  });
-
-  it('turns a request query into the run listing it selects', async () => {
+  it('reads the flat bracket keys a host without a nested query parser hands over', async () => {
+    // Express 5's default query parser leaves `filter[status]` as a literal key.
     const c = await makeConsole();
 
-    await throughInterceptor(c, 'runs', {
-      filter: { where: [{ field: 'tag', operator: 'in', value: ['etl', 'nightly'] }] },
+    await c.list({ 'filter[status]': 'failed', 'filter[attr.tier][in]': 'pro,enterprise' });
+
+    expect(c.queries[0]).toMatchObject({ status: 'failed' });
+    expect(c.queries[0]?.attributes).toEqual([
+      { key: 'tier', op: 'in', values: ['pro', 'enterprise'] },
+    ]);
+  });
+
+  it.each([
+    [{ status: 'dead' }, /filter\[status\]/],
+    [{ limit: '5' }, /"size"/],
+    [{ offset: '10' }, /"page"/],
+  ])('answers 400 for the removed flat param %j instead of ignoring it', async (query, message) => {
+    const c = await makeConsole();
+
+    await expect(c.list(query)).rejects.toMatchObject({
+      status: 400,
+      message: expect.stringMatching(message),
     });
-
-    expect(c.queries[0]).toMatchObject({ tags: ['etl', 'nightly'] });
-  });
-
-  it('feeds the facet route from the same parsing', async () => {
-    const c = await makeConsole();
-
-    await throughInterceptor(c, 'facets', { namespace: 'acme' });
-
-    expect(c.facetQueries[0]).toMatchObject({ namespace: 'acme' });
+    expect(c.queries).toEqual([]);
   });
 });
 
 describe('DurableApiController: multi-value predicates', () => {
-  it('ORs a repeated tag param into `tags`, and keeps a single one as `tag`', async () => {
+  it('ORs a tag list into `tags`, and keeps a single one as `tag`', async () => {
     const c = await makeConsole();
 
-    await c.list({ tag: ['etl', 'nightly'] });
-    await c.list({ tag: 'etl' });
+    await c.list({ filter: { tag: ['etl', 'nightly'] } });
+    await c.list({ filter: { tag: 'etl' } });
+    await c.list({ filter: { tag: 'etl,nightly' } });
+    await c.list({ filter: { tag: { in: 'etl,nightly' } } });
 
     expect(c.queries[0]).toMatchObject({ tags: ['etl', 'nightly'] });
     expect(c.queries[0]?.tag).toBeUndefined();
     expect(c.queries[1]).toMatchObject({ tag: 'etl' });
     expect(c.queries[1]?.tags).toBeUndefined();
+    expect(c.queries[2]).toMatchObject({ tags: ['etl', 'nightly'] });
+    expect(c.queries[3]).toMatchObject({ tags: ['etl', 'nightly'] });
   });
 
-  it('ORs repeated tenants into `namespaces`, so a few can be compared side by side', async () => {
+  it('ORs several tenants into `namespaces`, so a few can be compared side by side', async () => {
     const c = await makeConsole();
 
-    await c.list({ namespace: ['acme', 'globex'] });
+    await c.list({ filter: { namespace: ['acme', 'globex'] } });
 
     expect(c.queries[0]).toMatchObject({ namespaces: ['acme', 'globex'] });
   });
 
-  it('takes the same sets through the structured `where` spelling', async () => {
-    // What `filterQuery().where('tag', 'in', [...])` builds — the same predicate the console's
-    // multi-select produces, arriving as an operator object rather than as repeated params.
+  it('ORs several statuses into `statuses`, and keeps a single one as `status`', async () => {
     const c = await makeConsole();
 
-    await c.list({
-      filter: {
-        where: [
-          { field: 'tag', operator: 'in', value: ['etl', 'nightly'] },
-          { field: 'namespace', operator: 'in', value: ['acme'] },
-        ],
-      },
-    });
+    await c.list({ filter: { status: ['running', 'suspended'] } });
+    await c.list({ filter: { status: 'dead' } });
 
-    expect(c.queries[0]).toMatchObject({ tags: ['etl', 'nightly'], namespaces: ['acme'] });
+    expect(c.queries[0]).toMatchObject({ statuses: ['running', 'suspended'] });
+    expect(c.queries[0]?.status).toBeUndefined();
+    expect(c.queries[1]).toMatchObject({ status: 'dead' });
+    expect(c.queries[1]?.statuses).toBeUndefined();
   });
 
   it('carries a set of search-attribute values as one `in` predicate, not two ANDed equalities', async () => {
@@ -332,19 +275,7 @@ describe('DurableApiController: multi-value predicates', () => {
     // attribute with two values — the multi-select would always return nothing.
     const c = await makeConsole();
 
-    await c.list({
-      filter: { where: [{ field: 'attr.tier', operator: 'in', value: ['pro', 'enterprise'] }] },
-    });
-
-    expect(c.queries[0]?.attributes).toEqual([
-      { key: 'tier', op: 'in', values: ['pro', 'enterprise'] },
-    ]);
-  });
-
-  it('takes the flat `key:in:a|b` spelling of the same attribute set', async () => {
-    const c = await makeConsole();
-
-    await c.list({ attr: 'tier:in:pro|enterprise' });
+    await c.list({ filter: { 'attr.tier': { in: ['pro', 'enterprise'] } } });
 
     expect(c.queries[0]?.attributes).toEqual([
       { key: 'tier', op: 'in', values: ['pro', 'enterprise'] },
@@ -354,20 +285,30 @@ describe('DurableApiController: multi-value predicates', () => {
   it('coerces attribute operands, so a numeric set compares as numbers', async () => {
     const c = await makeConsole();
 
-    await c.list({ attr: 'amount:in:200|300' });
+    await c.list({ filter: { 'attr.amount': { in: '200,300' } } });
 
     expect(c.queries[0]?.attributes).toEqual([{ key: 'amount', op: 'in', values: [200, 300] }]);
   });
 });
 
-describe('DurableApiController: predicates this backend cannot express', () => {
-  it('refuses an unsupported operator instead of returning a wider set', async () => {
+describe('DurableApiController: requests this backend cannot serve', () => {
+  it('refuses an unknown filter field instead of returning a wider set', async () => {
+    const c = await makeConsole();
+
+    await expect(c.list({ filter: { bogus: 'x' } })).rejects.toBeInstanceOf(BadRequestException);
+    expect(c.queries).toEqual([]);
+  });
+
+  it('refuses an unsupported operator', async () => {
     // Dropping the clause would answer with every run and look exactly like success.
     const c = await makeConsole();
 
-    await expect(
-      c.list({ filter: { where: [{ field: 'tag', operator: 'contains', value: 'etl' }] } }),
-    ).rejects.toBeInstanceOf(BadRequestException);
+    await expect(c.list({ filter: { tag: { contains: 'etl' } } })).rejects.toBeInstanceOf(
+      BadRequestException,
+    );
+    await expect(c.list({ filter: { 'attr.tier': { contains: 'p' } } })).rejects.toBeInstanceOf(
+      BadRequestException,
+    );
     expect(c.queries).toEqual([]);
   });
 
@@ -376,6 +317,7 @@ describe('DurableApiController: predicates this backend cannot express', () => {
     const c = await makeConsole();
 
     await expect(c.list({ sort: 'workflow' })).rejects.toBeInstanceOf(BadRequestException);
+    await expect(c.list({ sort: 'createdAt' })).rejects.toBeInstanceOf(BadRequestException);
   });
 
   it('accepts the one order a run listing actually has', async () => {
@@ -385,6 +327,49 @@ describe('DurableApiController: predicates this backend cannot express', () => {
 
     expect(c.queries).toHaveLength(1);
   });
+
+  it('refuses a page param that is not a whole number of at least 1', async () => {
+    const c = await makeConsole();
+
+    await expect(c.list({ page: '0' })).rejects.toBeInstanceOf(BadRequestException);
+    await expect(c.list({ size: 'abc' })).rejects.toBeInstanceOf(BadRequestException);
+  });
+});
+
+describe('DurableApiController: paging', () => {
+  it('asks the store for one page and answers with the offset envelope', async () => {
+    const c = await makeConsole([runWithPayloads()]);
+
+    const page = await c.list({ page: '3', size: '20' });
+
+    expect(c.queries[0]).toMatchObject({ limit: 20, offset: 40 });
+    // The total is the facet aggregate (3 failed + 7 completed), not the length of the page.
+    expect(page.meta).toEqual({
+      total: 10,
+      perPage: 20,
+      currentPage: 3,
+      lastPage: 1,
+      firstPage: 1,
+    });
+  });
+
+  it('bounds the page by default and clamps an oversized one', async () => {
+    const c = await makeConsole();
+
+    await c.list();
+    await c.list({ size: '10000' });
+
+    expect(c.queries[0]).toMatchObject({ limit: 100, offset: 0 });
+    expect(c.queries[1]).toMatchObject({ limit: 500 });
+  });
+
+  it('counts only the statuses and origins the request selects', async () => {
+    const c = await makeConsole();
+
+    const page = await c.list({ filter: { status: 'failed' } });
+
+    expect(page.meta.total).toBe(3);
+  });
 });
 
 describe('DurableApiController: bulk scoping', () => {
@@ -393,11 +378,10 @@ describe('DurableApiController: bulk scoping', () => {
     // operator never had on screen.
     const c = await makeConsole();
 
-    await c.bulk(
-      'cancel',
-      { status: 'dead', namespace: 'acme', origin: '@dudousxd/agent' },
-      'true',
-    );
+    await c.bulk('cancel', {
+      filter: { status: 'dead', namespace: 'acme', origin: '@dudousxd/agent' },
+      compensate: 'true',
+    });
 
     expect(c.queries[0]).toMatchObject({
       status: 'dead',
@@ -409,63 +393,22 @@ describe('DurableApiController: bulk scoping', () => {
   it('treats blank bulk params as absent too', async () => {
     const c = await makeConsole();
 
-    await c.bulk('retry', { namespace: '', origin: '' });
+    await c.bulk('retry', { filter: { namespace: '', origin: '' } });
 
     expect(c.queries[0]?.namespace).toBeUndefined();
     expect(c.queries[0]?.origin).toBeUndefined();
   });
 
-  it('drops the page window, so "retry all" is not "retry the first page"', async () => {
+  it('refuses page params, so "retry all" is never mistaken for "retry the first page"', async () => {
     const c = await makeConsole();
 
-    await c.bulk('retry', { status: 'dead', limit: '100', offset: '200' });
+    await expect(
+      c.bulk('retry', { filter: { status: 'dead' }, page: '3', size: '100' }),
+    ).rejects.toMatchObject({ status: 400 });
+    expect(c.queries).toEqual([]);
 
+    await c.bulk('retry', { filter: { status: 'dead' } });
     expect(c.queries[0]?.offset).toBeUndefined();
-    // `bulk` applies its own bound; what matters is that the operator's 100 is gone.
-    expect(c.queries[0]?.limit).not.toBe(100);
-  });
-});
-
-describe('DurableApiController: paging', () => {
-  it('passes limit and offset straight through, so the store does the bounding', async () => {
-    const c = await makeConsole();
-
-    await c.list({ limit: '100', offset: '200' });
-
-    expect(c.queries[0]).toMatchObject({ limit: 100, offset: 200 });
-  });
-
-  it('leaves the query unbounded when no bound is sent', async () => {
-    // An existing API consumer that never sent a bound must keep getting the whole listing rather
-    // than being silently truncated to some default page.
-    const c = await makeConsole();
-
-    await c.list();
-
-    expect(c.queries[0]?.limit).toBeUndefined();
-    expect(c.queries[0]?.offset).toBeUndefined();
-  });
-
-  it('ignores a bound that is not a whole non-negative number', async () => {
-    // Coercing junk to 0 would return an empty page, which reads as "there are no runs".
-    const c = await makeConsole();
-
-    await c.list({ limit: 'abc', offset: '-5' });
-
-    expect(c.queries[0]?.limit).toBeUndefined();
-    expect(c.queries[0]?.offset).toBeUndefined();
-  });
-
-  it('ORs a repeated status param into `statuses`, and keeps a single one as `status`', async () => {
-    const c = await makeConsole();
-
-    await c.list({ status: ['running', 'suspended'] });
-    await c.list({ status: 'dead' });
-
-    expect(c.queries[0]).toMatchObject({ statuses: ['running', 'suspended'] });
-    expect(c.queries[0]?.status).toBeUndefined();
-    expect(c.queries[1]).toMatchObject({ status: 'dead' });
-    expect(c.queries[1]?.statuses).toBeUndefined();
   });
 });
 
@@ -473,42 +416,39 @@ describe('DurableApiController: the unattributed bucket', () => {
   it('asks the store for runs with NO origin, which no origin VALUE can match', async () => {
     const c = await makeConsole();
 
-    await c.list({ unattributed: 'true' });
+    await c.list({ filter: { unattributed: 'true' } });
 
     expect(c.queries[0]?.origin).toBeNull();
   });
 
-  it('selects it through the structured spelling too — the one the console sends', async () => {
+  it('refuses a value that is not a boolean', async () => {
     const c = await makeConsole();
 
-    await c.list({ filter: { where: [{ field: 'origin', operator: 'isNull' }] } });
-
-    expect(c.queries[0]?.origin).toBeNull();
+    await expect(c.list({ filter: { unattributed: 'yes' } })).rejects.toBeInstanceOf(
+      BadRequestException,
+    );
   });
 
   it('unions with a concurrent origin — "this package plus the runs nothing claims"', async () => {
     const c = await makeConsole();
 
-    await c.list({ origin: '@dudousxd/agent', unattributed: 'true' });
+    await c.list({ filter: { origin: '@dudousxd/agent', unattributed: 'true' } });
 
     expect(c.queries[0]?.origins).toEqual(['@dudousxd/agent', null]);
   });
 
   it('resolves the same way whichever order the two params arrive in', async () => {
-    // `@FilterFor` dispatch follows the client's key order; the answer must not.
     const c = await makeConsole();
 
-    await c.list({ unattributed: 'true', origin: '@dudousxd/agent' });
+    await c.list({ filter: { unattributed: 'true', origin: '@dudousxd/agent' } });
 
     expect(c.queries[0]?.origins).toEqual(['@dudousxd/agent', null]);
   });
 
   it('scopes a BULK action to it too — or retry-all would reach every origin', async () => {
-    // The console can select this bucket, so a destructive action launched under it must be narrowed
-    // to it. Sending no origin param at all would act on runs the operator never had on screen.
     const c = await makeConsole();
 
-    await c.bulk('cancel', { unattributed: 'true' });
+    await c.bulk('cancel', { filter: { unattributed: 'true' } });
 
     expect(c.queries[0]?.origin).toBeNull();
   });
@@ -519,10 +459,12 @@ describe('DurableApiController: facets', () => {
     const c = await makeConsole();
 
     await c.facets({
-      workflow: 'checkout',
-      tag: 'tier:pro',
-      attr: 'amount:gte:200',
-      namespace: 'acme',
+      filter: {
+        workflow: 'checkout',
+        tag: 'tier:pro',
+        'attr.amount': { gte: '200' },
+        namespace: 'acme',
+      },
     });
 
     expect(c.facetQueries[0]).toMatchObject({
@@ -534,15 +476,28 @@ describe('DurableApiController: facets', () => {
   });
 
   it('is not narrowed by the axes it reports, even when the request carries them', async () => {
-    // Counting "how many are failed" inside a query already filtered to failed answers itself. The
-    // route takes the same filter as the listing, so the dropping has to happen here.
+    // Counting "how many are failed" inside a query already filtered to failed answers itself.
     const c = await makeConsole();
 
-    await c.facets({ status: 'failed', origin: '@acme/billing', limit: '10' });
+    await c.facets({ filter: { status: 'failed', origin: '@acme/billing' } });
 
     expect(c.facetQueries[0]).not.toHaveProperty('status');
     expect(c.facetQueries[0]).not.toHaveProperty('origin');
     expect(c.facetQueries[0]).not.toHaveProperty('limit');
+  });
+
+  it('answers 400 for a paging param, which a set of counts does not take', async () => {
+    const c = await makeConsole();
+
+    await expect(c.facets({ size: '10' })).rejects.toMatchObject({ status: 400 });
+  });
+
+  it('wraps the cells as { data }', async () => {
+    const c = await makeConsole();
+
+    const body = await c.controller.facets({});
+
+    expect(body.data).toHaveLength(2);
   });
 });
 
@@ -552,7 +507,7 @@ describe('DurableApiController: value pickers', () => {
     const c = await makeConsole();
 
     const rows = await c.values({
-      filter: { where: [{ field: 'namespace', operator: 'equals', value: 'acme' }] },
+      filter: { namespace: 'acme' },
       groupByCount: { field: 'tag' },
     });
 
@@ -562,6 +517,23 @@ describe('DurableApiController: value pickers', () => {
       { value: 'etl', count: 4 },
       { value: 'nightly', count: 1 },
     ]);
+  });
+
+  it('takes flat groupByCount keys next to flat filter keys', async () => {
+    const c = await makeConsole();
+
+    await c.values({ 'filter[namespace]': 'acme', 'groupByCount[field]': 'tag' });
+
+    expect(c.valueFacets[0]?.axis).toEqual({ field: 'tag' });
+    expect(c.valueFacets[0]?.query).toMatchObject({ namespace: 'acme' });
+  });
+
+  it('refuses an unknown filter field here too', async () => {
+    const c = await makeConsole();
+
+    await expect(
+      c.values({ filter: { bogus: 'x' }, groupByCount: { field: 'tag' } }),
+    ).rejects.toBeInstanceOf(BadRequestException);
   });
 
   it('bounds the answer, because tag cardinality grows with the data', async () => {
@@ -604,19 +576,19 @@ describe('DurableApiController: list rows', () => {
     // reads it.
     const c = await makeConsole([runWithPayloads()]);
 
-    const rows = await c.list();
+    const { data } = await c.list();
 
-    expect(rows[0]).not.toHaveProperty('input');
-    expect(rows[0]).not.toHaveProperty('output');
-    expect(rows[0]).not.toHaveProperty('error');
+    expect(data[0]).not.toHaveProperty('input');
+    expect(data[0]).not.toHaveProperty('output');
+    expect(data[0]).not.toHaveProperty('error');
   });
 
   it('keeps every field a row or its derived state reads', async () => {
     const c = await makeConsole([runWithPayloads()]);
 
-    const rows = await c.list();
+    const { data } = await c.list();
 
-    expect(rows[0]).toMatchObject({
+    expect(data[0]).toMatchObject({
       id: 'run-1',
       workflow: 'checkout',
       status: 'failed',
@@ -636,6 +608,66 @@ describe('DurableApiController: list rows', () => {
     expect(detail.run.input).toEqual({ order: 'ord-1' });
     expect(detail.run.output).toEqual({ charged: false });
     expect(detail.run.error?.message).toBe('boom');
+  });
+});
+
+describe('DurableApiController: schedules', () => {
+  it('narrows by filter[...] and answers { data } bounded by size', async () => {
+    const c = await makeConsole();
+    const service = (c.controller as unknown as { dashboard: DashboardService }).dashboard;
+    const seen: unknown[] = [];
+    service.listSchedules = async (query) => {
+      seen.push(query);
+      return [];
+    };
+
+    const body = await c.controller.schedules({
+      filter: { namespace: 'acme', paused: 'true' },
+      size: '5000',
+    });
+
+    expect(body).toEqual({ data: [] });
+    expect(seen[0]).toEqual({ namespace: 'acme', paused: true, limit: 1000 });
+  });
+
+  it('refuses an unknown filter field and a non-boolean paused', async () => {
+    const c = await makeConsole();
+
+    await expect(c.controller.schedules({ filter: { status: 'x' } })).rejects.toBeInstanceOf(
+      BadRequestException,
+    );
+    await expect(c.controller.schedules({ filter: { paused: 'maybe' } })).rejects.toBeInstanceOf(
+      BadRequestException,
+    );
+  });
+});
+
+describe('DurableApiController: fan members', () => {
+  it('pages with page/size and filter[failed], as an offset page', async () => {
+    const c = await makeConsole();
+    const service = (c.controller as unknown as { dashboard: DashboardService }).dashboard;
+    const seen: unknown[] = [];
+    service.getFanMembers = async (_id, _group, query) => {
+      seen.push(query);
+      return { items: [], total: 1200 };
+    };
+
+    const body = await c.controller.fanMembers('r1', 'g', {
+      page: '2',
+      size: '1000',
+      filter: { failed: 'true' },
+    });
+
+    expect(seen[0]).toEqual({ offset: 500, limit: 500, failedOnly: true });
+    expect(body.meta).toMatchObject({ total: 1200, perPage: 500, currentPage: 2, lastPage: 3 });
+  });
+
+  it('refuses an unknown filter field', async () => {
+    const c = await makeConsole();
+
+    await expect(c.controller.fanMembers('r1', 'g', { filter: { status: 'x' } })).rejects.toThrow(
+      BadRequestException,
+    );
   });
 });
 

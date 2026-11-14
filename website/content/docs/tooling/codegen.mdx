@@ -71,7 +71,7 @@ namespace):
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| `api.durable.listRuns({ query })` | `GET /runs` | List runs, optionally filtered by `status`. |
+| `api.durable.listRuns({ query })` | `GET /runs` | One page of runs (`{ data, meta }`), filtered by `filter[status]`, `filter[workflow]`, … and paged by `page` / `size`. |
 | `api.durable.getRun({ params: { id } })` | `GET /runs/:id` | One run plus its step `timeline` (or `null`). |
 | `api.durable.retry({ params: { id } })` | `POST /runs/:id/retry` | Re-drive a failed/dead run. |
 | `api.durable.cancel({ params: { id }, query })` | `POST /runs/:id/cancel` | Cancel a run; `compensate: 'true'` runs saga undos. |
@@ -94,8 +94,8 @@ TanStack Query hooks as the rest of your API. A minimal ops panel:
 <Tab value="Typed client">
 
 ```ts
-// A raw call — the return type is inferred as Run[]
-const running = await api.durable.listRuns({ query: { status: 'running' } });
+// A raw call — the return type is inferred as { data: Run[]; meta: { total, … } }
+const { data: running } = await api.durable.listRuns({ query: { 'filter[status]': 'running' } });
 
 // Run detail, then a control action
 const detail = await api.durable.getRun({ params: { id: runId } });
@@ -113,7 +113,8 @@ await api.durable.cancel({ params: { id: runId }, query: { compensate: 'true' } 
 
 ```tsx
 function FailedRuns() {
-  const { data: runs } = api.durable.listRuns.useQuery({ query: { status: 'failed' } });
+  const { data: page } = api.durable.listRuns.useQuery({ query: { 'filter[status]': 'failed' } });
+  const runs = page?.data;
   const retry = api.durable.retry.useMutation();
 
   return (

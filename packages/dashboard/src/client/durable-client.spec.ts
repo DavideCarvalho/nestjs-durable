@@ -2,36 +2,32 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConsoleAccessError, durableClient, onConsoleAccessDenied } from './durable-client.js';
 
 /**
- * The filter clauses a request carries, read back out of its query string.
+ * The filter predicates a request carries, read back out of its query string.
  *
- * The console sends its predicates in `@dudousxd/nestjs-filter`'s structured spelling
- * (`filter[where][0][field]=…`), so a test that asserted on flat params would be asserting the
- * encoding rather than the predicate. This decodes back to what was MEANT.
+ * The console sends Aviary's list wire (`filter[tag][]=a`, `filter[attr.amount][gte]=200`, …), and
+ * a bare value, a `[]` list and an operator key can all spell one predicate, so a test that asserted
+ * on the raw params would be asserting the encoding rather than the predicate. This decodes back to
+ * what was MEANT: `eq` for one value, `in` for a set, else the operator sent.
  */
-function clauses(
-  url: string | undefined,
-): Array<{ field: string; operator: string; value: unknown }> {
+function clauses(url: string | undefined): Array<{ field: string; op: string; value: unknown }> {
   const params = new URLSearchParams(url?.split('?')[1] ?? '');
-  const byIndex = new Map<string, { field: string; operator: string; value: unknown }>();
+  const byKey = new Map<string, { field: string; op: string; value: unknown }>();
   for (const [key, value] of params) {
-    const match = /^filter\[where\]\[(\d+)\]\[(field|operator|value)\](?:\[(\d+)\])?$/.exec(key);
+    const match = /^filter\[([^[\]]+)\](?:\[([^[\]]+)\])?(\[\])?$/.exec(key);
     if (!match) continue;
-    const [, index, part, member] = match;
-    const clause = byIndex.get(index as string) ?? { field: '', operator: '', value: undefined };
-    if (part === 'value' && member !== undefined) {
-      const list = (clause.value as unknown[] | undefined) ?? [];
-      list[Number(member)] = coerce(value);
-      clause.value = list;
-    } else if (part === 'value') {
-      clause.value = coerce(value);
+    const [, field, op, list] = match as unknown as [string, string, string?, string?];
+    if (list || (op === undefined && value.includes(','))) {
+      const id = `${field}:in`;
+      const clause = byKey.get(id) ?? { field, op: 'in', value: [] };
+      (clause.value as unknown[]).push(...(list ? [value] : value.split(',')).map(coerce));
+      byKey.set(id, clause);
+    } else if (op === 'in') {
+      byKey.set(`${field}:in`, { field, op: 'in', value: value.split(',').map(coerce) });
     } else {
-      clause[part as 'field' | 'operator'] = value;
+      byKey.set(`${field}:${op ?? 'eq'}`, { field, op: op ?? 'eq', value: coerce(value) });
     }
-    byIndex.set(index as string, clause);
   }
-  return [...byIndex.entries()]
-    .sort(([a], [b]) => Number(a) - Number(b))
-    .map(([, clause]) => clause);
+  return [...byKey.values()];
 }
 
 /** Query strings are text; the server coerces operands the same way. */
@@ -97,9 +93,9 @@ describe('durableClient: the run-list query string', () => {
       origin: '@dudousxd/nestjs-catalog-pipeline',
     });
     expect(clauses(calls[0])).toEqual([
-      { field: 'tag', operator: 'equals', value: 'tier:pro' },
-      { field: 'namespace', operator: 'equals', value: 'acme' },
-      { field: 'origin', operator: 'equals', value: '@dudousxd/nestjs-catalog-pipeline' },
+      { field: 'tag', op: 'eq', value: 'tier:pro' },
+      { field: 'namespace', op: 'eq', value: 'acme' },
+      { field: 'origin', op: 'eq', value: '@dudousxd/nestjs-catalog-pipeline' },
     ]);
   });
 
@@ -113,8 +109,8 @@ describe('durableClient: the run-list query string', () => {
     });
 
     expect(clauses(calls[0])).toEqual([
-      { field: 'tag', operator: 'in', value: ['etl', 'nightly'] },
-      { field: 'namespace', operator: 'in', value: ['acme', 'globex'] },
+      { field: 'tag', op: 'in', value: ['etl', 'nightly'] },
+      { field: 'namespace', op: 'in', value: ['acme', 'globex'] },
     ]);
   });
 
@@ -124,8 +120,8 @@ describe('durableClient: the run-list query string', () => {
     await durableClient.runs(undefined, undefined, ['amount:gte:200', 'tier:in:pro|enterprise']);
 
     expect(clauses(calls[0])).toEqual([
-      { field: 'attr.amount', operator: 'gte', value: 200 },
-      { field: 'attr.tier', operator: 'in', value: ['pro', 'enterprise'] },
+      { field: 'attr.amount', op: 'gte', value: 200 },
+      { field: 'attr.tier', op: 'in', value: ['pro', 'enterprise'] },
     ]);
   });
 
@@ -137,9 +133,9 @@ describe('durableClient: the run-list query string', () => {
       origin: '@dudousxd/nestjs-agent',
     });
     expect(clauses(calls[0])).toEqual([
-      { field: 'status', operator: 'equals', value: 'dead' },
-      { field: 'namespace', operator: 'equals', value: 'acme' },
-      { field: 'origin', operator: 'equals', value: '@dudousxd/nestjs-agent' },
+      { field: 'status', op: 'eq', value: 'dead' },
+      { field: 'namespace', op: 'eq', value: 'acme' },
+      { field: 'origin', op: 'eq', value: '@dudousxd/nestjs-agent' },
     ]);
   });
 });
@@ -215,27 +211,30 @@ describe('durableClient: paging and the unattributed bucket', () => {
 
   afterEach(() => vi.unstubAllGlobals());
 
-  it('bounds the listing with limit and offset', async () => {
-    // Inside the filter envelope, not as `paginate`: the console's "show more" grows ONE window
-    // rather than stepping through pages, and `paginate.size` is capped server-side by
-    // `maxPageSize` — a cap that would silently stop "show more" at 100 rows.
+  it('asks for one page with page and size', async () => {
     const { calls } = captureUrl();
 
-    await durableClient.runs(undefined, undefined, undefined, { limit: 100, offset: 200 });
+    await durableClient.runs(undefined, undefined, undefined, { page: 3, size: 100 });
 
-    expect(calls[0]).toContain('filter[limit]=100');
-    expect(calls[0]).toContain('filter[offset]=200');
+    expect(calls[0]).toBe('/durable/api/runs?page=3&size=100');
+  });
+
+  it('keeps a single value holding a comma from being read as a list', async () => {
+    const { calls } = captureUrl();
+
+    await durableClient.runs(undefined, 'a,b');
+
+    expect(calls[0]).toBe('/durable/api/runs?filter[tag][]=a%2Cb');
   });
 
   it('asks for the unattributed bucket as an ABSENCE, never as an origin VALUE', async () => {
     // Any reserved `origin` string is a package name someone can legitimately publish, so the
-    // absence travels as the one operator that can select it.
+    // absence travels as a filter field of its own.
     const { calls } = captureUrl();
 
     await durableClient.runs(undefined, undefined, undefined, { origin: null });
 
-    // `isNull` selects an absence, so it carries no operand of its own.
-    expect(clauses(calls[0])).toEqual([{ field: 'origin', operator: 'isNull', value: undefined }]);
+    expect(clauses(calls[0])).toEqual([{ field: 'unattributed', op: 'eq', value: true }]);
   });
 
   it('sends a concrete origin as an equality, unchanged', async () => {
@@ -243,9 +242,7 @@ describe('durableClient: paging and the unattributed bucket', () => {
 
     await durableClient.runs(undefined, undefined, undefined, { origin: '@dudousxd/agent' });
 
-    expect(clauses(calls[0])).toEqual([
-      { field: 'origin', operator: 'equals', value: '@dudousxd/agent' },
-    ]);
+    expect(clauses(calls[0])).toEqual([{ field: 'origin', op: 'eq', value: '@dudousxd/agent' }]);
   });
 
   it('sends a status SET as one clause, which the server ORs', async () => {
@@ -256,7 +253,7 @@ describe('durableClient: paging and the unattributed bucket', () => {
     });
 
     expect(clauses(calls[0])).toEqual([
-      { field: 'status', operator: 'in', value: ['running', 'suspended'] },
+      { field: 'status', op: 'in', value: ['running', 'suspended'] },
     ]);
   });
 
@@ -265,8 +262,7 @@ describe('durableClient: paging and the unattributed bucket', () => {
 
     await durableClient.bulk('cancel', { origin: null });
 
-    // `isNull` selects an absence, so it carries no operand of its own.
-    expect(clauses(calls[0])).toEqual([{ field: 'origin', operator: 'isNull', value: undefined }]);
+    expect(clauses(calls[0])).toEqual([{ field: 'unattributed', op: 'eq', value: true }]);
   });
 
   it('asks the facets endpoint only for the axes it does NOT report', async () => {
@@ -276,11 +272,11 @@ describe('durableClient: paging and the unattributed bucket', () => {
 
     expect(calls[0]).toContain('/runs/facets?');
     expect(clauses(calls[0])).toEqual([
-      { field: 'tag', operator: 'equals', value: 'tier:pro' },
-      { field: 'namespace', operator: 'equals', value: 'acme' },
-      { field: 'attr.amount', operator: 'gte', value: 200 },
+      { field: 'tag', op: 'eq', value: 'tier:pro' },
+      { field: 'namespace', op: 'eq', value: 'acme' },
+      { field: 'attr.amount', op: 'gte', value: 200 },
     ]);
-    expect(calls[0]).not.toContain('filter[limit]');
+    expect(calls[0]).not.toContain('page=');
   });
 
   it('scopes a value picker by the rest of the filter, and bounds what it returns', async () => {
@@ -291,7 +287,7 @@ describe('durableClient: paging and the unattributed bucket', () => {
     await durableClient.values('tag', { namespace: ['acme'] }, { limit: 20 });
 
     expect(calls[0]).toContain('/runs/values?');
-    expect(clauses(calls[0])).toEqual([{ field: 'namespace', operator: 'equals', value: 'acme' }]);
+    expect(clauses(calls[0])).toEqual([{ field: 'namespace', op: 'eq', value: 'acme' }]);
     expect(calls[0]).toContain('groupByCount[field]=tag');
     expect(calls[0]).toContain('groupByCount[limit]=20');
   });
@@ -304,7 +300,15 @@ describe('durableClient.fanMembers', () => {
       'fetch',
       vi.fn((url: string) => {
         calls.push(url);
-        return Promise.resolve(jsonResponse({ items: [], total: 0 }, 200));
+        return Promise.resolve(
+          jsonResponse(
+            {
+              data: [],
+              meta: { total: 0, perPage: 100, currentPage: 1, lastPage: 1, firstPage: 1 },
+            },
+            200,
+          ),
+        );
       }),
     );
     return { calls };
@@ -320,13 +324,15 @@ describe('durableClient.fanMembers', () => {
 
   it('sends the page window and the failed-only filter', async () => {
     const { calls } = captureUrl();
-    await durableClient.fanMembers('r1', 'all:3', { offset: 200, limit: 100, failed: true });
-    expect(calls[0]).toBe('/durable/api/runs/r1/fans/all%3A3?offset=200&limit=100&failed=true');
+    await durableClient.fanMembers('r1', 'all:3', { page: 3, size: 100, failed: true });
+    expect(calls[0]).toBe(
+      '/durable/api/runs/r1/fans/all%3A3?page=3&size=100&filter%5Bfailed%5D=true',
+    );
   });
 
   it('omits failed=false rather than sending it', async () => {
     const { calls } = captureUrl();
-    await durableClient.fanMembers('r1', 'g', { offset: 0, failed: false });
-    expect(calls[0]).toBe('/durable/api/runs/r1/fans/g?offset=0');
+    await durableClient.fanMembers('r1', 'g', { page: 1, failed: false });
+    expect(calls[0]).toBe('/durable/api/runs/r1/fans/g?page=1');
   });
 });

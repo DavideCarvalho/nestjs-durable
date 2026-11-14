@@ -155,10 +155,11 @@ describe('run detail ETags over HTTP', () => {
   });
 
   it('versions a fan page by its group and the page asked for', async () => {
-    const path = `/durable/api/runs/r1/fans/${encodeURIComponent('steps:0:100')}?limit=10`;
+    const path = `/durable/api/runs/r1/fans/${encodeURIComponent('steps:0:100')}?size=10`;
     const first = await request(app.getHttpServer()).get(path);
     expect(first.status).toBe(200);
-    expect(first.body.items).toHaveLength(10);
+    expect(first.body.data).toHaveLength(10);
+    expect(first.body.meta).toMatchObject({ total: 80, perPage: 10, currentPage: 1 });
     const etag = first.headers.etag as string;
     expect(etag).toMatch(/^"fp-[0-9a-f]+"$/);
 
@@ -166,14 +167,14 @@ describe('run detail ETags over HTTP', () => {
     expect(again.status).toBe(304);
 
     const otherPage = await request(app.getHttpServer())
-      .get(`${path}&offset=10`)
+      .get(`${path}&page=2`)
       .set('If-None-Match', etag);
     expect(otherPage.status).toBe(200);
 
     await store.saveCheckpoint(step(3, { status: 'failed', attempts: 2 }));
     const moved = await request(app.getHttpServer()).get(path).set('If-None-Match', etag);
     expect(moved.status).toBe(200);
-    expect(moved.body.items[3].status).toBe('failed');
+    expect(moved.body.data[3].status).toBe('failed');
   });
 
   it('answers in full, without a 304, when the gateway cannot version the detail', async () => {

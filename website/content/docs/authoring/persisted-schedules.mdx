@@ -124,6 +124,16 @@ schedule in the engine's namespace (all namespaces for an operator engine) and r
 
 ## Dashboard
 
-The console header shows a **schedules** chip (count, paused count) whose popover lists every
-persisted schedule's cadence, next and last fire and last error, with **pause/resume** and **run now**.
-The API behind it is `GET /schedules` and `POST /schedules/:id/{pause,resume,trigger}`.
+The console's **Schedules** page lists every persisted schedule's cadence, next and last fire and last
+error, with **pause/resume** and **run now**. The API behind it is `GET /schedules` and
+`POST /schedules/:id/{pause,resume,trigger}`.
+
+`GET /schedules` answers `{ data: [...] }`, soonest-due first. It takes `filter[namespace]`,
+`filter[workflow]`, `filter[tag]` and `filter[paused]=true|false`, and `size` (default 200, at most
+1000). It is not paged: the store cannot count schedules, and the soonest-due order changes every
+time a schedule fires, so neither page numbers nor cursors over it would be stable. An unknown filter
+field is a `400`.
+
+```bash
+curl '/durable/api/schedules?filter[tag]=tenant:acme&filter[paused]=false&size=50'
+```
