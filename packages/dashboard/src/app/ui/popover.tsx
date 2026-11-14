@@ -33,7 +33,7 @@ export const PopoverContent = forwardRef<HTMLDivElement, PopoverContentProps>(
         <PopoverPrimitive.Popup
           ref={ref}
           className={cn(
-            'rise w-72 overflow-hidden rounded-md border border-line bg-popover/95 text-zinc-300 shadow-xl backdrop-blur focus-visible:outline-none',
+            'rise w-72 overflow-hidden rounded-lg border border-border bg-popover text-fg-2 shadow-(--aviary-shadow) focus-visible:outline-none',
             className,
           )}
           {...props}

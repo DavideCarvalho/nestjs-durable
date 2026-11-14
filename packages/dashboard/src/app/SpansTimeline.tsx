@@ -131,14 +131,14 @@ function fmtDur(ms: number): string {
 
 type SubStatus = 'ok' | 'failed' | 'skipped';
 const SUB_BAR: Record<SubStatus, string> = {
-  ok: 'bg-emerald-500/40 ring-1 ring-emerald-500/50',
-  failed: 'bg-red-500/40 ring-1 ring-red-500/50',
-  skipped: 'bg-amber-500/35 ring-1 ring-amber-500/45',
+  ok: 'bg-good/40 ring-1 ring-good/50',
+  failed: 'bg-bad/40 ring-1 ring-bad/50',
+  skipped: 'bg-warn/35 ring-1 ring-warn/45',
 };
 const SUB_DOT: Record<SubStatus, string> = {
-  ok: 'bg-emerald-400',
-  failed: 'bg-red-400',
-  skipped: 'bg-amber-400',
+  ok: 'bg-good',
+  failed: 'bg-bad',
+  skipped: 'bg-warn',
 };
 
 /** A prepared timeline row: a step plus its resolved bar geometry and sub-process rows. */
@@ -224,7 +224,7 @@ function StepRow({
         onClick={() => onSelect(step, run)}
         title={isChild ? 'Child workflow — click for its detail (↗ opens its run)' : undefined}
         className={`group grid w-full grid-cols-[150px_1fr] items-center gap-3 rounded-md px-2 py-1 text-left transition-colors ${
-          active ? 'bg-zinc-800/60' : 'hover:bg-zinc-900/60'
+          active ? 'bg-hover' : 'hover:bg-hover'
         }`}
       >
         <span className="flex items-center gap-1.5 truncate">
@@ -235,7 +235,7 @@ function StepRow({
                 e.stopPropagation();
                 onToggleChild(childRunId);
               }}
-              className="shrink-0 text-indigo-400 hover:text-indigo-200 transition-colors"
+              className="shrink-0 text-violet hover:text-violet transition-colors"
               title={isExpanded ? 'Collapse child run' : 'Expand child run inline'}
             >
               <span
@@ -253,7 +253,7 @@ function StepRow({
                 e.stopPropagation();
                 toggleSubs(step.seq);
               }}
-              className="shrink-0 text-zinc-500 transition-colors hover:text-zinc-300"
+              className="shrink-0 text-dim transition-colors hover:text-fg-2"
               title={
                 subsCollapsed ? `Show ${subRows.length} sub-process(es)` : 'Hide sub-processes'
               }
@@ -266,12 +266,10 @@ function StepRow({
               </span>
             </button>
           )}
-          <span
-            className={failed ? 'text-red-400' : isChild ? 'text-indigo-300' : 'text-emerald-400'}
-          >
+          <span className={failed ? 'text-bad' : isChild ? 'text-violet' : 'text-good'}>
             <Icon width={12} height={12} />
           </span>
-          <span className="truncate text-[12px] text-zinc-300">
+          <span className="truncate text-[12px] text-fg-2">
             {childRunId !== undefined
               ? (childRuns[childRunId]?.run.workflow ?? childFallbackLabel(childRunId, step.runId))
               : stepDisplayName(step)}
@@ -285,7 +283,7 @@ function StepRow({
                 onOpenRun(childRunId);
               }}
               title="Open the child run"
-              className="shrink-0 text-indigo-300 transition-colors hover:text-indigo-100"
+              className="shrink-0 text-violet transition-colors hover:text-violet"
             >
               ↗
             </button>
@@ -297,15 +295,15 @@ function StepRow({
           <span
             className={`absolute top-1/2 flex h-3.5 -translate-y-1/2 items-center rounded-[3px] transition-all duration-500 ease-out ${
               failed
-                ? 'bg-red-500/35 ring-1 ring-red-500/50'
+                ? 'bg-bad/35 ring-1 ring-bad/50'
                 : active
-                  ? 'bg-emerald-400/45 ring-1 ring-emerald-400/60'
-                  : 'bg-emerald-500/30 ring-1 ring-emerald-500/40'
+                  ? 'bg-good/45 ring-1 ring-good/60'
+                  : 'bg-good/30 ring-1 ring-good/40'
             }`}
             style={{ left: `${left}%`, width: `${width}%` }}
           />
           <span
-            className="mono tnum absolute top-1/2 -translate-y-1/2 whitespace-nowrap pl-1 text-[10px] text-zinc-500"
+            className="mono tnum absolute top-1/2 -translate-y-1/2 whitespace-nowrap pl-1 text-[10px] text-dim"
             style={{ left: `min(${left + width}%, calc(100% - 44px))` }}
           >
             {fmtDur(ms)}
@@ -314,7 +312,7 @@ function StepRow({
       </button>
       {staleView?.kind === 'working' && (
         <div
-          className="mono ml-[18px] mb-1 flex items-center gap-1 text-[10px] text-emerald-500/80"
+          className="mono ml-[18px] mb-1 flex items-center gap-1 text-[10px] text-good/80"
           title="A live worker holds this dispatch — its heartbeat is fresh. Long steps are expected to sit here; only re-dispatch if the heartbeat goes stale."
         >
           <span aria-hidden>⚙</span>
@@ -342,7 +340,7 @@ function StepRow({
             >
               <span className="flex items-center gap-1.5 truncate">
                 <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${SUB_DOT[sub.status]}`} />
-                <span className="truncate text-[10px] text-zinc-400">{sub.name}</span>
+                <span className="truncate text-[10px] text-dim">{sub.name}</span>
               </span>
               <span className="relative h-3">
                 <span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-line-soft" />
@@ -351,7 +349,7 @@ function StepRow({
                   style={{ left: `${sub.left}%`, width: `${sub.width}%` }}
                 />
                 <span
-                  className="mono tnum absolute top-1/2 -translate-y-1/2 whitespace-nowrap pl-1 text-[9px] text-zinc-600"
+                  className="mono tnum absolute top-1/2 -translate-y-1/2 whitespace-nowrap pl-1 text-[9px] text-faint"
                   style={{ left: `min(${sub.left + sub.width}%, calc(100% - 38px))` }}
                 >
                   {fmtDur(sub.ms)}
@@ -395,18 +393,16 @@ function ParallelFan({
   rowProps: RowProps;
 }) {
   return (
-    <div className="rounded-md bg-zinc-900/30 ring-1 ring-line-soft">
+    <div className="rounded-md bg-hover ring-1 ring-line-soft">
       <div className="flex items-center gap-2 px-2 py-1">
         <span
-          className="text-[11px] text-indigo-300/80"
+          className="text-[11px] text-violet/80"
           title="parallel fan-out (ctx.gather / ctx.all)"
         >
           ⑃
         </span>
-        <span className="mono text-[10px] uppercase tracking-[0.15em] text-zinc-500">parallel</span>
-        <span className={`text-[11px] ${fanFailed ? 'text-red-400' : 'text-zinc-300'}`}>
-          {label}
-        </span>
+        <span className="mono text-[10px] uppercase tracking-[0.15em] text-dim">parallel</span>
+        <span className={`text-[11px] ${fanFailed ? 'text-bad' : 'text-fg-2'}`}>{label}</span>
       </div>
       <div className="ml-[10px] border-l border-line-soft pl-1">
         {memberRows.map((row) => (
@@ -454,13 +450,13 @@ function SummarizedFan({
     [fan.failures, frame],
   );
   return (
-    <div className="rounded-md bg-zinc-900/30 ring-1 ring-line-soft">
+    <div className="rounded-md bg-hover ring-1 ring-line-soft">
       <div className="grid grid-cols-[150px_1fr] items-center gap-3 px-2 py-1">
         <span className="flex items-center gap-1.5 truncate">
           <button
             type="button"
             onClick={() => setOpen((v) => !v)}
-            className="shrink-0 text-zinc-500 transition-colors hover:text-zinc-300"
+            className="shrink-0 text-dim transition-colors hover:text-fg-2"
             title={open ? 'Hide the members' : `List the ${fan.size} members started`}
           >
             <span
@@ -470,11 +466,11 @@ function SummarizedFan({
               ▸
             </span>
           </button>
-          <span className="text-[11px] text-indigo-300/80" title="parallel fan-out, summarized">
+          <span className="text-[11px] text-violet/80" title="parallel fan-out, summarized">
             ⑃
           </span>
           <span
-            className={`truncate text-[12px] ${status === 'failed' ? 'text-red-400' : 'text-zinc-300'}`}
+            className={`truncate text-[12px] ${status === 'failed' ? 'text-bad' : 'text-fg-2'}`}
             title={fan.group}
           >
             {fan.label} ×{progress.total}
@@ -487,8 +483,8 @@ function SummarizedFan({
               <span
                 className={`absolute top-1/2 h-3.5 -translate-y-1/2 rounded-[3px] ${
                   status === 'failed'
-                    ? 'bg-red-500/25 ring-1 ring-red-500/40'
-                    : 'bg-indigo-500/20 ring-1 ring-indigo-500/40'
+                    ? 'bg-bad/25 ring-1 ring-bad/40'
+                    : 'bg-violet/20 ring-1 ring-violet/40'
                 } ${inFlight ? 'pulse' : ''}`}
                 style={{
                   left: `${((start - frame.t0) / frame.span) * 100}%`,
@@ -496,7 +492,7 @@ function SummarizedFan({
                 }}
               />
               <span
-                className="mono tnum absolute top-1/2 -translate-y-1/2 whitespace-nowrap pl-1 text-[10px] text-zinc-500"
+                className="mono tnum absolute top-1/2 -translate-y-1/2 whitespace-nowrap pl-1 text-[10px] text-dim"
                 style={{
                   left: `min(${((end - frame.t0) / frame.span) * 100}%, calc(100% - 44px))`,
                 }}
@@ -508,7 +504,7 @@ function SummarizedFan({
         </span>
       </div>
       <div className="flex items-center gap-3 px-2 pb-1.5 pl-[26px]">
-        <span className="flex h-1.5 w-40 shrink-0 overflow-hidden rounded-full bg-zinc-800">
+        <span className="flex h-1.5 w-40 shrink-0 overflow-hidden rounded-full bg-panel-3">
           {FAN_PROGRESS_SEGMENTS.map((seg) =>
             progress[seg.key] > 0 ? (
               <span
@@ -521,7 +517,7 @@ function SummarizedFan({
         </span>
         <span className="mono tnum flex flex-wrap gap-2 text-[10px]">
           {progress.started < progress.total && (
-            <span className="text-zinc-400">{fanSizeLabel(progress)} started</span>
+            <span className="text-dim">{fanSizeLabel(progress)} started</span>
           )}
           {FAN_PROGRESS_SEGMENTS.map((seg) =>
             progress[seg.key] > 0 ? (
@@ -534,8 +530,8 @@ function SummarizedFan({
         </span>
       </div>
       {failureRows.length > 0 && !open && (
-        <div className="ml-[10px] border-l border-red-500/30 pl-1">
-          <div className="mono px-2 text-[10px] text-red-300/70">
+        <div className="ml-[10px] border-l border-bad/30 pl-1">
+          <div className="mono px-2 text-[10px] text-bad/70">
             {progress.failed > failureRows.length
               ? `first ${failureRows.length} of ${progress.failed} failed`
               : `${failureRows.length} failed`}
@@ -553,8 +549,8 @@ function SummarizedFan({
               onClick={() => setFailedOnly((v) => !v)}
               className={`mono rounded border px-1.5 text-[10px] transition-colors ${
                 failedOnly
-                  ? 'border-red-500/40 bg-red-500/15 text-red-300'
-                  : 'border-line text-zinc-500 hover:text-zinc-300'
+                  ? 'border-bad/40 bg-bad/15 text-bad'
+                  : 'border-line text-dim hover:text-fg-2'
               }`}
             >
               failed only
@@ -631,18 +627,18 @@ function FanMembers({
   const failedPage = results.find((r) => r.isError);
   if (total === undefined && failedPage) {
     return (
-      <div className="mono px-2 py-1 text-[10px] text-red-400">
+      <div className="mono px-2 py-1 text-[10px] text-bad">
         couldn't load members:{' '}
         {failedPage.error instanceof Error ? failedPage.error.message : String(failedPage.error)}
       </div>
     );
   }
   if (total === undefined) {
-    return <div className="mono px-2 py-1 text-[10px] text-zinc-600">loading members…</div>;
+    return <div className="mono px-2 py-1 text-[10px] text-faint">loading members…</div>;
   }
   if (total === 0) {
     return (
-      <div className="mono px-2 py-1 text-[10px] text-zinc-600">
+      <div className="mono px-2 py-1 text-[10px] text-faint">
         {failedOnly ? 'no failed members' : 'no members'}
       </div>
     );
@@ -664,7 +660,7 @@ function FanMembers({
                 <StepRow row={prepareRow(step, undefined, frame)} {...rowProps} />
               ) : (
                 <div
-                  className="mono px-2 text-[10px] leading-7 text-zinc-700"
+                  className="mono px-2 text-[10px] leading-7 text-faint"
                   style={{ height: MEMBER_ROW_PX }}
                 >
                   #{item.index + 1} loading…
@@ -813,18 +809,17 @@ function ChildSpans({
     queryFn: () => durableClient.run(id),
   });
   if (depth > 6) return null; // safety cap against pathological nesting
-  if (!data)
-    return <div className="mono px-2 py-1 text-[10px] text-zinc-600">loading child run…</div>;
+  if (!data) return <div className="mono px-2 py-1 text-[10px] text-faint">loading child run…</div>;
   return (
-    <div className="my-1 rounded-md border border-line bg-black/15">
-      <div className="mono flex items-center gap-2 px-2 py-1 text-[10px] text-zinc-500">
-        <span className="text-indigo-300">⌁ {data.run.workflow}</span>
-        <span className="tnum text-zinc-600">{id.slice(0, 8)}</span>
+    <div className="my-1 rounded-md border border-line bg-sunken/15">
+      <div className="mono flex items-center gap-2 px-2 py-1 text-[10px] text-dim">
+        <span className="text-violet">⌁ {data.run.workflow}</span>
+        <span className="tnum text-faint">{id.slice(0, 8)}</span>
         <span className={`s-${data.run.status} uppercase`}>{data.run.status}</span>
         <button
           type="button"
           onClick={() => onOpenRun(id)}
-          className="ml-auto rounded border border-line px-1.5 text-zinc-400 hover:text-zinc-200"
+          className="ml-auto rounded border border-line px-1.5 text-dim hover:text-fg"
         >
           open ↗
         </button>
@@ -898,8 +893,8 @@ export const SpansTimeline = memo(function SpansTimeline({
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between px-4 pb-2 pt-3">
-        <span className="mono text-[10px] uppercase tracking-[0.2em] text-zinc-500">spans</span>
-        <span className="mono tnum text-[10px] text-zinc-600">total {fmtDur(span)}</span>
+        <span className="mono text-[10px] uppercase tracking-[0.2em] text-dim">spans</span>
+        <span className="mono tnum text-[10px] text-faint">total {fmtDur(span)}</span>
       </div>
       <div className="min-h-0 flex-1 space-y-1 overflow-auto px-3 pb-3">
         <RunSpans

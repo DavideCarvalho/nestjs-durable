@@ -5,3 +5,6 @@ export const DASHBOARD_DEV_TOOLS: symbol = Symbol('DASHBOARD_DEV_TOOLS');
 export const DASHBOARD_BASE_PATH: symbol = Symbol('DASHBOARD_BASE_PATH');
 /** DI token carrying the JSON API base the SPA fetches from (e.g. `/api/durable`). */
 export const DASHBOARD_API_PATH: symbol = Symbol('DASHBOARD_API_PATH');
+
+/** DI token carrying the console shell's `viewer` / `signOut` options (see `console-shell.ts`). */
+export const DASHBOARD_SHELL: symbol = Symbol('DASHBOARD_SHELL');

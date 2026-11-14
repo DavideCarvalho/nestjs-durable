@@ -19,7 +19,7 @@ export const TooltipRoot = TooltipPrimitive.Root;
 export const TooltipTrigger = TooltipPrimitive.Trigger;
 
 const POPUP_CLASS =
-  'z-50 max-w-[280px] whitespace-pre-line rounded-md border border-line bg-popover/95 px-2 py-1 text-left text-[10px] leading-relaxed text-zinc-300 shadow-xl backdrop-blur';
+  'z-50 max-w-[280px] whitespace-pre-line rounded-md border border-border bg-popover px-2 py-1 text-left text-[10px] leading-relaxed text-fg-2 shadow-(--aviary-shadow)';
 
 /**
  * The console's tooltip, keeping the call-site API the hand-rolled one had (`label` + `suppressed`).

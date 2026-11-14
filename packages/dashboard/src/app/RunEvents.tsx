@@ -48,9 +48,9 @@ function rowClass(type: EngineEvent['type']): string {
     return 'text-bad';
   }
   if (type === 'run.completed' || type === 'step.completed' || type === 'run.triggered') {
-    return 'text-emerald-300';
+    return 'text-good';
   }
-  return 'text-zinc-300';
+  return 'text-fg-2';
 }
 
 /**
@@ -74,11 +74,11 @@ export function RunEvents({
   const events = useSyncExternalStore(tail.subscribe, tail.snapshot, tail.snapshot);
   return (
     <section aria-label="Events" className="mt-3">
-      <h3 className="text-[10px] uppercase tracking-wider text-zinc-500">
-        Events <span className="normal-case tracking-normal text-zinc-600">(live)</span>
+      <h3 className="text-[10px] uppercase tracking-wider text-dim">
+        Events <span className="normal-case tracking-normal text-faint">(live)</span>
       </h3>
       {events.length === 0 ? (
-        <p className="mt-1 text-[11px] text-zinc-600" data-testid="events-empty">
+        <p className="mt-1 text-[11px] text-faint" data-testid="events-empty">
           No events yet. This shows the engine events of this run that arrive while the page is open
           (the last {tail.limit}); they are not stored.
         </p>
@@ -90,7 +90,7 @@ export function RunEvents({
               className="flex flex-wrap items-center gap-1.5 text-[11px]"
               data-type={event.type}
             >
-              <span className="mono text-zinc-600" title={event.at}>
+              <span className="mono text-faint" title={event.at}>
                 {eventTime(event.at)}
               </span>
               <span className={`mono ${rowClass(event.type)}`}>{event.type}</span>
@@ -98,17 +98,17 @@ export function RunEvents({
                 (event.type === 'run.triggered' || event.type === 'run.trigger_failed' ? (
                   <a
                     href={workflowHash(event.name)}
-                    className="mono text-zinc-200 underline-offset-2 hover:underline"
+                    className="mono text-fg underline-offset-2 hover:underline"
                   >
                     {event.name}
                   </a>
                 ) : (
-                  <span className="mono text-zinc-400">{event.name}</span>
+                  <span className="mono text-dim">{event.name}</span>
                 ))}
               {event.seq != null && <Chip className="text-[10px]">#{event.seq}</Chip>}
               {eventLinks(event, { sourceRunId, parentRunId }).map((link) => (
                 <span key={`${link.label}:${link.runId}`} className="flex items-center gap-1">
-                  <span className="text-[10px] text-zinc-600">{link.label}</span>
+                  <span className="text-[10px] text-faint">{link.label}</span>
                   <Button
                     variant="chip"
                     size="xs"
@@ -121,7 +121,7 @@ export function RunEvents({
                 </span>
               ))}
               {event.error?.message && <span className="text-bad">{event.error.message}</span>}
-              {event.reason && <span className="text-zinc-500">{event.reason}</span>}
+              {event.reason && <span className="text-dim">{event.reason}</span>}
             </li>
           ))}
         </ol>

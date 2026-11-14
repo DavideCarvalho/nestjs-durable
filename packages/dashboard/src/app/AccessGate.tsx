@@ -14,10 +14,10 @@ export function AccessGate({ children }: { children: ReactNode }) {
   return (
     <main role="alert" className="flex min-h-screen items-center justify-center p-6">
       <div className="max-w-sm text-center">
-        <h1 className="text-lg font-semibold text-zinc-100">
+        <h1 className="text-lg font-semibold text-fg">
           {signedOut ? 'Sign in required' : 'Access denied'}
         </h1>
-        <p className="mt-2 text-sm text-zinc-400">
+        <p className="mt-2 text-sm text-dim">
           {signedOut
             ? 'Sign in to the application, then reload this page.'
             : 'You do not have access to this console.'}
@@ -25,7 +25,7 @@ export function AccessGate({ children }: { children: ReactNode }) {
         <button
           type="button"
           onClick={() => window.location.reload()}
-          className="mt-4 rounded border border-zinc-700 px-3 py-1 text-sm text-zinc-200 hover:bg-zinc-800"
+          className="mt-4 rounded border border-line-strong px-3 py-1 text-sm text-fg hover:bg-panel-3"
         >
           Reload
         </button>
