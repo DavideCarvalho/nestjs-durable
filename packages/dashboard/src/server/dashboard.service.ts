@@ -30,6 +30,7 @@ import {
 } from '@dudousxd/nestjs-durable-core';
 import { Inject, Injectable, NotImplementedException, Optional } from '@nestjs/common';
 import { Observable } from 'rxjs';
+import { listRunsAndCount } from './run-query.adapter.js';
 
 // Single source of truth: core owns `RunDetail` (`run-gateway.ts`) — re-exported here (not
 // re-declared) so this package's existing public API (`import type { RunDetail } from
@@ -152,6 +153,11 @@ export class DashboardService {
 
   listRuns(query: RunQuery): Promise<RunListItem[]> {
     return this.gateway.listRuns(query);
+  }
+
+  /** One page of runs (`query.limit`/`offset`) and how many runs match `query` across every page. */
+  listRunsPage(query: RunQuery): Promise<{ rows: RunListItem[]; total: number }> {
+    return listRunsAndCount(this.gateway, query);
   }
 
   /** `(status, origin)` counts over the same predicates {@link listRuns} pages — what keeps the

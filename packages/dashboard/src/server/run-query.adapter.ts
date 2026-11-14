@@ -53,6 +53,32 @@ function unsupported(clause: ColumnFilter, supported: string): never {
 }
 
 /**
+ * A page of runs plus the size of the whole matching set. The total comes from the facet aggregate
+ * rather than from a second listing — that is the entire reason durable exposes one, and it keeps
+ * the count exact while the page stays bounded.
+ */
+export async function listRunsAndCount(
+  gateway: Pick<RunGateway, 'listRuns' | 'runFacets'>,
+  query: RunQuery,
+): Promise<{ rows: RunListItem[]; total: number }> {
+  const { status, statuses, origin, origins, limit, offset, ...facetQuery } = query;
+  const [rows, facets] = await Promise.all([
+    gateway.listRuns(query),
+    gateway.runFacets(facetQuery),
+  ]);
+  const total = facets
+    .filter((cell) => {
+      if (status && cell.status !== status) return false;
+      if (statuses && !statuses.includes(cell.status)) return false;
+      if (origin !== undefined && cell.origin !== origin) return false;
+      if (origins && !origins.includes(cell.origin)) return false;
+      return true;
+    })
+    .reduce((sum, cell) => sum + cell.count, 0);
+  return { rows, total };
+}
+
+/**
  * A {@link FilterAdapter} over the durable **run gateway** rather than over an ORM.
  *
  * This is what lets the console's filters be written with `@dudousxd/nestjs-filter` — its wire format,
@@ -234,22 +260,7 @@ export class RunQueryAdapter implements FilterAdapter {
    * count exact while the page stays bounded.
    */
   async getResultAndCount(qb: unknown): Promise<{ rows: unknown[]; total: number }> {
-    const draft = this.draft(qb);
-    const [rows, facets] = await Promise.all([
-      this.gateway.listRuns(draft.query),
-      this.gateway.runFacets(draft.facetQuery()),
-    ]);
-    const { status, statuses, origin, origins } = draft.query;
-    const total = facets
-      .filter((cell) => {
-        if (status && cell.status !== status) return false;
-        if (statuses && !statuses.includes(cell.status)) return false;
-        if (origin !== undefined && cell.origin !== origin) return false;
-        if (origins && !origins.includes(cell.origin)) return false;
-        return true;
-      })
-      .reduce((sum, cell) => sum + cell.count, 0);
-    return { rows, total };
+    return listRunsAndCount(this.gateway, this.draft(qb).query);
   }
 
   /**

@@ -74,7 +74,7 @@ describe('the console over HTTP', () => {
   it('carries the run list predicates the client encoded', async () => {
     const qs = runQueryString(
       { tag: ['etl', 'nightly'], namespace: 'acme', status: 'failed' },
-      { limit: 100 },
+      { page: 2, size: 100 },
     );
 
     const res = await request(app.getHttpServer()).get(`/durable/api/runs?${qs}`);
@@ -85,7 +85,9 @@ describe('the console over HTTP', () => {
       namespace: 'acme',
       status: 'failed',
       limit: 100,
+      offset: 100,
     });
+    expect(res.body.meta).toMatchObject({ currentPage: 2, perPage: 100 });
   });
 
   it('narrows rather than answering with everything — the failure this guards', async () => {
@@ -108,6 +110,26 @@ describe('the console over HTTP', () => {
     expect(res.body).toEqual([{ value: 'etl', count: 3 }]);
     expect(valueFacets[0]?.axis).toEqual({ field: 'tag' });
     expect(valueFacets[0]?.query).toMatchObject({ namespace: 'acme' });
+  });
+
+  it('carries attribute predicates and multi-value sets through the default query parser', async () => {
+    const qs = runQueryString({ attr: ['amount:gte:200', 'tier:in:pro|enterprise'], tag: ['a'] });
+
+    const res = await request(app.getHttpServer()).get(`/durable/api/runs?${qs}`);
+
+    expect(res.status).toBe(200);
+    expect(queries[0]?.tag).toBe('a');
+    expect(queries[0]?.attributes).toEqual([
+      { key: 'amount', op: 'gte', value: 200 },
+      { key: 'tier', op: 'in', values: ['pro', 'enterprise'] },
+    ]);
+  });
+
+  it('answers 400 for a filter field the run list does not have', async () => {
+    const res = await request(app.getHttpServer()).get('/durable/api/runs?filter[bogus]=x');
+
+    expect(res.status).toBe(400);
+    expect(queries).toEqual([]);
   });
 
   it('selects the unattributed bucket, which no origin value can match', async () => {

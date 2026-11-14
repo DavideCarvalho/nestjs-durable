@@ -70,10 +70,13 @@ export function nestjsDurableCodegen(options: NestjsDurableCodegenOptions = {}):
 
   const injected: RouteDescriptor[] = [
     route('GET', `${base}/runs`, `${ns}.listRuns`, {
+      // Aviary's list wire: `filter[...]` predicates, `page` (1-based) + `size` (default 100, max 500).
       query:
-        "{ status?: 'running' | 'suspended' | 'completed' | 'failed' | 'cancelling' | 'cancelled' | 'dead' }",
+        "{ 'filter[status]'?: 'running' | 'suspended' | 'completed' | 'failed' | 'cancelling' | 'cancelled' | 'dead'; " +
+        "'filter[workflow]'?: string; 'filter[namespace]'?: string; 'filter[tag]'?: string; " +
+        "'filter[origin]'?: string; 'filter[unattributed]'?: 'true'; page?: number; size?: number; sort?: '-createdAt' }",
       body: null,
-      response: `${RUN}[]`,
+      response: `{ data: ${RUN}[]; meta: { total: number; perPage: number; currentPage: number; lastPage: number; firstPage: number } }`,
     }),
     route(
       'GET',
