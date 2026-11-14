@@ -47,6 +47,9 @@ describe('the console over HTTP', () => {
     async runFacets() {
       return [];
     },
+    async workerHealth() {
+      return [{ group: 'billing', kind: 'step', depth: 0, liveWorkers: [] }];
+    },
   } as unknown as RunGateway;
 
   beforeEach(async () => {
@@ -158,6 +161,18 @@ describe('the console over HTTP', () => {
     expect((await request(app.getHttpServer()).get('/durable/api/schedules?limit=5')).status).toBe(
       400,
     );
+  });
+
+  it('answers the workers as { data }, and 400 for a limit it does not read', async () => {
+    const ok = await request(app.getHttpServer()).get('/durable/api/workers');
+    expect(ok.status).toBe(200);
+    expect(ok.body).toEqual({
+      data: [{ group: 'billing', kind: 'step', depth: 0, liveWorkers: [] }],
+    });
+
+    const res = await request(app.getHttpServer()).get('/durable/api/workers?limit=1');
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/"limit" was removed/);
   });
 
   it('answers 400 for a filter field the run list does not have', async () => {
