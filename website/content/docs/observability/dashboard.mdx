@@ -1064,15 +1064,20 @@ are mounted.
 
 ### Searching all consoles
 
-With another console mounted, <kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>K</kbd> (or **Search all consoles**
-in the menu) opens one search box over every console the viewer may open. Here it finds a run by its
-exact id and workflows whose name contains the text; the other consoles add their own hits (Telescope
-entries, agent threads, media files). Each console gets 300 ms and shows at most 5 hits. A console
-that doesn't answer in time is left out, and the box says the results may be incomplete.
+<kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>K</kbd> (the **Search** button in the top bar, or **Search all
+consoles** in the menu) opens one search box over every console the viewer may open. Here it finds a
+run by its exact id and workflows whose name contains the text; the other consoles add their own hits
+(Telescope entries, agent threads, media files). The console's own pages (Runs, Workers, Schedules)
+are listed first. Each console gets 300 ms and shows at most 5 hits.
 
-The endpoint is `GET <api>/consoles/search?q=`. It sits behind this console's own `authorize` like
-the rest of the API, and asks another console only after that console's `authorize` allowed the
-viewer.
+Each console is asked on its own, so its group appears as soon as it answers, while the box shows
+"Searching N consoles…" for the rest. Earlier hits stay on screen, dimmed, while a new query runs, and
+"Nothing found" appears only once every console has answered. A console that fails to answer is
+named under the results with a **Retry**.
+
+The endpoint is `GET <api>/consoles/search?q=` (`&console=<id>` for one console). It sits behind this
+console's own `authorize` like the rest of the API, and asks another console only after that
+console's `authorize` allowed the viewer.
 
 ### Skipping audit logs for switcher checks
 
@@ -1090,3 +1095,42 @@ DurableDashboardModule.forRoot({
   },
 });
 ```
+
+## Who is signed in, and signing out
+
+The console's sidebar ends with the signed-in user (name, role), a light/dark theme toggle (kept per
+browser) and a sign-out button. Both the user row and the sign-out are optional and come from two
+`forRoot` options:
+
+```ts
+DurableDashboardModule.forRoot({
+  decorators: [UseGuards(AuthenticationGuard)],
+  authorize: (ctx) => ctx.switchToHttp().getRequest().user?.isAdmin === true,
+  // Who the footer shows. Sync or async; null, undefined or a throw shows no user row.
+  viewer: (req) => ({ label: req.user.displayName, email: req.user.email, role: 'admin' }),
+  // How the footer signs out.
+  signOut: { action: '/auth/logout', csrfToken: (req) => req.csrfToken?.() },
+});
+```
+
+**`viewer`** — `(request) => { label, email?, role? }`. Without it the console reads `request.user`
+(whatever your guards in `decorators` already set): `fullName`, then `name`, then `email` for the
+label, and `role` or the first of `roles` (a string or `{ name }`). Reading it never starts an
+authentication; no user means no user row.
+
+**`signOut`** — one of:
+
+| Value | The footer renders |
+| --- | --- |
+| `'/logout'` | a POST form to `/logout`, with `_csrf` when the request has `req.csrfToken()` |
+| `{ href: '/logout' }` | a plain link |
+| `{ action: '/logout', csrfToken: (req) => token }` | a POST form with your token as `_csrf` |
+| `false` | no sign-out button |
+
+Without it, the console uses the sign-out an account console announced on the shared Aviary
+consoles registry (`account.signOut`: a path, `{ action }` or `{ href }`), and otherwise shows none.
+Only same-origin paths (`/x`) are ever sent to the page; anything else is dropped.
+
+Both land in the page's JSON config block (`durable-dashboard-config`) as data, so a strict CSP
+still allows them. The console UI itself follows the shared Aviary console kit (light and dark,
+phone-width drawer); see `docs/AVIARY-UI.md` in the repository.

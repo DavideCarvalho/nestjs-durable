@@ -9,5 +9,5 @@
     "noEmit": true,
     "allowImportingTsExtensions": true
   },
-  "include": ["src/app/**/*", "src/client/**/*"]
+  "include": ["src/app/**/*", "src/client/**/*", "src/aviary-kit/**/*"]
 }

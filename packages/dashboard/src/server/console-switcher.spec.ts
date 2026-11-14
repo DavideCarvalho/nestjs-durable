@@ -13,13 +13,14 @@ import {
   type AviaryConsoleRegistry,
   consoleSwitcherConfig,
   durableConsoleSearch,
+  isSameOriginPath,
   listVisibleConsoles,
   readAviaryConsoles,
   registerAviaryConsole,
   searchConsoles,
 } from './console-switcher.js';
 import { DurableDashboardModule } from './durable-dashboard.module.js';
-import { DurableUiController } from './durable-ui.controller.js';
+import { type DurableShellOptions, DurableUiController } from './durable-ui.controller.js';
 
 const TOKEN = 'console-token-123';
 const holder = globalThis as Record<symbol, unknown>;
@@ -90,6 +91,24 @@ describe('registerAviaryConsole', () => {
     expect(() => registerAviaryConsole(entry({ id: 'media', path: 'https://x.test' }))).toThrow(
       /path/,
     );
+  });
+});
+
+describe('isSameOriginPath', () => {
+  it('accepts a plain absolute path, rejects other origins, backslashes and control characters', () => {
+    expect(isSameOriginPath('/durable#/run/1')).toBe(true);
+    for (const bad of [
+      '//evil.test',
+      'https://evil.test',
+      '/\\evil.test',
+      '/a\u0007b',
+      '/a\nb',
+      '/a\u007fb',
+      'x',
+      1,
+    ]) {
+      expect(isSameOriginPath(bad)).toBe(false);
+    }
   });
 });
 
@@ -170,6 +189,8 @@ describe('listVisibleConsoles', () => {
       registry(
         entry({ id: 'odd', icon: 'rocket' as never }),
         entry({ id: 'evil', path: '//evil.test' }),
+        entry({ id: 'slash', path: '/\\evil.test' }),
+        entry({ id: 'ctl', path: '/ctl\u0007x' }),
       ),
       'media',
       context,
@@ -232,6 +253,8 @@ describe('searchConsoles', () => {
             hit('a.png'),
             { title: 'evil', href: 'https://evil.example' },
             { title: 'proto', href: '//evil.example' },
+            { title: 'backslash', href: '/\\evil.test' },
+            { title: 'control', href: '/a\u0000b' },
             { title: 3, href: '/x' } as never,
           ],
         }),
@@ -251,6 +274,32 @@ describe('searchConsoles', () => {
       ['media', 1],
     ]);
     expect(result.results[1]?.hits).toEqual([{ title: 'a.png', href: '/a.png' }]);
+  });
+
+  it('answers for one console only when asked (`console=<id>`), still behind its gate', async () => {
+    const asked: string[] = [];
+    const reg = registry(
+      entry({
+        id: 'durable',
+        search: async () => {
+          asked.push('durable');
+          return [hit('run-1')];
+        },
+      }),
+      entry({
+        id: 'media',
+        search: async () => {
+          asked.push('media');
+          return [hit('a.png')];
+        },
+      }),
+      entry({ id: 'agent', authorize: deny, search: async () => [hit('thread')] }),
+    );
+    const media = await searchConsoles(reg, 'durable', context, 'x', 300, 'media');
+    expect(media.results.map((r) => r.id)).toEqual(['media']);
+    expect(asked).toEqual(['media']);
+    expect((await searchConsoles(reg, 'durable', context, 'x', 300, 'agent')).results).toEqual([]);
+    expect((await searchConsoles(reg, 'durable', context, 'x', 300, 'nope')).results).toEqual([]);
   });
 
   it('answers nothing for a blank query or without a registry', async () => {
@@ -591,11 +640,14 @@ describe('the shell’s config block', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  function shell(): { html: string; config: Record<string, unknown> } {
-    const controller = Object.assign(new DurableUiController('/flows', '/api/flows'), {
+  async function shell(
+    options: DurableShellOptions = {},
+    request: unknown = {},
+  ): Promise<{ html: string; config: Record<string, unknown> }> {
+    const controller = Object.assign(new DurableUiController('/flows', '/api/flows', options), {
       dir,
     }) as unknown as DurableUiController;
-    const html = controller.index();
+    const html = await controller.index(request);
     const match = html.match(
       /<script type="application\/json" id="durable-dashboard-config">([^<]*)<\/script>/,
     );
@@ -603,22 +655,60 @@ describe('the shell’s config block', () => {
     return { html, config: JSON.parse(match[1]) as Record<string, unknown> };
   }
 
-  it('has no switcher while the durable console is alone', () => {
+  const search = { endpoint: '/api/flows/consoles/search', self: 'durable' };
+
+  it('has no switcher while the durable console is alone, but still its own ⌘K search', async () => {
     registerAviaryConsole(entry({ id: 'durable', path: '/flows' }));
-    expect(shell().config).toEqual({ apiBase: '/api/flows' });
+    expect((await shell()).config).toEqual({ apiBase: '/api/flows', search });
   });
 
-  it('carries the endpoint and how many others are registered, as data (CSP-safe)', () => {
+  it('has neither switcher nor search when the console is not registered', async () => {
+    expect((await shell()).config).toEqual({ apiBase: '/api/flows' });
+  });
+
+  it('carries the endpoint and how many others are registered, as data (CSP-safe)', async () => {
     registerAviaryConsole(entry({ id: 'durable', path: '/flows' }));
     registerAviaryConsole(entry({ id: 'media' }));
     registerAviaryConsole(entry({ id: 'agent' }));
-    const { html, config } = shell();
+    const { html, config } = await shell();
     expect(config).toEqual({
       apiBase: '/api/flows',
       switcher: { endpoint: '/api/flows/consoles', others: 2 },
+      search,
     });
     // The block is JSON data, not script: a `script-src 'self' 'nonce-x'` page still parses it.
     expect(html).toContain('<script type="application/json" id="durable-dashboard-config">');
     expect(html).toContain('src="/flows/assets/app.js"');
+  });
+
+  it('reads the viewer from request.user, and signOut from the option, escaped like the rest', async () => {
+    const { html, config } = await shell(
+      { signOut: { action: '/logout', csrfToken: () => 'tok' } },
+      { user: { fullName: '</script><b>', email: 'ann@x.test', roles: [{ name: 'admin' }] } },
+    );
+    expect(html.split('</script>').length).toBe(4);
+    expect(config).toEqual({
+      apiBase: '/api/flows',
+      viewer: { label: '</script><b>', email: 'ann@x.test', role: 'admin' },
+      signOut: { action: '/logout', csrfToken: 'tok' },
+    });
+  });
+
+  it('uses the viewer option over request.user, and an announced sign-out as a fallback', async () => {
+    (globalThis as Record<symbol, unknown>)[AVIARY_CONSOLES_SLOT] = {
+      version: 1,
+      entries: [],
+      account: { signOut: { href: '/account/logout' } },
+    };
+    const { config } = await shell(
+      { viewer: async () => ({ label: 'Ops', role: 'support' }) },
+      { user: { email: 'ignored@x.test' } },
+    );
+    expect(config).toEqual({
+      apiBase: '/api/flows',
+      viewer: { label: 'Ops', role: 'support' },
+      signOut: { href: '/account/logout' },
+    });
+    expect((await shell({ signOut: false })).config).toEqual({ apiBase: '/api/flows' });
   });
 });

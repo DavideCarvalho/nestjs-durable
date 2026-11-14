@@ -95,17 +95,17 @@ export function LifecycleSourceLine({
 }) {
   return (
     <div className="mt-1.5 flex flex-wrap items-center gap-1" data-testid="lifecycle-source">
-      <span className="text-[10px] text-zinc-600">started by</span>
+      <span className="text-[10px] text-faint">started by</span>
       <RunChip runId={source.runId} onOpenRun={onOpenRun} />
-      <span className="text-[10px] text-zinc-600">on</span>
+      <span className="text-[10px] text-faint">on</span>
       <Chip className={cn('text-[10px]', source.kind === 'failed' ? 's-failed' : 's-completed')}>
         {source.kind}
       </Chip>
       <RunStatusChip status={source.status} />
       {source.traceId && (
         <span className="ml-1 flex items-center gap-1">
-          <span className="text-[10px] text-zinc-600">trace</span>
-          <span className="mono text-[10px] text-zinc-400" title="The source run's trace id">
+          <span className="text-[10px] text-faint">trace</span>
+          <span className="mono text-[10px] text-dim" title="The source run's trace id">
             {source.traceId}
           </span>
           <CopyButton value={source.traceId} />
@@ -137,14 +137,14 @@ export function RunWaits({
           className="flex flex-wrap items-center gap-1"
           data-testid="waits-for"
         >
-          <span className="text-[10px] text-amber-300/80">Waiting for run</span>
+          <span className="text-[10px] text-warn/80">Waiting for run</span>
           <RunChip runId={link.runId} onOpenRun={onOpenRun} />
           <RunStatusChip status={link.status} />
         </div>
       ))}
       {awaitedBy.length > 0 && (
         <div className="flex flex-wrap items-center gap-1" data-testid="awaited-by">
-          <span className="text-[10px] text-zinc-600">Awaited by</span>
+          <span className="text-[10px] text-faint">Awaited by</span>
           {awaitedBy.map((link) => (
             <span key={`${link.runId}#${link.seq}`} className="flex items-center gap-1">
               <RunChip runId={link.runId} onOpenRun={onOpenRun} />
@@ -179,7 +179,7 @@ export function LifecycleDeliveries({
   if (deliveries.length === 0) return null;
   return (
     <section aria-label="Lifecycle subscribers" className="mt-3">
-      <h3 className="text-[10px] uppercase tracking-wider text-zinc-500">Lifecycle subscribers</h3>
+      <h3 className="text-[10px] uppercase tracking-wider text-dim">Lifecycle subscribers</h3>
       <ul className="mt-1 flex flex-col gap-1">
         {deliveries.map((d) => (
           <li
@@ -189,7 +189,7 @@ export function LifecycleDeliveries({
           >
             <a
               href={workflowHash(d.subscriber)}
-              className="mono text-[12px] text-zinc-200 underline-offset-2 hover:underline"
+              className="mono text-[12px] text-fg underline-offset-2 hover:underline"
             >
               {d.subscriber}
             </a>
@@ -275,7 +275,7 @@ export function LifecyclePendingFilter({
       }
       className={cn(
         'mono rounded-md border-line',
-        on && 'border-amber-500/40 bg-amber-500/10 text-amber-200 hover:text-amber-100',
+        on && 'border-warn/40 bg-warn/10 text-warn hover:text-warn',
       )}
     >
       lifecycle pending

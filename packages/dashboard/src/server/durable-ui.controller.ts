@@ -7,12 +7,30 @@ import {
   Header,
   Inject,
   NotFoundException,
+  Optional,
   Param,
+  Req,
   StreamableFile,
 } from '@nestjs/common';
 import { ConsolePage } from './console-authorize.js';
-import { DURABLE_CONSOLE_ID, consoleSwitcherConfig } from './console-switcher.js';
-import { DASHBOARD_API_PATH, DASHBOARD_BASE_PATH } from './tokens.js';
+import {
+  type ConsoleSignOutOption,
+  type ConsoleViewerResolver,
+  resolveConsoleSignOut,
+  resolveConsoleViewer,
+} from './console-shell.js';
+import {
+  DURABLE_CONSOLE_ID,
+  consoleSwitcherConfig,
+  readAviaryConsoles,
+} from './console-switcher.js';
+import { DASHBOARD_API_PATH, DASHBOARD_BASE_PATH, DASHBOARD_SHELL } from './tokens.js';
+
+/** The console shell options a {@link DurableUiControllerBase} reads (`viewer`, `signOut`). */
+export interface DurableShellOptions {
+  viewer?: ConsoleViewerResolver | undefined;
+  signOut?: ConsoleSignOutOption | undefined;
+}
 
 export { DASHBOARD_API_PATH, DASHBOARD_BASE_PATH };
 
@@ -34,6 +52,7 @@ const CONTENT_TYPES: Record<string, string> = {
   '.svg': 'image/svg+xml',
   '.json': 'application/json; charset=utf-8',
   '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
   '.ico': 'image/x-icon',
 };
 
@@ -56,6 +75,7 @@ export class DurableUiControllerBase {
   constructor(
     @Inject(DASHBOARD_BASE_PATH) private readonly basePath: string,
     @Inject(DASHBOARD_API_PATH) private readonly apiBasePath: string,
+    @Optional() @Inject(DASHBOARD_SHELL) private readonly shell: DurableShellOptions = {},
   ) {}
 
   // index.html references hash-named bundles, so it MUST NOT be cached (stale bundle = the
@@ -63,7 +83,7 @@ export class DurableUiControllerBase {
   @Get()
   @Header('Content-Type', 'text/html; charset=utf-8')
   @Header('Cache-Control', 'no-store, must-revalidate')
-  index(): string {
+  async index(@Req() request?: unknown): Promise<string> {
     const indexPath = join(this.dir, 'index.html');
     if (!existsSync(indexPath)) {
       throw new NotFoundException('Dashboard is not built. Run the package build.');
@@ -75,19 +95,30 @@ export class DurableUiControllerBase {
       `="${this.basePath}/`,
     );
     // __DURABLE_BASE__ = where assets load; __DURABLE_API__ = where the SPA fetches the JSON API.
-    const inject = `<script>window.__DURABLE_BASE__='${this.basePath}';window.__DURABLE_API__='${this.apiBasePath}';</script>${this.configBlock()}`;
+    const inject = `<script>window.__DURABLE_BASE__='${this.basePath}';window.__DURABLE_API__='${this.apiBasePath}';</script>${await this.configBlock(request)}`;
     return html.includes('</head>') ? html.replace('</head>', `${inject}</head>`) : inject + html;
   }
 
   /**
    * The page's JSON config block (`durable-dashboard-config`, CSP-safe: data, not script). It
-   * carries `switcher` only when another Aviary console is registered.
+   * carries `switcher` only when another Aviary console is registered; `search` (⌘K, answering per
+   * console too) whenever this console is in the registry; `viewer` and `signOut` for the sidebar
+   * footer when they resolve (see `DurableDashboardOptions.viewer` / `signOut`).
    */
-  private configBlock(): string {
+  private async configBlock(request: unknown): Promise<string> {
     const switcher = consoleSwitcherConfig(DURABLE_CONSOLE_ID, `${this.apiBasePath}/consoles`);
+    const registry = readAviaryConsoles();
+    const registered = registry?.entries.some((entry) => entry.id === DURABLE_CONSOLE_ID);
+    const viewer = await resolveConsoleViewer(request, this.shell?.viewer);
+    const signOut = resolveConsoleSignOut(request, this.shell?.signOut, registry);
     const json = JSON.stringify({
       apiBase: this.apiBasePath,
       ...(switcher !== undefined ? { switcher } : {}),
+      ...(registered
+        ? { search: { endpoint: `${this.apiBasePath}/consoles/search`, self: DURABLE_CONSOLE_ID } }
+        : {}),
+      ...(viewer ? { viewer } : {}),
+      ...(signOut ? { signOut } : {}),
     }).replaceAll('<', '\\u003c');
     return `<script type="application/json" id="${DURABLE_DASHBOARD_CONFIG_ID}">${json}</script>`;
   }

@@ -4,6 +4,7 @@ import { UseGuards } from '@nestjs/common';
 import { describe, expect, it } from 'vitest';
 import { DurableApiController } from './durable-api.controller.js';
 import { DurableApiModule, DurableDashboardModule } from './durable-dashboard.module.js';
+import { DASHBOARD_SHELL } from './tokens.js';
 
 /** The API controller one registration mounts (a per-registration subclass of the exported one). */
 function mountedApi(dashboard: DynamicModule): typeof DurableApiController {
@@ -25,6 +26,13 @@ describe('DurableDashboardModule.forRoot imports', () => {
   it('omitting `imports` still returns a valid dynamic module', () => {
     const dynamicModule = DurableDashboardModule.forRoot();
     expect(dynamicModule.imports?.length).toBeGreaterThan(0);
+  });
+});
+
+describe('DurableDashboardModule.forRoot exports', () => {
+  it('exports DASHBOARD_SHELL whether the routes are mounted or not', () => {
+    expect(DurableDashboardModule.forRoot().exports).toContain(DASHBOARD_SHELL);
+    expect(DurableDashboardModule.forRoot({ routes: false }).exports).toContain(DASHBOARD_SHELL);
   });
 });
 
