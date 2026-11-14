@@ -183,7 +183,7 @@ window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Res
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
-  if (route === '/workers') return json(workers);
+  if (route === '/workers') return json({ data: workers });
   if (route === '/topology') return json({ role: 'control-plane' });
   const payload = serve(route, new URLSearchParams(match?.[2] ?? ''));
   return payload === undefined ? real(input as RequestInfo, init) : json(payload);

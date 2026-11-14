@@ -134,10 +134,16 @@ export class DurableApiControllerBase {
     return this.dashboard.metrics();
   }
 
-  /** Per-group worker health (queue backlog + live worker heartbeats) for the Workers panel. */
+  /**
+   * Per-group worker health (queue backlog + live worker heartbeats) for the Workers page, as
+   * `{ data }`: one row per registered group, so a short list with nothing to page, filter or sort.
+   * It takes no query params, and answers 400 for any (`limit`, `size`, `filter[...]`, …) instead of
+   * ignoring it.
+   */
   @Get('workers')
-  workers() {
-    return this.dashboard.workerHealth();
+  async workers(@Query() query: Record<string, unknown> = {}) {
+    rejectUnknownParams(query, []);
+    return { data: await this.dashboard.workerHealth() };
   }
 
   /**

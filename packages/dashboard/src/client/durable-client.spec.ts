@@ -336,3 +336,22 @@ describe('durableClient.fanMembers', () => {
     expect(calls[0]).toBe('/durable/api/runs/r1/fans/g?page=1');
   });
 });
+
+describe('durableClient.workers', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('asks /workers with no params and unwraps its { data }', async () => {
+    const calls: string[] = [];
+    const group = { group: 'billing', kind: 'step', depth: 2, liveWorkers: [] };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string) => {
+        calls.push(url);
+        return Promise.resolve(jsonResponse({ data: [group] }, 200));
+      }),
+    );
+
+    await expect(durableClient.workers()).resolves.toEqual([group]);
+    expect(calls[0]).toBe('/durable/api/workers');
+  });
+});

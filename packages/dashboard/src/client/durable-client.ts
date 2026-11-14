@@ -658,8 +658,8 @@ export const durableClient = {
     return http<FanPage>(qs ? `${path}?${qs}` : path);
   },
   /** Per-group worker health (queue backlog + live worker heartbeats) for the Workers panel. */
-  workers(): Promise<GroupHealth[]> {
-    return http<GroupHealth[]>('/workers');
+  async workers(): Promise<GroupHealth[]> {
+    return (await http<{ data: GroupHealth[] }>('/workers')).data;
   },
   /** Persisted schedules (`engine.schedules`), soonest-due first, at most `size` (server default
    *  200, cap 1000). Empty when unsupported. */

@@ -504,7 +504,7 @@ function body(path: string): unknown | undefined {
       .sort((a, b) => b.count - a.count || String(a.value).localeCompare(String(b.value)))
       .slice(0, limit);
   }
-  if (route === '/workers') return workers;
+  if (route === '/workers') return { data: workers };
   if (route === '/schedules') return { data: schedules };
   if (route === '/consoles') return consoles;
   if (route === '/consoles/search') return searchBody(search);

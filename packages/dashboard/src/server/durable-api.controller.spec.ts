@@ -642,6 +642,34 @@ describe('DurableApiController: schedules', () => {
   });
 });
 
+describe('DurableApiController: workers', () => {
+  it('answers { data } with every group the gateway reports', async () => {
+    const c = await makeConsole();
+    const service = (c.controller as unknown as { dashboard: DashboardService }).dashboard;
+    const group = { group: 'billing', kind: 'step' as const, depth: 2, liveWorkers: [] };
+    service.workerHealth = async () => [group];
+
+    await expect(c.controller.workers()).resolves.toEqual({ data: [group] });
+  });
+
+  it.each([
+    [{ limit: '1' }, /"limit" was removed and this endpoint has no replacement/],
+    [{ size: '10' }, /Unknown query parameter "size"/],
+    [{ filter: { group: 'billing' } }, /Unknown query parameter "filter"/],
+  ])(
+    'answers 400 for %j, a param it does not read, instead of ignoring it',
+    async (query, message) => {
+      const c = await makeConsole();
+
+      const error = await c.controller.workers(query).catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(BadRequestException);
+      expect((error as Error).message).toMatch(message);
+      expect((error as Error).message).toMatch(/Accepted parameters: \(none\)/);
+    },
+  );
+});
+
 describe('DurableApiController: fan members', () => {
   it('pages with page/size and filter[failed], as an offset page', async () => {
     const c = await makeConsole();
