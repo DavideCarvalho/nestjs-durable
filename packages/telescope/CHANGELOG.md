@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-telescope
 
+## 0.11.1
+
+### Patch Changes
+
+- [#466](https://github.com/DavideCarvalho/nestjs-durable/pull/466) [`83b5b0b`](https://github.com/DavideCarvalho/nestjs-durable/commit/83b5b0bd489ec7c3e728e315fc64d8d84c7ed59f) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Accept `@dudousxd/nestjs-telescope` 5.x (peer range `>=1.0.0 <6.0.0`). The providers use only the extension, watcher and storage SPI, which 5.0 leaves unchanged.
+
 ## 0.11.0
 
 ### Minor Changes

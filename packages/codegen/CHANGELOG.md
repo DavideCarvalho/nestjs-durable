@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-codegen
 
+## 0.6.0
+
+### Minor Changes
+
+- [#466](https://github.com/DavideCarvalho/nestjs-durable/pull/466) [`83b5b0b`](https://github.com/DavideCarvalho/nestjs-durable/commit/83b5b0bd489ec7c3e728e315fc64d8d84c7ed59f) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `listRuns` follows the console's list wire: its query is `filter[status]`, `filter[workflow]`, `filter[namespace]`, `filter[tag]`, `filter[origin]`, `filter[unattributed]`, `page`, `size` and `sort`, and its response is `{ data: Run[]; meta: { total, perPage, currentPage, lastPage, firstPage } }` instead of `Run[]`.
+
 ## 0.5.0
 
 ### Minor Changes
