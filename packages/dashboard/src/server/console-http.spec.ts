@@ -125,6 +125,41 @@ describe('the console over HTTP', () => {
     ]);
   });
 
+  it('keeps an attribute `in` value that holds a comma whole', async () => {
+    const qs = runQueryString({ attr: ['city:in:Paris, TX|Austin'] });
+    expect(qs).toContain('[in][]=');
+
+    const res = await request(app.getHttpServer()).get(`/durable/api/runs?${qs}`);
+
+    expect(res.status).toBe(200);
+    expect(queries[0]?.attributes).toEqual([
+      { key: 'city', op: 'in', values: ['Paris, TX', 'Austin'] },
+    ]);
+  });
+
+  it.each([
+    ['limit=5', /"size"/],
+    ['offset=10', /"page"/],
+    ['where[status]=failed', /"filter"/],
+    ['status=failed', /filter\[status\]/],
+    ['cursor=abc', /no replacement/],
+  ])('answers 400 for the removed or unknown param %s', async (qs, message) => {
+    const res = await request(app.getHttpServer()).get(`/durable/api/runs?${qs}`);
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(message);
+    expect(queries).toEqual([]);
+  });
+
+  it('answers 400 for paging params on the facets and a bare size on schedules', async () => {
+    expect((await request(app.getHttpServer()).get('/durable/api/runs/facets?page=2')).status).toBe(
+      400,
+    );
+    expect((await request(app.getHttpServer()).get('/durable/api/schedules?limit=5')).status).toBe(
+      400,
+    );
+  });
+
   it('answers 400 for a filter field the run list does not have', async () => {
     const res = await request(app.getHttpServer()).get('/durable/api/runs?filter[bogus]=x');
 

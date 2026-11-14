@@ -10,5 +10,7 @@ Every HTTP list endpoint of the console API now speaks Aviary's list wire (`filt
 - `GET runs/:id/fans/:group` takes `page`/`size` (default 100, at most 500) and `filter[failed]=true`, and answers `{ data, meta }` (was `{ items, total }`). The ETag is unchanged.
 - `GET schedules` takes `filter[namespace|workflow|tag|paused]` and `size` (default 200, at most 1000), and answers `{ data }`. It is not paged: the store cannot count schedules and their soonest-due order moves on every fire.
 - `POST bulk/:action` takes the same `filter[...]` params as `GET runs`.
+- Every one of these answers 400 for a query param it does not read (`limit`, `offset`, `cursor`, a bare `?status=`, `where[...]`, paging on `facets` / `bulk`, …), naming the replacement where there is one, instead of ignoring it.
+- The client sends an attribute `in` set as repeated `filter[attr.<key>][in][]=` params, so a value holding a comma stays one value.
 
 The `./client` follows: `durableClient.runs()` takes `{ page, size }` and returns `OffsetPage<WorkflowRun>`, `fanMembers()` takes `{ page, size, failed }` and returns `{ data, meta }`, and `facets()` / `schedules()` unwrap `{ data }`. `RunFilter` no longer has `@FilterFor` methods and the API controller no longer binds `ApplyFilterInterceptor`. The Runs page loads more by `page`.

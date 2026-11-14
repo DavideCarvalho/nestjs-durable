@@ -33,6 +33,7 @@ import {
   offsetPage,
   parseFilterParams,
   parsePageParams,
+  rejectUnknownParams,
 } from './list-api.js';
 import { NotModifiedException, NotModifiedFilter, setEtag } from './not-modified.js';
 import { runColumnFilters, runFilterInput, runPageParams } from './run-list-query.js';
@@ -77,6 +78,7 @@ export class DurableApiControllerBase {
    */
   @Get('runs')
   async runs(@Query() query: Record<string, unknown> = {}): Promise<OffsetPage<RunListRow>> {
+    rejectUnknownParams(query, ['page', 'size', 'sort', 'filter']);
     const { page, size, offset } = runPageParams(query);
     const draft = await this.runDraft(query);
     const { rows, total } = await this.dashboard.listRunsPage({
@@ -100,6 +102,7 @@ export class DurableApiControllerBase {
    */
   @Get('runs/facets')
   async facets(@Query() query: Record<string, unknown> = {}) {
+    rejectUnknownParams(query, ['filter']);
     const draft = await this.runDraft(query);
     return { data: await this.dashboard.runFacets(draft.facetQuery()) };
   }
@@ -120,6 +123,7 @@ export class DurableApiControllerBase {
    */
   @Get('runs/values')
   async values(@Query() query: Record<string, unknown> = {}) {
+    rejectUnknownParams(query, ['filter', 'groupByCount']);
     return this.runner.groupByCount(DurableRun, runFilterInput(query), { filterClass: RunFilter });
   }
 
@@ -145,6 +149,7 @@ export class DurableApiControllerBase {
    */
   @Get('schedules')
   async schedules(@Query() query: Record<string, unknown> = {}) {
+    rejectUnknownParams(query, ['filter', 'size']);
     const filters = parseFilterParams(query, {
       fields: { namespace: ['eq'], workflow: ['eq'], tag: ['eq'], paused: ['eq'] },
     });
@@ -245,6 +250,7 @@ export class DurableApiControllerBase {
     @Headers('if-none-match') ifNoneMatch?: string,
     @Res({ passthrough: true }) response?: unknown,
   ): Promise<OffsetPage<unknown>> {
+    rejectUnknownParams(query, ['page', 'size', 'filter']);
     const { page, size, offset } = parsePageParams(query, {
       defaultSize: FAN_PAGE_SIZE,
       maxSize: FAN_PAGE_MAX,
@@ -300,6 +306,7 @@ export class DurableApiControllerBase {
     @Param('action') action: 'retry' | 'cancel',
     @Query() query: Record<string, unknown> = {},
   ) {
+    rejectUnknownParams(query, ['filter', 'compensate']);
     const draft = await this.runDraft(query);
     return this.dashboard.bulk(action === 'cancel' ? 'cancel' : 'retry', draft.query, {
       compensate: query.compensate === 'true',
