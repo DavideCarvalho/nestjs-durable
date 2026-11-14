@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.61.1
+
+### Patch Changes
+
+- [#463](https://github.com/DavideCarvalho/nestjs-durable/pull/463) [`a19c47d`](https://github.com/DavideCarvalho/nestjs-durable/commit/a19c47dd9e6a765e237fdfb21ef799df6320fff6) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `anyAuthorize` keeps a `redirectTo` from any form. Before, when an earlier form answered `unauthenticated` without one (a guest with no token, in `anyAuthorize(authorizeByToken(...), SessionAuthorizer)`), the console answered a bare 401 and ignored a later form's redirect to the sign-in page.
+
 ## 0.61.0
 
 ### Minor Changes
