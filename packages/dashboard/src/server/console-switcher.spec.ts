@@ -13,6 +13,7 @@ import {
   type AviaryConsoleRegistry,
   consoleSwitcherConfig,
   durableConsoleSearch,
+  isSameOriginPath,
   listVisibleConsoles,
   readAviaryConsoles,
   registerAviaryConsole,
@@ -93,6 +94,24 @@ describe('registerAviaryConsole', () => {
   });
 });
 
+describe('isSameOriginPath', () => {
+  it('accepts a plain absolute path, rejects other origins, backslashes and control characters', () => {
+    expect(isSameOriginPath('/durable#/run/1')).toBe(true);
+    for (const bad of [
+      '//evil.test',
+      'https://evil.test',
+      '/\\evil.test',
+      '/a\u0007b',
+      '/a\nb',
+      '/a\u007fb',
+      'x',
+      1,
+    ]) {
+      expect(isSameOriginPath(bad)).toBe(false);
+    }
+  });
+});
+
 describe('consoleSwitcherConfig', () => {
   it('is absent when this console is alone or not registered, and counts the others', () => {
     expect(consoleSwitcherConfig('media', '/a/consoles')).toBeUndefined();
@@ -170,6 +189,8 @@ describe('listVisibleConsoles', () => {
       registry(
         entry({ id: 'odd', icon: 'rocket' as never }),
         entry({ id: 'evil', path: '//evil.test' }),
+        entry({ id: 'slash', path: '/\\evil.test' }),
+        entry({ id: 'ctl', path: '/ctl\u0007x' }),
       ),
       'media',
       context,
@@ -232,6 +253,8 @@ describe('searchConsoles', () => {
             hit('a.png'),
             { title: 'evil', href: 'https://evil.example' },
             { title: 'proto', href: '//evil.example' },
+            { title: 'backslash', href: '/\\evil.test' },
+            { title: 'control', href: '/a\u0000b' },
             { title: 3, href: '/x' } as never,
           ],
         }),

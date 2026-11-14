@@ -11,6 +11,11 @@ describe('routes', () => {
     expect(parseRoute('#/nope')).toEqual({ page: 'runs' });
   });
 
+  it('falls back to the runs board on a malformed escape instead of throwing', () => {
+    expect(parseRoute('#/run/%E0%A4%A')).toEqual({ page: 'runs' });
+    expect(parseRoute('#/workflow/%')).toEqual({ page: 'runs' });
+  });
+
   it('round-trips through routeHash (the run deep link stays #/run/<id>)', () => {
     for (const hash of ['#/run/ord%2F1', '#/workflow/checkout', '#/workers', '#/schedules']) {
       expect(routeHash(parseRoute(hash))).toBe(hash);
