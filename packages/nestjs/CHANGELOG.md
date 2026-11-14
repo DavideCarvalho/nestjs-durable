@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable
 
+## 0.59.1
+
+### Patch Changes
+
+- [#464](https://github.com/DavideCarvalho/nestjs-durable/pull/464) [`008e2ff`](https://github.com/DavideCarvalho/nestjs-durable/commit/008e2ff82ad58c61f2ce8e857af235b205ca7fb9) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The optional `class-validator` peer accepts 0.15 (`^0.14.0 || ^0.15.0`), so apps on class-validator 0.15 no longer get a peer warning. The tests now run against 0.15.1.
+
 ## 0.59.0
 
 ### Minor Changes
