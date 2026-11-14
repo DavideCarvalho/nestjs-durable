@@ -2,6 +2,7 @@ import type {
   DurableTopology,
   GroupHealth,
   RunDetail,
+  ScheduleSummary,
   StepCheckpoint,
   WorkflowRun,
 } from '../client/durable-client';
@@ -342,6 +343,114 @@ function matching(search: string | undefined): WorkflowRun[] {
   );
 }
 
+const schedules: ScheduleSummary[] = [
+  {
+    id: 'nightly-reconcile',
+    workflow: 'reconcile-ledger',
+    namespace: 'default',
+    cron: '0 3 * * *',
+    timezone: 'America/Sao_Paulo',
+    input: {},
+    createdAt: iso(-30 * 86_400_000),
+    updatedAt: iso(-86_400_000),
+    fires: 42,
+    overlap: 'skip',
+    catchup: 'latest',
+    paused: false,
+    nextFireAt: iso(6 * 3_600_000),
+    lastFireAt: iso(-18 * 3_600_000),
+  },
+  {
+    id: 'invoice-sweep',
+    workflow: 'invoice',
+    namespace: 'billing',
+    everyMs: 900_000,
+    input: {},
+    createdAt: iso(-30 * 86_400_000),
+    updatedAt: iso(-86_400_000),
+    fires: 42,
+    overlap: 'skip',
+    catchup: 'latest',
+    paused: false,
+    nextFireAt: iso(240_000),
+    lastFireAt: iso(-660_000),
+    lastError: 'TimeoutError: ledger lock held for 30s',
+  },
+  {
+    id: 'backup-snapshots',
+    workflow: 'backup',
+    namespace: 'default',
+    cron: '*/30 * * * *',
+    timezone: 'UTC',
+    input: {},
+    createdAt: iso(-30 * 86_400_000),
+    updatedAt: iso(-86_400_000),
+    fires: 42,
+    overlap: 'skip',
+    catchup: 'latest',
+    paused: true,
+    nextFireAt: null,
+    lastFireAt: iso(-2 * 86_400_000),
+  },
+];
+
+/** The other Aviary consoles, as `GET <api>/consoles` lists them. */
+const consoles = {
+  version: 1,
+  current: 'durable',
+  consoles: [
+    { id: 'telescope', title: 'Telescope', icon: 'telescope', href: '/telescope' },
+    { id: 'agent', title: 'Agents', icon: 'agent', href: '/agent' },
+    { id: 'media', title: 'Media', icon: 'media', href: '/media' },
+  ],
+};
+
+/** Per-console ⌘K answers, each after its own delay, so the streaming groups can be seen. */
+const SEARCH_DELAY_MS: Record<string, number> = {
+  durable: 150,
+  telescope: 700,
+  agent: 1400,
+  media: 2400,
+};
+
+function searchBody(search: string | undefined): unknown {
+  const params = new URLSearchParams(search ?? '');
+  const q = (params.get('q') ?? '').toLowerCase();
+  const only = params.get('console');
+  const groups = [
+    {
+      id: 'durable',
+      title: 'Workflows',
+      icon: 'workflow',
+      hits: runs
+        .filter((r) => r.id.includes(q) || r.workflow.includes(q))
+        .slice(0, 5)
+        .map((r) => ({
+          title: r.id,
+          subtitle: `run · ${r.workflow} · ${r.status}`,
+          href: `/durable#/run/${r.id}`,
+        })),
+    },
+    {
+      id: 'telescope',
+      title: 'Telescope',
+      icon: 'telescope',
+      hits: [
+        { title: `GET /orders?q=${q}`, subtitle: 'request · 200 · 41ms', href: '/telescope#/r/1' },
+        { title: `${q} timeout`, subtitle: 'exception · 3 occurrences', href: '/telescope#/e/2' },
+      ],
+    },
+    {
+      id: 'agent',
+      title: 'Agents',
+      icon: 'agent',
+      hits: [{ title: `thread about ${q}`, subtitle: 'thread · support-bot', href: '/agent#/t/9' }],
+    },
+    { id: 'media', title: 'Media', icon: 'media', hits: [] },
+  ];
+  return { version: 1, q, partial: false, results: groups.filter((g) => !only || g.id === only) };
+}
+
 function body(path: string): unknown | undefined {
   const [route, search] = path.split('?');
   if (route === '/runs') return matching(search);
@@ -370,6 +479,9 @@ function body(path: string): unknown | undefined {
       .slice(0, limit);
   }
   if (route === '/workers') return workers;
+  if (route === '/schedules') return schedules;
+  if (route === '/consoles') return consoles;
+  if (route === '/consoles/search') return searchBody(search);
   if (route === '/topology') return topology;
   const run = route?.match(/^\/runs\/(.+)$/)?.[1];
   if (run) {
@@ -390,12 +502,28 @@ function body(path: string): unknown | undefined {
  * handed back to the real `fetch`, so the page still loads normally.
  */
 export function installMockConsoleApi(): void {
+  // The shell fields the server would put in the page's data block.
+  const block = document.createElement('script');
+  block.type = 'application/json';
+  block.id = 'durable-dashboard-config';
+  block.textContent = JSON.stringify({
+    apiBase: '/durable/api',
+    switcher: { endpoint: '/durable/api/consoles', others: 3 },
+    search: { endpoint: '/durable/api/consoles/search', self: 'durable' },
+    viewer: { label: 'Ann Lee', email: 'ann@acme.test', role: 'admin' },
+    signOut: { action: '/logout', csrfToken: 'preview' },
+  });
+  document.head.appendChild(block);
   const real = window.fetch.bind(window);
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     const match = url.match(/\/durable\/api(\/.*)$/);
     const payload = match?.[1] ? body(match[1]) : undefined;
     if (payload === undefined) return real(input as RequestInfo, init);
+    const only = match?.[1]?.startsWith('/consoles/search')
+      ? new URLSearchParams(match[1].split('?')[1] ?? '').get('console')
+      : null;
+    if (only) await new Promise((resolve) => setTimeout(resolve, SEARCH_DELAY_MS[only] ?? 300));
     return new Response(JSON.stringify(payload), {
       status: 200,
       headers: { 'content-type': 'application/json' },

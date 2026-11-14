@@ -1,7 +1,9 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { createRoot } from 'react-dom/client';
 import type { GroupHealth, RunStatus, WorkflowRun } from '../client/durable-client';
-import { App } from './App';
+import '../aviary-kit/fonts';
+import { ThemeProvider } from '../aviary-kit/theme';
+import { App, DURABLE_ACCENT } from './App';
 import '@xyflow/react/dist/style.css';
 import './index.css';
 
@@ -176,7 +178,9 @@ window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Res
 };
 
 createRoot(document.getElementById('root') as HTMLElement).render(
-  <QueryClientProvider client={new QueryClient()}>
-    <App />
-  </QueryClientProvider>,
+  <ThemeProvider storageKey="aviary-durable-theme" accent={DURABLE_ACCENT}>
+    <QueryClientProvider client={new QueryClient()}>
+      <App />
+    </QueryClientProvider>
+  </ThemeProvider>,
 );

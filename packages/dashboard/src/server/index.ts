@@ -1,4 +1,6 @@
 export * from './console-authorize.js';
+export * from './console-shell.js';
+export { DASHBOARD_SHELL } from './tokens.js';
 export * from './dashboard.service.js';
 export * from './durable-api.controller.js';
 export * from './durable-dashboard.module.js';

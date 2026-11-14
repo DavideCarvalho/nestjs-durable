@@ -37,8 +37,8 @@ export function OriginFacets({
   return (
     // A plain container with a visible caption, exactly like the header's status chip row — the
     // caption is the label, so there is no `role="group"` for `useSemanticElements` to object to.
-    <div className="flex flex-wrap items-center gap-1 border-b border-line px-2 py-1.5">
-      <span className="mono shrink-0 text-[10px] uppercase tracking-[0.18em] text-zinc-600">
+    <div className="flex flex-wrap items-center gap-1 border-b border-border px-2 py-1.5">
+      <span className="mono shrink-0 text-[10px] uppercase tracking-[0.18em] text-faint">
         origin
       </span>
       {facets.map((facet) => {
@@ -46,8 +46,8 @@ export function OriginFacets({
         return (
           <Button
             key={originFilterKey(facet.filter)}
-            variant="ghost"
-            size="chip"
+            variant="chip"
+            size="xs"
             aria-pressed={selected}
             title={facet.title}
             onClick={() => onChange(facet.filter)}
@@ -55,12 +55,11 @@ export function OriginFacets({
               'mono max-w-full gap-1 rounded-md',
               // The app's own runs are not a package, so their chip is not styled like one — dim and
               // italic sets it apart without dressing it up as a real origin.
-              facet.filter.kind === 'unknown' && 'italic text-zinc-500',
-              selected && 'border-zinc-600 bg-zinc-900 text-zinc-100 hover:text-zinc-100',
+              facet.filter.kind === 'unknown' && 'italic text-dim',
             )}
           >
             <span className="truncate">{facet.label}</span>
-            <span className="tnum shrink-0 text-zinc-600">{facet.count}</span>
+            <span className="tnum shrink-0 text-faint">{facet.count}</span>
           </Button>
         );
       })}
