@@ -108,7 +108,7 @@ describe('the durable console over @nestjs/workflows', () => {
   it('lists completed, failed, waiting and parent/child instances with mapped statuses', async () => {
     const { http } = await boot();
     const res = await request(http).get('/durable/api/runs').expect(200);
-    const rows = res.body.runs ?? res.body;
+    const rows = res.body.data;
     const byId = Object.fromEntries(
       (rows as Array<{ id: string; status: string; waiting?: unknown }>).map((r) => [r.id, r]),
     );
@@ -147,7 +147,7 @@ describe('the durable console over @nestjs/workflows', () => {
 
   it('counts per status for the status chips', async () => {
     const { http } = await boot();
-    const facets = (await request(http).get('/durable/api/runs/facets').expect(200)).body;
+    const facets = (await request(http).get('/durable/api/runs/facets').expect(200)).body.data;
     const count = (status: string) =>
       (facets as Array<{ status: string; count: number }>)
         .filter((f) => f.status === status)

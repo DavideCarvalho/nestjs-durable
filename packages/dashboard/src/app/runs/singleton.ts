@@ -27,11 +27,13 @@ export function anySingleton(runs: readonly WorkflowRun[]): boolean {
 export function useSingletonSiblings(needed: boolean): WorkflowRun[] {
   const { data = [] } = useQuery({
     queryKey: ['runs', 'in-flight'],
-    queryFn: () =>
-      durableClient.runs(undefined, undefined, undefined, {
-        statuses: SINGLETON_INFLIGHT_STATUSES,
-        limit: 500,
-      }),
+    queryFn: async () =>
+      (
+        await durableClient.runs(undefined, undefined, undefined, {
+          statuses: SINGLETON_INFLIGHT_STATUSES,
+          size: 500,
+        })
+      ).data,
     enabled: needed,
     refetchInterval: 5000,
   });

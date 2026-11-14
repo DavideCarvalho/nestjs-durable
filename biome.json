@@ -51,6 +51,10 @@
     {
       "include": ["**/aviary-kit/ui/**", "**/aviary-kit/hooks/**"],
       "linter": { "enabled": false }
+    },
+    {
+      "include": ["**/server/list-api.ts", "**/server/list-api.spec.ts"],
+      "linter": { "rules": { "style": { "noNonNullAssertion": "off" } } }
     }
   ]
 }

@@ -23,12 +23,14 @@ import type {
 // drifting; each deliberate divergence from core is called out and justified inline where it's made.
 
 export {
+  type RunPage,
   type RunPredicates,
   type RunValueField,
   type RunValueRow,
   runQueryString,
 } from './run-query-string.js';
 import {
+  type RunPage,
   type RunPredicates,
   type RunValueField,
   type RunValueRow,
@@ -36,6 +38,26 @@ import {
 } from './run-query-string.js';
 
 export type RunStatus = CoreRunStatus;
+
+/** The `meta` of an offset-paged list response (Aviary's list API). Pages are 1-based. */
+export interface OffsetPageMeta {
+  total: number;
+  perPage: number;
+  currentPage: number;
+  lastPage: number;
+  firstPage: number;
+}
+
+/** An offset-paged list response: `{ data, meta }`. */
+export interface OffsetPage<T> {
+  data: T[];
+  meta: OffsetPageMeta;
+}
+
+/** Whether an offset page has a page after it. */
+export function hasNextPage(page: Pick<OffsetPage<unknown>, 'meta'>): boolean {
+  return page.meta.currentPage < page.meta.lastPage;
+}
 export type StepKind = CoreStepKind;
 
 /** This deployment's durable role — mirrors the server's `DurableTopology` (kept local so the SPA
@@ -166,15 +188,14 @@ export type FanSummary = Omit<WireDates<CoreFanSummary>, 'failures'> & {
   failures: StepCheckpoint[];
 };
 
-/** One page of a summarized fan's members, in seq order. `total` counts every matching member. */
-export interface FanPage {
-  items: StepCheckpoint[];
-  total: number;
-}
+/** One page of a summarized fan's members, in seq order. `meta.total` counts every matching member. */
+export type FanPage = OffsetPage<StepCheckpoint>;
 
 export interface FanPageOptions {
-  offset?: number | undefined;
-  limit?: number | undefined;
+  /** 1-based page. */
+  page?: number | undefined;
+  /** Members per page; the server caps it at 500. */
+  size?: number | undefined;
   /** Only failed members (a failed step, or a child that failed). */
   failed?: boolean | undefined;
 }
@@ -532,17 +553,15 @@ export interface RunFilterOptions {
   namespace?: string | string[] | undefined;
   /**
    * The package that declared the workflow — `WorkflowRun.origin`, exact match. Absent = all origins.
-   * `null` selects the UNATTRIBUTED runs instead (the server's `unattributed` param): a run with no
+   * `null` selects the UNATTRIBUTED runs instead (the server's `filter[unattributed]`): a run with no
    * origin matches no string value at all, so absence needs its own spelling. See `run-origin.ts`.
    */
   origin?: string | null | undefined;
 }
 
-/** How much of the list to fetch. Absent bounds mean the whole listing — which on a busy control
- *  plane is megabytes and thousands of rows, so the console always sends a `limit`. */
-export interface RunPageOptions {
-  limit?: number | undefined;
-  offset?: number | undefined;
+/** Which page of the list to fetch: `page` is 1-based, `size` defaults to 100 and is capped at 500
+ *  by the server. */
+export interface RunPageOptions extends RunPage {
   /** Match ANY of these statuses (`status IN (...)`), for a caller that wants a set rather than the
    *  single `status` argument — e.g. the in-flight runs a singleton leader is chosen among. */
   statuses?: RunStatus[] | undefined;
@@ -567,7 +586,7 @@ export const durableClient = {
     tag?: string | string[],
     attr?: string[],
     opts?: RunFilterOptions & RunPageOptions,
-  ): Promise<WorkflowRun[]> {
+  ): Promise<OffsetPage<WorkflowRun>> {
     const qs = runQueryString(
       {
         status: status ?? opts?.statuses,
@@ -576,22 +595,23 @@ export const durableClient = {
         namespace: opts?.namespace,
         origin: opts?.origin,
       },
-      { limit: opts?.limit, offset: opts?.offset },
+      { page: opts?.page, size: opts?.size },
     );
-    return http<WorkflowRun[]>(qs ? `/runs?${qs}` : '/runs');
+    return http<OffsetPage<WorkflowRun>>(qs ? `/runs?${qs}` : '/runs');
   },
   /**
    * `(status, origin)` counts for the runs matching the same tag/tenant/attribute predicates as
    * {@link runs} — the console's chips, counted over the WHOLE matching set rather than over the page
    * it happens to be showing. `status`/`origin` are not sent: they are the axes being counted.
    */
-  facets(
+  async facets(
     tag?: string | string[],
     attr?: string[],
     namespace?: string | string[],
   ): Promise<RunFacetRow[]> {
     const qs = runQueryString({ tag, attr, namespace });
-    return http<RunFacetRow[]>(qs ? `/runs/facets?${qs}` : '/runs/facets');
+    const body = await http<{ data: RunFacetRow[] }>(qs ? `/runs/facets?${qs}` : '/runs/facets');
+    return body.data;
   },
 
   /**
@@ -630,9 +650,9 @@ export const durableClient = {
   /** One page of a summarized fan's members — the ones {@link run} left out of its timeline. */
   fanMembers(runId: string, group: string, opts: FanPageOptions = {}): Promise<FanPage> {
     const params = new URLSearchParams();
-    if (opts.offset !== undefined) params.set('offset', String(opts.offset));
-    if (opts.limit !== undefined) params.set('limit', String(opts.limit));
-    if (opts.failed) params.set('failed', 'true');
+    if (opts.page !== undefined) params.set('page', String(opts.page));
+    if (opts.size !== undefined) params.set('size', String(opts.size));
+    if (opts.failed) params.set('filter[failed]', 'true');
     const qs = params.toString();
     const path = `/runs/${encodeURIComponent(runId)}/fans/${encodeURIComponent(group)}`;
     return http<FanPage>(qs ? `${path}?${qs}` : path);
@@ -641,9 +661,11 @@ export const durableClient = {
   workers(): Promise<GroupHealth[]> {
     return http<GroupHealth[]>('/workers');
   },
-  /** Persisted schedules (`engine.schedules`), soonest-due first. Empty when unsupported. */
-  schedules(): Promise<ScheduleSummary[]> {
-    return http<ScheduleSummary[]>('/schedules');
+  /** Persisted schedules (`engine.schedules`), soonest-due first, at most `size` (server default
+   *  200, cap 1000). Empty when unsupported. */
+  async schedules(opts?: { size?: number }): Promise<ScheduleSummary[]> {
+    const path = opts?.size !== undefined ? `/schedules?size=${opts.size}` : '/schedules';
+    return (await http<{ data: ScheduleSummary[] }>(path)).data;
   },
   pauseSchedule(id: string): Promise<ScheduleSummary> {
     return http<ScheduleSummary>(`/schedules/${encodeURIComponent(id)}/pause`, { method: 'POST' });

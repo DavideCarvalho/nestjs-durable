@@ -124,7 +124,7 @@ describe('the console behind AuthorizationModule.forRoot() (global guard, deny b
 
     const api = await request(server).get('/durable/api/runs');
     expect(api.status).toBe(200);
-    expect(api.body).toEqual([]);
+    expect(api.body.data).toEqual([]);
     // Reaches the handler (which 404s an unknown asset), not the guard's 401.
     const ui = await request(server).get('/durable/assets/nope.js');
     expect(ui.status).toBe(404);
@@ -145,7 +145,7 @@ describe('the console behind AuthorizationModule.forRoot() (global guard, deny b
 
     const allowed = await request(server).get('/durable/api/runs').set('x-role', 'admin');
     expect(allowed.status).toBe(200);
-    expect(allowed.body).toEqual([]);
+    expect(allowed.body.data).toEqual([]);
     expect((await request(server).get('/durable/assets/x.js').set('x-role', 'admin')).status).toBe(
       404,
     );
@@ -232,7 +232,7 @@ describe('production, with `authorize` omitted', () => {
       .set('x-role', 'admin')
       .set('x-console', 'yes');
     expect(allowed.status).toBe(200);
-    expect(allowed.body).toEqual([]);
+    expect(allowed.body.data).toEqual([]);
   });
 });
 
@@ -298,7 +298,7 @@ describe('`routes: false`: the console mounted by the developer', () => {
     // production NODE_ENV, whose `authorize` default does not apply to a self-mounted console).
     const runs = await request(server).get('/ops/durable/api/runs').set('x-role', 'admin');
     expect(runs.status).toBe(200);
-    expect(runs.body).toEqual([]);
+    expect(runs.body.data).toEqual([]);
     const facets = await request(server).get('/ops/durable/api/runs/facets').set('x-role', 'admin');
     expect(facets.status).toBe(200);
     // The UI handler is reached (an unknown asset 404s in the handler, not in a guard).
