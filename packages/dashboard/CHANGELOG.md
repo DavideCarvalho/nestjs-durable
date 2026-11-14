@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.64.0
+
+### Minor Changes
+
+- [#467](https://github.com/DavideCarvalho/nestjs-durable/pull/467) [`7b82971`](https://github.com/DavideCarvalho/nestjs-durable/commit/7b829719a506e2b85dabb5f8002c0d5985a133d4) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `GET workers` follows the console's list wire like the other list endpoints: it answers `{ data: GroupHealth[] }` (was a bare array) and 400 for any query param, since it reads none (`?limit=1` was silently ignored; the 400 says `limit` has no replacement here). `durableClient.workers()` unwraps `{ data }`, so the Workers page, the runs board and the spans timeline are unchanged.
+
 ## 0.63.0
 
 ### Minor Changes
