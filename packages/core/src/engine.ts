@@ -4024,6 +4024,15 @@ export class WorkflowEngine {
     return this.visibleRun(runId);
   }
 
+  /**
+   * The runs matching `query`, narrowed to the ones the caller may see (with tenancy on, another
+   * tenant's runs are left out, like {@link getRun}). Pair it with `workflow` / `statuses` to bound
+   * the scan on a large store. `overlap: 'skip'` schedules use it to find their in-flight runs.
+   */
+  listRuns(query: RunQuery): Promise<WorkflowRun[]> {
+    return this.store.listRuns(this.scopeRunQuery(query));
+  }
+
   /** A run's full checkpoint timeline, ordered by seq (what the testing kit's `captureHistory`
    *  reads, next to {@link getRun}). Empty for a run the caller may not see. */
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {

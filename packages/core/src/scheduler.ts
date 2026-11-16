@@ -1,6 +1,7 @@
 import { createRequire } from 'node:module';
 import { resolveCronParse } from './cron-compat';
 import type { WorkflowEngine } from './engine';
+import { type RunStatus, TERMINAL_RUN_STATUSES } from './interfaces';
 import { type WorkflowInputOf, type WorkflowRef, workflowName } from './workflow-ref';
 
 // Resolve the optional `cron-parser` peer dependency in a way that works in BOTH the ESM and CJS
@@ -36,9 +37,11 @@ export interface ScheduledWorkflow<W extends WorkflowRef = WorkflowRef> {
   /** Temporarily stop firing this schedule (kept registered). Defaults to false. */
   paused?: boolean;
   /**
-   * What to do when the previous window's run hasn't finished yet (fixed-interval schedules only):
-   * `'allow'` (default) starts the new window anyway; `'skip'` skips it while the prior run is still
-   * `running`/`suspended`, so a slow run can't pile up overlapping executions.
+   * What to do when an earlier window's run hasn't finished yet (interval and cron schedules alike):
+   * `'allow'` (default) starts the new window anyway; `'skip'` skips every window while any earlier
+   * run of this schedule is still in flight (pending, running, suspended, blocked or cancelling), so a
+   * slow run can't pile up overlapping executions. With `backfill`, missed windows start one at a
+   * time.
    */
   overlap?: 'allow' | 'skip';
   /**
@@ -230,7 +233,7 @@ function scheduleRunIdsAt(s: ScheduledWorkflow, nowMs: number): string[] {
  * jittered window is deferred to a later call, never slept on.
  */
 export async function runSchedules(
-  engine: Pick<WorkflowEngine, 'start' | 'getRun'> & Partial<Pick<WorkflowEngine, 'isDraining'>>,
+  engine: ScheduleTickEngine,
   schedules: readonly ScheduledWorkflow[],
   nowMs: number,
   opts?: RunSchedulesOptions,
@@ -257,16 +260,10 @@ export async function runSchedules(
     // (due timers, retries, timeouts) behind it.
     if (candidates.length === 0) continue;
 
-    // overlap:'skip' (fixed-interval): don't start this window while the previous window's run is
-    // still in-flight, so a slow run can't pile up. Interval-only — cron windows aren't adjacent ids.
-    // Checked after the candidate filter: it only matters when something is about to start.
-    if (s.overlap === 'skip' && s.everyMs) {
-      const prevBucket = Math.floor(nowMs / s.everyMs) - 1;
-      if (prevBucket >= 0) {
-        const prev = await engine.getRun(`sched:${s.key}:${prevBucket}`);
-        if (prev && (prev.status === 'running' || prev.status === 'suspended')) continue;
-      }
-    }
+    // overlap:'skip': no new window while ANY earlier run of this schedule is still in flight —
+    // cron or interval alike. Checked after the candidate filter: it only matters when something is
+    // about to start, so an idle schedule still costs no I/O per tick.
+    if (s.overlap === 'skip' && (await overlapping(engine, s, nowMs))) continue;
     // Dispatch-path jitter (not workflow code): spread same-boundary ticks across instances. Each
     // window gets its own fire time, `jitter` at most after this process first saw it due, and is
     // skipped until then — the tick does NOT sleep. Sleeping here held the whole timer poll (every
@@ -285,12 +282,127 @@ export async function runSchedules(
       // idempotency keeps it to one run — only the returned ids may briefly overcount.
       const existing = await engine.getRun(runId);
       remember(settled, s.key, runId);
-      if (existing) continue;
+      if (existing) {
+        if (s.overlap === 'skip' && !isTerminal(existing.status)) {
+          // Another instance (or a manual trigger) started it: it is the run to wait on now.
+          noteInFlight(engine, s.key, runId);
+          break;
+        }
+        continue;
+      }
       await engine.start(workflowName(s.workflow), s.input, runId, { namespace: s.namespace });
       ids.push(runId);
+      if (s.overlap === 'skip') {
+        // The run just started overlaps every later window, so a backfill under 'skip' catches up
+        // one window at a time instead of starting them all at once.
+        noteInFlight(engine, s.key, runId);
+        break;
+      }
     }
   }
   return ids;
+}
+
+/**
+ * What {@link runSchedules} needs from the engine. `listRuns` is what lets `overlap: 'skip'` find an
+ * in-flight run this process never saw (started before a restart, or by another instance); a driver
+ * without it only sees the runs it observed itself plus the previous window.
+ */
+export type ScheduleTickEngine = Pick<WorkflowEngine, 'start' | 'getRun'> &
+  Partial<Pick<WorkflowEngine, 'isDraining' | 'listRuns'>>;
+
+/** Every status a run can still leave: what "still in flight" means for `overlap: 'skip'`. */
+const IN_FLIGHT: RunStatus[] = ['pending', 'running', 'suspended', 'blocked', 'cancelling'];
+
+function isTerminal(status: RunStatus): boolean {
+  return TERMINAL_RUN_STATUSES.includes(status);
+}
+
+/**
+ * Per engine, per schedule key: run ids of this schedule last known to be in flight. Only an
+ * optimization; the store stays the source of truth (see {@link overlapping}). Bounded: an id leaves
+ * as soon as a read shows it settled, and the set is capped.
+ */
+const inFlightRuns = new WeakMap<object, Map<string, Set<string>>>();
+
+function inFlightFor(engine: object, key: string): Set<string> {
+  let byKey = inFlightRuns.get(engine);
+  if (byKey === undefined) {
+    byKey = new Map();
+    inFlightRuns.set(engine, byKey);
+  }
+  let ids = byKey.get(key);
+  if (ids === undefined) {
+    ids = new Set();
+    byKey.set(key, ids);
+  }
+  return ids;
+}
+
+function noteInFlight(engine: object, key: string, runId: string): void {
+  const ids = inFlightFor(engine, key);
+  ids.add(runId);
+  // Each id leaves once seen settled; the cap only guards against a pathological pile-up.
+  if (ids.size > 64) ids.delete(ids.values().next().value as string);
+}
+
+/**
+ * Whether an earlier run of schedule `s` is still in flight, so `overlap: 'skip'` must hold this
+ * window back.
+ *
+ * Checking only the previous window's id is not enough: while window N runs, N+1 is skipped and
+ * never gets a run, so at N+2 "the previous window" is empty and a second run would start next to
+ * N. So:
+ *
+ * 1. Runs this process already knows are in flight are re-read by id (newest first, stopping at the
+ *    first still in flight). While a long run blocks the schedule that is ONE read per tick.
+ * 2. Once none of them is in flight any more, the store is asked once for this schedule's in-flight
+ *    runs (`listRuns` by workflow + in-flight statuses, filtered to `sched:<key>:` ids). That covers
+ *    what the memo can't know: runs from before a restart, runs another instance started,
+ *    backfilled windows. It happens once per window that is about to start, never on an idle tick,
+ *    and has no look-back bound, so a run stuck for days still blocks, cron or interval alike.
+ */
+async function overlapping(
+  engine: ScheduleTickEngine,
+  s: ScheduledWorkflow,
+  nowMs: number,
+): Promise<boolean> {
+  const known = inFlightFor(engine, s.key);
+  for (const runId of [...known].reverse()) {
+    const run = await engine.getRun(runId);
+    if (run && !isTerminal(run.status)) return true;
+    known.delete(runId);
+  }
+
+  if (engine.listRuns) {
+    const prefix = `sched:${s.key}:`;
+    const runs = await engine.listRuns({ workflow: workflowName(s.workflow), statuses: IN_FLIGHT });
+    const blocking = runs.filter((r) => r.id.startsWith(prefix) && !isTerminal(r.status));
+    for (const r of blocking) noteInFlight(engine, s.key, r.id);
+    return blocking.length > 0;
+  }
+
+  // A driver without `listRuns`: the most it can check beyond its own memo is the window just
+  // before the current one.
+  const prev = previousWindowRunId(s, nowMs);
+  if (prev === undefined) return false;
+  const run = await engine.getRun(prev);
+  if (!run || isTerminal(run.status)) return false;
+  noteInFlight(engine, s.key, prev);
+  return true;
+}
+
+/** The run id of the window before the one current at `nowMs` (interval bucket or cron fire). */
+function previousWindowRunId(s: ScheduledWorkflow, nowMs: number): string | undefined {
+  if (s.cron != null) {
+    const current = prevCronFireMs(s.cron, nowMs, s.timezone);
+    return `sched:${s.key}:${prevCronFireMs(s.cron, current - 1, s.timezone)}`;
+  }
+  if (s.everyMs != null) {
+    const bucket = Math.floor(nowMs / s.everyMs) - 1;
+    return bucket >= 0 ? `sched:${s.key}:${bucket}` : undefined;
+  }
+  return undefined;
 }
 
 /**
