@@ -48,6 +48,11 @@ export function tenantAppOf(
 /** An engine event a control plane attributed to a tenant app. */
 export type AttributedEngineEvent = EngineEvent & { app?: string | undefined };
 
+/** `value` when it is a finite number (at least 1), else `fallback`: `NaN` and `Infinity` included. */
+function positive(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) ? Math.max(1, value) : fallback;
+}
+
 /** A namespace read that threw or timed out. */
 const FAILED: unique symbol = Symbol('failed');
 
@@ -74,8 +79,8 @@ export class RunAppStamper {
   constructor(options: RunAppAttribution) {
     this.#lookup = (runId) => options.namespaceOf(runId);
     this.#own = new Set(options.own ?? []);
-    this.#max = Math.max(1, options.cacheSize ?? 10_000);
-    this.#timeoutMs = Math.max(1, options.lookupTimeoutMs ?? 5_000);
+    this.#max = positive(options.cacheSize, 10_000);
+    this.#timeoutMs = positive(options.lookupTimeoutMs, 5_000);
   }
 
   /** Call `forward` with `event` stamped with its app (when it has one), now or once it is known. */

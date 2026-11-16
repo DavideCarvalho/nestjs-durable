@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type {
+  LifecycleSubscriptionLink,
   RunFacetQuery,
   RunGateway,
   RunQuery,
@@ -118,7 +119,12 @@ export function appScopedGateway(gateway: RunGateway, apps: readonly string[]): 
     runFacets: (query: RunFacetQuery) => gateway.runFacets(narrowToApps(query, apps)),
     runValueFacets: (axis, query, opts) =>
       gateway.runValueFacets(axis, narrowToApps(query, apps), opts),
-    waitingFor: (runIds) => gateway.waitingFor(runIds),
+    // Only the runs of the apps: an id of another app's run answers as not waiting.
+    waitingFor: async (runIds) => {
+      const visible: string[] = [];
+      for (const id of runIds) if (await sees(id)) visible.push(id);
+      return visible.length > 0 ? gateway.waitingFor(visible) : {};
+    },
     workerHealth: async () =>
       (await gateway.workerHealth()).filter((g) => apps.some((app) => g.group.endsWith(`@${app}`))),
     cancel: guard((id, opts?: { compensate?: boolean }) => gateway.cancel(id, opts), null),
@@ -133,9 +139,28 @@ export function appScopedGateway(gateway: RunGateway, apps: readonly string[]): 
     const fn = gateway.getFanMembers.bind(gateway);
     scoped.getFanMembers = guard((id, group: string, query) => fn(id, group, query), null);
   }
-  if (gateway.workflowLifecycle) scoped.workflowLifecycle = gateway.workflowLifecycle.bind(gateway);
+  if (gateway.workflowLifecycle) {
+    const fn = gateway.workflowLifecycle.bind(gateway);
+    // The links of the apps' subscriptions only: one read per app (or the asked one), merged.
+    scoped.workflowLifecycle = async (workflow, opts) => {
+      const namespaces =
+        opts?.namespace !== undefined
+          ? apps.includes(opts.namespace)
+            ? [opts.namespace]
+            : []
+          : apps;
+      const answers = await Promise.all(namespaces.map((namespace) => fn(workflow, { namespace })));
+      return {
+        workflow,
+        startsOnSettle: mergeLinks(answers.flatMap((a) => a.startsOnSettle)),
+        startedBy: mergeLinks(answers.flatMap((a) => a.startedBy)),
+      };
+    };
+  }
   if (gateway.lifecycleSubscribers) {
-    scoped.lifecycleSubscribers = gateway.lifecycleSubscribers.bind(gateway);
+    const fn = gateway.lifecycleSubscribers.bind(gateway);
+    scoped.lifecycleSubscribers = async (workflow, kind, namespace) =>
+      apps.includes(namespace) ? fn(workflow, kind, namespace) : [];
   }
   if (gateway.republishLifecycle) {
     const fn = gateway.republishLifecycle.bind(gateway);
@@ -158,4 +183,13 @@ export function appScopedGateway(gateway: RunGateway, apps: readonly string[]): 
     };
   }
   return scoped;
+}
+
+/** Links from several namespaces' answers, one per (workflow, kind), sorted like the engine's. */
+function mergeLinks(links: LifecycleSubscriptionLink[]): LifecycleSubscriptionLink[] {
+  const byKey = new Map<string, LifecycleSubscriptionLink>();
+  for (const link of links) byKey.set(`${link.workflow}\u0000${link.kind}`, link);
+  return [...byKey.values()].sort(
+    (a, b) => a.workflow.localeCompare(b.workflow) || a.kind.localeCompare(b.kind),
+  );
 }

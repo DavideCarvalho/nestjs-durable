@@ -455,7 +455,12 @@ export class DashboardService {
     return new Observable<{ data: EngineEvent }>((subscriber) => {
       let off: (() => void) | undefined;
       let closed = false;
-      void (gateway.getRun?.(runId) ?? Promise.resolve(null)).then(
+      // `gateway` is the app-scoped one here, whose `getRun` is always defined (it falls back to
+      // `getRunDetail` on a gateway without one).
+      const lookup = gateway.getRun
+        ? gateway.getRun(runId)
+        : gateway.getRunDetail(runId, { summarizeFansOver: 0 }).then((d) => d?.run ?? null);
+      void lookup.then(
         (run) => {
           if (closed) return;
           if (!run) {

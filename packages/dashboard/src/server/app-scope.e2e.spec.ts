@@ -230,6 +230,44 @@ describe('app scope units', () => {
     });
   });
 
+  it("scopes workflow lifecycle links and waiting lookups to the apps' namespaces", async () => {
+    const { gateway } = fakeGateway(RUNS);
+    const link = (workflow: string) => ({
+      workflow,
+      kind: 'completed',
+      local: true,
+      announced: false,
+      where: false,
+      input: false,
+    });
+    const asked: Array<string | undefined> = [];
+    const waited: string[][] = [];
+    Object.assign(gateway, {
+      workflowLifecycle: async (workflow: string, opts?: { namespace?: string }) => {
+        asked.push(opts?.namespace);
+        return {
+          workflow,
+          startsOnSettle: [link(`notify-${opts?.namespace ?? 'all'}`)],
+          startedBy: [],
+        };
+      },
+      waitingFor: async (ids: string[]) => {
+        waited.push(ids);
+        return {};
+      },
+    });
+    const scoped = appScopedGateway(gateway, ['acme', 'beta']);
+    const links = await scoped.workflowLifecycle?.('wf');
+    expect(asked.sort()).toEqual(['acme', 'beta']);
+    expect(links?.startsOnSettle.map((l) => l.workflow)).toEqual(['notify-acme', 'notify-beta']);
+    asked.length = 0;
+    await scoped.workflowLifecycle?.('wf', { namespace: 'gamma' });
+    expect(asked).toEqual([]);
+
+    await scoped.waitingFor(['a1', 'own', 'b1']);
+    expect(waited).toEqual([['a1', 'b1']]);
+  });
+
   it('the scoped gateway hides runs outside the apps', async () => {
     const { gateway } = fakeGateway(RUNS);
     const scoped = appScopedGateway(gateway, ['beta']);

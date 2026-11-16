@@ -197,6 +197,25 @@ describe('RunAppStamper', () => {
     expect(out).toEqual(['step.completed']);
   });
 
+  it('falls back to the defaults for a non-finite cache size or timeout', async () => {
+    let reads = 0;
+    const stamper = new RunAppStamper({
+      namespaceOf: async () => {
+        reads += 1;
+        return 'acme';
+      },
+      cacheSize: Number.NaN,
+      lookupTimeoutMs: Number.NaN,
+    });
+    const out: AttributedEngineEvent[] = [];
+    stamper.stamp(ev('step.started', 'r1'), (e) => out.push(e));
+    stamper.stamp(ev('step.completed', 'r1'), (e) => out.push(e));
+    await flush();
+    // A NaN timeout would time every read out at once: the default lets the read answer.
+    expect(out.map((e) => e.app)).toEqual(['acme', 'acme']);
+    expect(reads).toBe(1);
+  });
+
   it('bounds its cache', async () => {
     let reads = 0;
     const stamper = new RunAppStamper({

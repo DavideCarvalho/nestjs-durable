@@ -154,7 +154,8 @@ authorize: (ctx) => {
 to those apps: the run list, its counts and facets, the filter pickers, run reads and the live tail
 (another app's run answers `404`), every action including bulk ones, worker health (`<name>@<app>`
 groups) and schedules (by namespace). `/metrics` answers `403`, since its counters span every app,
-and a workflow's lifecycle page drops its process-wide trigger counts. `anyAuthorize` keeps the grant
+and a workflow's lifecycle page lists only the subscriptions of those apps, without the process-wide
+trigger counts. `anyAuthorize` keeps the grant
 of the form that allowed.
 
 ### A bearer token
