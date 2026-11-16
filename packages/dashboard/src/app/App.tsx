@@ -3,7 +3,6 @@ import { ErrorBoundary } from '../aviary-kit/blocks/error-boundary';
 import { ActivityIcon, ClockIcon, ServerIcon } from '../aviary-kit/icons';
 import { readShellConfig } from '../aviary-kit/shell-config';
 import { AppShell, type NavSection, PageBody } from '../aviary-kit/shell/app-shell';
-import type { SearchCommand } from '../aviary-kit/shell/console-search';
 import { SchedulesPanel } from './SchedulesPanel';
 import { WorkflowPage } from './WorkflowLifecycle';
 import { supports, useTopology } from './capabilities';
@@ -91,6 +90,7 @@ export function App() {
             label: 'Runs',
             icon: <ActivityIcon />,
             href: '#/',
+            keywords: ['executions', 'workflows'],
             onSelect: () => navigate({ page: 'runs' }),
           },
           ...(showWorkers
@@ -100,6 +100,7 @@ export function App() {
                   label: 'Workers',
                   icon: <ServerIcon />,
                   href: '#/workers',
+                  keywords: ['nodes', 'engines'],
                   onSelect: () => navigate({ page: 'workers' }),
                 },
               ]
@@ -115,6 +116,7 @@ export function App() {
                 label: 'Schedules',
                 icon: <ClockIcon />,
                 href: '#/schedules',
+                keywords: ['cron', 'timers'],
                 onSelect: () => navigate({ page: 'schedules' }),
               },
             ]
@@ -122,22 +124,6 @@ export function App() {
       },
     ],
     [showWorkers, showSchedules, navigate],
-  );
-
-  // ⌘K: this console's pages, listed above the cross-console hits.
-  const commands = useMemo<SearchCommand[]>(
-    () =>
-      nav.flatMap((section) =>
-        section.items.map((item) => ({
-          id: `page:${item.id}`,
-          label: item.label,
-          group: 'Pages',
-          icon: item.icon,
-          keywords: [section.section],
-          onSelect: () => item.onSelect?.(),
-        })),
-      ),
-    [nav],
   );
 
   const activeId = route.page === 'workflow' ? 'runs' : route.page;
@@ -166,7 +152,6 @@ export function App() {
       activeId={activeId}
       shell={shell}
       title={title}
-      commands={commands}
       searchPlaceholder="Search runs, workflows, media, threads…"
       contentClassName={route.page === 'runs' ? 'overflow-hidden' : undefined}
       actions={<LiveIndicator />}
