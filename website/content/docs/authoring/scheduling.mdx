@@ -31,9 +31,9 @@ interface ScheduledWorkflow<W extends WorkflowRef = WorkflowRef> {
   timezone?: string;
   /** Temporarily stop firing this schedule (kept registered). Defaults to false. */
   paused?: boolean;
-  /** What to do when the previous window's run hasn't finished (fixed-interval only): `'allow'`
-   *  (default) starts the new window anyway; `'skip'` skips it while the prior run is still
-   *  `running`/`suspended`. */
+  /** What to do when an earlier window's run hasn't finished (interval and cron alike): `'allow'`
+   *  (default) starts the new window anyway; `'skip'` skips every window while any earlier run of
+   *  this schedule is still in flight. */
   overlap?: 'allow' | 'skip';
   /** Randomly delay dispatch by up to this many ms, to spread load across instances ticking the
    *  same boundary. Opt-in; absent = fire immediately. */
@@ -191,17 +191,19 @@ poller skips it entirely on every tick while paused:
 
 ## Skipping overlapping runs — `overlap`
 
-By default (`overlap: 'allow'`), a fixed-interval schedule starts every window on schedule even if the
-previous window's run is still going — a slow run and a fresh one can end up in flight together. Set
-`overlap: 'skip'` to skip a window instead, while the immediately preceding window's run is still
-`running` or `suspended`:
+By default (`overlap: 'allow'`), a schedule starts every window on schedule even if an earlier
+window's run is still going — a slow run and a fresh one can end up in flight together. Set
+`overlap: 'skip'` to start no window while any earlier run of the schedule is still in flight
+(`pending`, `running`, `suspended`, `blocked` or `cancelling`):
 
 ```ts
 { key: 'cache-sync', workflow: CacheSyncWorkflow, everyMs: 60_000, overlap: 'skip' }
 ```
 
-This is **fixed-interval only** (it checks the previous `everyMs` bucket) — cron windows aren't
-adjacent ids in the same way, so `overlap` has no effect on a `cron` schedule.
+Every window that comes due in the meantime is skipped, and the schedule fires again at the first
+window after that run finishes. It works the same for `everyMs` and `cron` schedules, sees runs
+started before a restart or by another instance, and with `backfill` starts missed windows one at a
+time.
 
 ## Dispatch jitter — `jitter`
 

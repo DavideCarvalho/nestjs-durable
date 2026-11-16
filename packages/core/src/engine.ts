@@ -1,3 +1,5 @@
+// Records this copy of the package, so the boot path can refuse to start with two of them loaded.
+import './copy-guard';
 import { type AdmissionBackend, InMemoryAdmissionBackend } from './admission';
 import { currentWorkflowCtx, runInWorkflowCtx } from './ambient-ctx';
 import { backoffDelay } from './backoff';
@@ -4022,6 +4024,15 @@ export class WorkflowEngine {
    */
   getRun(runId: string): Promise<WorkflowRun | null> {
     return this.visibleRun(runId);
+  }
+
+  /**
+   * The runs matching `query`, narrowed to the ones the caller may see (with tenancy on, another
+   * tenant's runs are left out, like {@link getRun}). Pair it with `workflow` / `statuses` to bound
+   * the scan on a large store. `overlap: 'skip'` schedules use it to find their in-flight runs.
+   */
+  listRuns(query: RunQuery): Promise<WorkflowRun[]> {
+    return this.store.listRuns(this.scopeRunQuery(query));
   }
 
   /** A run's full checkpoint timeline, ordered by seq (what the testing kit's `captureHistory`
