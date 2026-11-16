@@ -20,6 +20,7 @@ import {
   type Transport,
   WorkflowEngine,
   type WorkflowRef,
+  sealDurableCopies,
   useDurableExecution,
 } from '@dudousxd/nestjs-durable-core';
 import {
@@ -920,9 +921,17 @@ class DurableTenancyBridge implements OnApplicationBootstrap, OnModuleDestroy {
   }
 }
 
+/**
+ * `forRoot` / `forRootAsync` first refuse to boot when two different installs of
+ * `@dudousxd/nestjs-durable-core` are loaded in this process (a pnpm peer-variant split): each copy
+ * has its own `WorkflowEngine` class, so code from one copy cannot resolve the engine the other copy
+ * registered. They throw `DuplicateDurableCopyError` naming both installs, and a distinct copy that
+ * loads afterwards throws on load.
+ */
 @Module({})
 export class DurableModule {
   static forRoot(options: DurableModuleOptions): DynamicModule {
+    sealDurableCopies();
     DurableModule.assertValid(options);
     return DurableModule.build({
       provide: DURABLE_OPTIONS_CANONICAL,
@@ -931,6 +940,7 @@ export class DurableModule {
   }
 
   static forRootAsync(options: DurableModuleAsyncOptions): DynamicModule {
+    sealDurableCopies();
     return DurableModule.build({
       provide: DURABLE_OPTIONS_CANONICAL,
       useFactory: async (...args: Parameters<DurableModuleAsyncOptions['useFactory']>) => {

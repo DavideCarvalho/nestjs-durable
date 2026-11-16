@@ -38,6 +38,13 @@ export * from './metrics';
 export * from './remote-event';
 export * from './on-error';
 export * from './origin';
+export {
+  assertSingleDurableCopy,
+  DuplicateDurableCopyError,
+  type DurableCopy,
+  durableCopies,
+  sealDurableCopies,
+} from './copy-guard';
 export * from './scheduler';
 export * from './schedules';
 export { createStepLogger } from './step-logger';

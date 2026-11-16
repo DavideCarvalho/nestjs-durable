@@ -69,6 +69,7 @@ export type {
   WorkflowLifecycleEvent,
 } from '@dudousxd/nestjs-durable-core';
 export {
+  DuplicateDurableCopyError,
   hmacTenantVerifier,
   LIFECYCLE_PENDING_TAG,
   lifecycleRunId,

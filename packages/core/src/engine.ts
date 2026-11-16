@@ -1,3 +1,5 @@
+// Records this copy of the package, so the boot path can refuse to start with two of them loaded.
+import './copy-guard';
 import { type AdmissionBackend, InMemoryAdmissionBackend } from './admission';
 import { currentWorkflowCtx, runInWorkflowCtx } from './ambient-ctx';
 import { backoffDelay } from './backoff';

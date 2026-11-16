@@ -293,3 +293,32 @@ default `timerPollMs` (1000ms) or a nonzero value, or that you're genuinely driv
 `resumeDueTimers()`/schedule checks from an external scheduler if you set it to `0` (see [firing
 schedules from your own trigger](/docs/authoring/scheduling#firing-schedules-from-your-own-trigger)). See
 [Scheduling](/docs/authoring/scheduling) and [Durability & replay](/docs/concepts/durability).
+
+## Two copies of `@dudousxd/nestjs-durable-core`
+
+**Symptom:** the app fails at boot, in `DurableModule.forRoot` / `forRootAsync`, with a
+`DuplicateDurableCopyError` naming each install:
+
+```
+@dudousxd/nestjs-durable-core is loaded 2 times, from different installs:
+  - 0.93.0 at /app/node_modules/.pnpm/@dudousxd+nestjs-durable-core@0.93.0_<peers-a>/node_modules/@dudousxd/nestjs-durable-core
+  - 0.93.0 at /app/node_modules/.pnpm/@dudousxd+nestjs-durable-core@0.93.0_<peers-b>/node_modules/@dudousxd/nestjs-durable-core
+Each copy has its own WorkflowEngine class, so code from one copy cannot resolve the engine the other copy registered (...).
+Make every package resolve one copy: ...
+```
+
+A distinct copy that loads only after boot (a lazy `require`) throws the same error when it loads.
+
+**Cause:** two installs of the core package are loaded in one process. With pnpm this usually means
+two peer-resolution variants: the app and a workspace package (or a library) that depends on
+`@dudousxd/nestjs-durable-core` resolve different versions of one of its peers (`zod`,
+`cron-parser`, `reflect-metadata`), so pnpm installs the core package twice. Each copy has its own
+`WorkflowEngine` class: Nest cannot inject the engine the other copy registered, `instanceof`
+checks fail, and workflows registered on one engine are unknown to the other. The check only sees
+copies from 0.93.0 or later.
+
+**Fix:** make every package resolve one copy. Declare the same peer dependency versions in the app as
+in the workspace packages that depend on `@dudousxd/nestjs-durable-core`, or pin them with pnpm
+`overrides` (in `pnpm-workspace.yaml`), reinstall, and check that
+`pnpm why @dudousxd/nestjs-durable-core` shows a single variant. There is no option to turn the
+check off: two copies never work correctly.
