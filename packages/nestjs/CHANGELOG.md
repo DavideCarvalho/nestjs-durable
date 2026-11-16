@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable
 
+## 0.60.0
+
+### Minor Changes
+
+- [#469](https://github.com/DavideCarvalho/nestjs-durable/pull/469) [`885f7b1`](https://github.com/DavideCarvalho/nestjs-durable/commit/885f7b1d4a80e2093c0bd7ad56902fa32589f404) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Fail at boot when two copies of `@dudousxd/nestjs-durable-core` are loaded in one process (for example two pnpm peer-resolution variants). `DurableModule.forRoot` / `forRootAsync` throw a `DuplicateDurableCopyError` naming both installs and the fix (same peer versions in the app and its workspace packages, or pnpm overrides), instead of failing later because each copy has its own `WorkflowEngine` class. A distinct copy that loads after boot throws on load. `@dudousxd/nestjs-durable` now needs `@dudousxd/nestjs-durable-core` 0.93.0 or later.
+
 ## 0.59.1
 
 ### Patch Changes

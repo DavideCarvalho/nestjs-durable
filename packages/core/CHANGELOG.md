@@ -1,5 +1,13 @@
 # @dudousxd/nestjs-durable-core
 
+## 0.93.0
+
+### Minor Changes
+
+- [#469](https://github.com/DavideCarvalho/nestjs-durable/pull/469) [`885f7b1`](https://github.com/DavideCarvalho/nestjs-durable/commit/885f7b1d4a80e2093c0bd7ad56902fa32589f404) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Fail at boot when two copies of `@dudousxd/nestjs-durable-core` are loaded in one process (for example two pnpm peer-resolution variants). `DurableModule.forRoot` / `forRootAsync` throw a `DuplicateDurableCopyError` naming both installs and the fix (same peer versions in the app and its workspace packages, or pnpm overrides), instead of failing later because each copy has its own `WorkflowEngine` class. A distinct copy that loads after boot throws on load. `@dudousxd/nestjs-durable` now needs `@dudousxd/nestjs-durable-core` 0.93.0 or later.
+
+- [#469](https://github.com/DavideCarvalho/nestjs-durable/pull/469) [`885f7b1`](https://github.com/DavideCarvalho/nestjs-durable/commit/885f7b1d4a80e2093c0bd7ad56902fa32589f404) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Fix `overlap: 'skip'` letting a second run start every other window. It only checked the window just before the current one, which never has a run when it was itself skipped, so a long run had a new copy started next to it every two windows. A schedule with `overlap: 'skip'` now starts no window while any earlier run of it is still in flight (pending, running, suspended, blocked or cancelling), including runs started before a restart or by another instance. `overlap: 'skip'` now also applies to `cron` schedules (it was silently ignored there), and a `backfill` under `'skip'` catches up one window at a time. Adds `WorkflowEngine.listRuns(query)` (tenant-scoped, like `getRun`) and the `ScheduleTickEngine` type `runSchedules` takes. Persisted schedules (`engine.schedules`) were not affected.
+
 ## 0.92.0
 
 ### Minor Changes
