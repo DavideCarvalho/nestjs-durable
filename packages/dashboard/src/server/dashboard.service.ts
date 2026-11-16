@@ -28,8 +28,16 @@ import {
   collectMetrics,
   parseWebhookToken,
 } from '@dudousxd/nestjs-durable-core';
-import { Inject, Injectable, NotImplementedException, Optional } from '@nestjs/common';
+import {
+  ForbiddenException,
+  Inject,
+  Injectable,
+  NotFoundException,
+  NotImplementedException,
+  Optional,
+} from '@nestjs/common';
 import { Observable } from 'rxjs';
+import { appScopedGateway, currentConsoleApps, namespaceInApps } from './app-scope.js';
 import { listRunsAndCount } from './run-query.adapter.js';
 
 // Single source of truth: core owns `RunDetail` (`run-gateway.ts`) — re-exported here (not
@@ -72,6 +80,33 @@ export class DashboardService {
   }
 
   /**
+   * The run gateway for this request: confined to the viewer's apps when `authorize` granted a list
+   * (see `ConsoleAppGrant`), the whole gateway otherwise.
+   */
+  private gw(): RunGateway {
+    const apps = currentConsoleApps();
+    return apps ? appScopedGateway(this.gateway, apps) : this.gateway;
+  }
+
+  /** A confined viewer may act on `runId` only when it is one of its apps' runs: else a 404. */
+  private async assertRunVisible(runId: string): Promise<void> {
+    if (currentConsoleApps() === undefined) return;
+    if (!(await this.runExists(runId))) throw new NotFoundException(`run ${runId} not found`);
+  }
+
+  /** A confined viewer may touch schedule `id` only when it is in one of its apps: else a 404. */
+  private async assertScheduleVisible(id: string): Promise<void> {
+    const apps = currentConsoleApps();
+    if (apps === undefined) return;
+    const schedule = await this.engine?.schedules?.get(id);
+    if (!schedule || !namespaceInApps(schedule.namespace, apps)) {
+      throw Object.assign(new Error(`schedule "${id}" not found`), {
+        name: 'ScheduleNotFoundError',
+      });
+    }
+  }
+
+  /**
    * The operator-only ops need the FULL engine + canonical store, which only the control plane has.
    * On a tenant the `WorkflowEngine` token is a store-less start client that implements none of these
    * methods, so presence of the canonical store is the reliable discriminator — gate on it (never
@@ -95,22 +130,43 @@ export class DashboardService {
    */
   async listSchedules(query: ScheduleListQuery): Promise<ScheduleDescription[]> {
     if (!this.store || !this.engine?.schedules?.supported) return [];
-    return this.engine.schedules.list(query);
+    const apps = currentConsoleApps();
+    if (apps === undefined) return this.engine.schedules.list(query);
+    // A confined viewer sees its apps' schedules only.
+    if (query.namespace !== undefined && !apps.includes(query.namespace)) return [];
+    const lists = await Promise.all(
+      (query.namespace !== undefined ? [query.namespace] : apps).map((namespace) =>
+        this.engine?.schedules.list({ ...query, namespace }),
+      ),
+    );
+    const merged = lists.flat().filter((s): s is ScheduleDescription => s !== undefined);
+    merged.sort(
+      (a, b) =>
+        (a.nextFireAt?.getTime() ?? Number.POSITIVE_INFINITY) -
+        (b.nextFireAt?.getTime() ?? Number.POSITIVE_INFINITY),
+    );
+    return query.limit !== undefined ? merged.slice(0, query.limit) : merged;
   }
 
   /** Pause a persisted schedule (control plane only). */
   pauseSchedule(id: string): Promise<ScheduleDescription> {
-    return this.controlPlane().engine.schedules.pause(id);
+    // Synchronous on a tenant: the 501 is thrown, not rejected.
+    const { engine } = this.controlPlane();
+    return this.assertScheduleVisible(id).then(() => engine.schedules.pause(id));
   }
 
   /** Resume a persisted schedule from its next window (control plane only). */
   resumeSchedule(id: string): Promise<ScheduleDescription> {
-    return this.controlPlane().engine.schedules.resume(id);
+    // Synchronous on a tenant: the 501 is thrown, not rejected.
+    const { engine } = this.controlPlane();
+    return this.assertScheduleVisible(id).then(() => engine.schedules.resume(id));
   }
 
   /** Start one run of a persisted schedule now, outside its cadence (control plane only). */
   triggerSchedule(id: string): Promise<RunResult> {
-    return this.controlPlane().engine.schedules.trigger(id);
+    // Synchronous on a tenant: the 501 is thrown, not rejected.
+    const { engine } = this.controlPlane();
+    return this.assertScheduleVisible(id).then(() => engine.schedules.trigger(id));
   }
 
   /**
@@ -121,6 +177,10 @@ export class DashboardService {
    */
   async metrics(): Promise<string> {
     const { store, engine } = this.controlPlane();
+    // The counters and gauges span every app: only a viewer who sees them all gets them.
+    if (currentConsoleApps() !== undefined) {
+      throw new ForbiddenException('metrics cover every app; your console grant names only some');
+    }
     const cap = 10_000;
     const [pending, running, dead] = await Promise.all([
       store.listRuns({ status: 'pending', limit: cap }),
@@ -152,18 +212,18 @@ export class DashboardService {
   }
 
   listRuns(query: RunQuery): Promise<RunListItem[]> {
-    return this.gateway.listRuns(query);
+    return this.gw().listRuns(query);
   }
 
   /** One page of runs (`query.limit`/`offset`) and how many runs match `query` across every page. */
   listRunsPage(query: RunQuery): Promise<{ rows: RunListItem[]; total: number }> {
-    return listRunsAndCount(this.gateway, query);
+    return listRunsAndCount(this.gw(), query);
   }
 
   /** `(status, origin)` counts over the same predicates {@link listRuns} pages — what keeps the
    *  console's chips exact while its list is bounded to a page. */
   runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
-    return this.gateway.runFacets(query);
+    return this.gw().runFacets(query);
   }
 
   /** The distinct values of one filter axis over the same predicates — what fills the console's
@@ -174,14 +234,14 @@ export class DashboardService {
     query: RunFacetQuery,
     opts?: RunValueFacetOptions,
   ): Promise<RunValueFacetRow[]> {
-    return this.gateway.runValueFacets(axis, query, opts);
+    return this.gw().runValueFacets(axis, query, opts);
   }
 
   /** This deployment's durable role (control plane vs tenant) + tenant name — for the dashboard header
    *  badge. Routes through the gateway, which knows its own topology (store-backed = operator, proxy =
    *  tenant). Works on both topologies (no store/engine needed). */
   topology(): DurableTopology {
-    return this.gateway.topology();
+    return this.gw().topology();
   }
 
   /** Per-group worker health (queue backlog + live worker heartbeats) for the Workers panel. The
@@ -189,30 +249,30 @@ export class DashboardService {
    *  gateway so it works on BOTH topologies: the control plane returns every group; a tenant proxies
    *  to the operator, which scopes the result to the tenant's own `@<tenant>` groups. */
   async workerHealth(): Promise<GroupHealth[]> {
-    return this.gateway.workerHealth();
+    return this.gw().workerHealth();
   }
 
   getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
-    return this.gateway.getRunDetail(runId, options);
+    return this.gw().getRunDetail(runId, options);
   }
 
   /** A page of one fan's members, or null when the run is unknown or the gateway can't page fans. */
   async getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null> {
-    return (await this.gateway.getFanMembers?.(runId, group, query)) ?? null;
+    return (await this.gw().getFanMembers?.(runId, group, query)) ?? null;
   }
 
   /** Fix-and-replay a dead/failed run with a corrected input — a fresh linked run. Returns its id. */
   retryWithInput(runId: string, input: unknown): Promise<{ runId: string } | null> {
-    return this.gateway.retryWithInput(runId, input);
+    return this.gw().retryWithInput(runId, input);
   }
 
   /** Re-run a failed/incomplete run; completed steps replay from their checkpoints. */
   retry(runId: string): Promise<RunResult | null> {
-    return this.gateway.retry(runId);
+    return this.gw().retry(runId);
   }
 
   cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null> {
-    return this.gateway.cancel(runId, opts);
+    return this.gw().cancel(runId, opts);
   }
 
   /**
@@ -223,7 +283,7 @@ export class DashboardService {
     runId: string,
     subscriber?: string,
   ): Promise<RepublishLifecycleResult | undefined> {
-    return this.gateway.republishLifecycle?.({
+    return this.gw().republishLifecycle?.({
       runId,
       ...(subscriber !== undefined ? { subscriber } : {}),
     });
@@ -235,7 +295,7 @@ export class DashboardService {
    * the gateway cannot answer.
    */
   async workflowLifecycle(workflow: string): Promise<WorkflowLifecyclePage | undefined> {
-    const links = await this.gateway.workflowLifecycle?.(workflow);
+    const links = await this.gw().workflowLifecycle?.(workflow);
     if (!links) return links;
     const counts = this.triggerCountsOf(links);
     return counts ? { ...links, triggerCounts: counts } : links;
@@ -249,6 +309,8 @@ export class DashboardService {
   private triggerCountsOf(
     links: WorkflowLifecycleLinks,
   ): Record<string, { triggered: number; failed: number }> | undefined {
+    // Process-wide counters span every app.
+    if (currentConsoleApps() !== undefined) return undefined;
     const snapshot = this.metricsCollector?.snapshot();
     if (!snapshot || links.startsOnSettle.length === 0) return undefined;
     const triggered = snapshot.triggeredBySubscriber[links.workflow] ?? {};
@@ -274,12 +336,12 @@ export class DashboardService {
     filter: Pick<RunQuery, 'status' | 'tag' | 'workflow' | 'attributes' | 'namespace' | 'origin'>,
     opts?: { compensate?: boolean },
   ): Promise<{ matched: number; applied: number }> {
-    const runs = await this.gateway.listRuns({ ...filter, limit: 500 });
+    const runs = await this.gw().listRuns({ ...filter, limit: 500 });
     let applied = 0;
     for (const r of runs) {
       try {
-        if (action === 'retry') await this.gateway.retry(r.id);
-        else await this.gateway.cancel(r.id, opts);
+        if (action === 'retry') await this.gw().retry(r.id);
+        else await this.gw().cancel(r.id, opts);
         applied += 1;
       } catch {
         // Skip a run that can't take the action (e.g. already terminal) — keep going.
@@ -290,12 +352,12 @@ export class DashboardService {
 
   /** Resume a run paused at a `ctx.breakpoint` (the "continue" button). */
   continue(runId: string): Promise<RunResult | null> {
-    return this.gateway.continue(runId);
+    return this.gw().continue(runId);
   }
 
   /** Re-dispatch a run's stuck `pending` remote steps — recovery for a lost step dispatch. */
   redispatch(runId: string) {
-    return this.gateway.redispatchPending(runId);
+    return this.gw().redispatchPending(runId);
   }
 
   /**
@@ -337,16 +399,18 @@ export class DashboardService {
 
   /** A run's id, workflow and status, or null when no run the caller may see has that id. */
   async findRun(runId: string): Promise<{ id: string; workflow: string; status: string } | null> {
-    const run = this.gateway.getRun
-      ? await this.gateway.getRun(runId)
-      : (await this.gateway.getRunDetail(runId, { summarizeFansOver: 0 }))?.run;
+    const gateway = this.gw();
+    const run = gateway.getRun
+      ? await gateway.getRun(runId)
+      : (await gateway.getRunDetail(runId, { summarizeFansOver: 0 }))?.run;
     return run ? { id: run.id, workflow: run.workflow, status: run.status } : null;
   }
 
   /** Whether `runId` names a run the caller may see (tenancy applies). */
   async runExists(runId: string): Promise<boolean> {
-    if (this.gateway.getRun) return (await this.gateway.getRun(runId)) !== null;
-    return (await this.gateway.getRunDetail(runId, { summarizeFansOver: 0 })) !== null;
+    const gateway = this.gw();
+    if (gateway.getRun) return (await gateway.getRun(runId)) !== null;
+    return (await gateway.getRunDetail(runId, { summarizeFansOver: 0 })) !== null;
   }
 
   /**
@@ -360,12 +424,16 @@ export class DashboardService {
 
   /** Side-effect-free read of a value a run published via `ctx.setEvent` (a live query). Control-plane-only. */
   async getEvent(runId: string, key: string): Promise<unknown> {
-    return this.controlPlane().engine.getEvent(runId, key);
+    const { engine } = this.controlPlane();
+    await this.assertRunVisible(runId);
+    return engine.getEvent(runId, key);
   }
 
   /** Deliver a validated `ctx.onUpdate` to a run; the validator may reject it (see UpdateResult). Control-plane-only. */
   async update(runId: string, name: string, arg: unknown): Promise<UpdateResult> {
-    return this.controlPlane().engine.update(runId, name, arg);
+    const { engine } = this.controlPlane();
+    await this.assertRunVisible(runId);
+    return engine.update(runId, name, arg);
   }
 
   /**
@@ -375,9 +443,33 @@ export class DashboardService {
    * gateway already filters to `runId`; the dashboard just wires the events through.
    */
   streamRun(runId: string): Observable<{ data: EngineEvent }> {
+    // Captured now: the stream is subscribed after the handler returns, outside the request scope.
+    const gateway = this.gw();
+    if (currentConsoleApps() === undefined) {
+      return new Observable<{ data: EngineEvent }>((subscriber) => {
+        const off = gateway.subscribe(runId, (event) => subscriber.next({ data: event }));
+        return () => off();
+      });
+    }
+    // A run outside the viewer's apps streams nothing: answered like an unknown run.
     return new Observable<{ data: EngineEvent }>((subscriber) => {
-      const off = this.gateway.subscribe(runId, (event) => subscriber.next({ data: event }));
-      return () => off();
+      let off: (() => void) | undefined;
+      let closed = false;
+      void (gateway.getRun?.(runId) ?? Promise.resolve(null)).then(
+        (run) => {
+          if (closed) return;
+          if (!run) {
+            subscriber.error(new NotFoundException(`run ${runId} not found`));
+            return;
+          }
+          off = gateway.subscribe(runId, (event) => subscriber.next({ data: event }));
+        },
+        (error: unknown) => subscriber.error(error),
+      );
+      return () => {
+        closed = true;
+        off?.();
+      };
     });
   }
 }
