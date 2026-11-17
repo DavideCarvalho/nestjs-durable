@@ -5,6 +5,13 @@ import {
   useQuery,
   useQueryClient,
 } from '@tanstack/react-query';
+import {
+  createParser,
+  parseAsArrayOf,
+  parseAsString,
+  parseAsStringLiteral,
+  useQueryStates,
+} from 'nuqs';
 import { type Dispatch, type SetStateAction, useCallback, useMemo, useState } from 'react';
 import { ActionDialog } from '../../aviary-kit/blocks/action-dialog';
 import { EmptyState } from '../../aviary-kit/blocks/empty-state';
@@ -27,6 +34,7 @@ import {
   originFacetsFromCounts,
   originFilterKey,
   originLabel,
+  sameOriginFilter,
   unknownCountFromFacets,
 } from '../../client/run-origin';
 import { stalledWorkflows } from '../../client/summarize-health';
@@ -50,8 +58,9 @@ import { anySingleton, useSingletonSiblings } from './singleton';
  */
 const PAGE_SIZE = 100;
 
-/** Every filter the runs board holds. Lives in the App (not the page) so leaving for Workers and
- *  coming back keeps the operator's narrowing. */
+/** Every filter the runs board holds. Lives in the hash's query (`#/?status=failed&tag=vip`), read
+ *  in the App (not the page), and the App carries it across Workers and back, so leaving the board
+ *  keeps the operator's narrowing — and a filtered board is a link. */
 export interface RunFilters {
   status: RunStatus | 'all';
   setStatus: Dispatch<SetStateAction<RunStatus | 'all'>>;
@@ -71,23 +80,67 @@ export interface RunFilters {
   setOrigin: Dispatch<SetStateAction<OriginFilter>>;
 }
 
+/** How the `app` facet (runs with no origin) is spelled in `?origin=`: parentheses can't appear in
+ *  an npm package name, so it never collides with a real origin. */
+const UNKNOWN_ORIGIN_PARAM = '(app)';
+
+/** `?origin=<package>` / `?origin=(app)`; absent = every origin. */
+export const originParam = createParser<OriginFilter>({
+  parse: (value) =>
+    value === UNKNOWN_ORIGIN_PARAM
+      ? { kind: 'unknown' }
+      : value === ''
+        ? null
+        : { kind: 'origin', origin: value },
+  serialize: (filter) =>
+    filter.kind === 'unknown'
+      ? UNKNOWN_ORIGIN_PARAM
+      : filter.kind === 'origin'
+        ? filter.origin
+        : '',
+  eq: sameOriginFilter,
+}).withDefault(ALL_ORIGINS);
+
+const list = parseAsArrayOf(parseAsString).withDefault([]);
+
+/** The runs board's URL params. Each pick is an explicit choice, so it adds a history entry. */
+export const runFilterParams = {
+  status: parseAsStringLiteral(['all', ...STATUSES] as const).withDefault('all'),
+  tag: list,
+  attr: list,
+  namespace: list,
+  origin: originParam,
+};
+
 export function useRunFilters(): RunFilters {
-  const [status, setStatus] = useState<RunStatus | 'all'>('all');
-  const [tag, setTag] = useState<string[]>([]);
-  const [attr, setAttr] = useState<string[]>([]);
-  const [namespace, setNamespace] = useState<string[]>([]);
-  const [origin, setOrigin] = useState<OriginFilter>(ALL_ORIGINS);
+  const [state, setState] = useQueryStates(runFilterParams, { history: 'push' });
+  // `Dispatch<SetStateAction<…>>` setters over one key each: a functional update sees that key's
+  // current value, like the `useState` setters these replace. Stable across renders, as those were.
+  const setters = useMemo(() => {
+    const setter =
+      <K extends keyof typeof runFilterParams>(key: K) =>
+      (next: SetStateAction<(typeof state)[K]>) =>
+        void setState((prev) => ({
+          [key]:
+            typeof next === 'function'
+              ? (next as (value: (typeof state)[K]) => (typeof state)[K])(prev[key])
+              : next,
+        }));
+    return {
+      setStatus: setter('status') as Dispatch<SetStateAction<RunStatus | 'all'>>,
+      setTag: setter('tag'),
+      setAttr: setter('attr'),
+      setNamespace: setter('namespace'),
+      setOrigin: setter('origin'),
+    };
+  }, [setState]);
   return {
-    status,
-    setStatus,
-    tag,
-    setTag,
-    attr,
-    setAttr,
-    namespace,
-    setNamespace,
-    origin,
-    setOrigin,
+    status: state.status,
+    tag: state.tag,
+    attr: state.attr,
+    namespace: state.namespace,
+    origin: state.origin,
+    ...setters,
   };
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseRoute, routeHash } from './routes';
+import { parseRoute, routeHash, sameRoute } from './routes';
 
 describe('routes', () => {
   it('parses every page from the hash, the runs board by default', () => {
@@ -21,5 +21,17 @@ describe('routes', () => {
       expect(routeHash(parseRoute(hash))).toBe(hash);
     }
     expect(routeHash({ page: 'runs' })).toBe('');
+  });
+
+  it('decides the page by the path half: the query is the runs board filters', () => {
+    expect(parseRoute('#?status=failed')).toEqual({ page: 'runs' });
+    expect(parseRoute('#/run/r1?status=failed&tag=vip')).toEqual({ page: 'runs', runId: 'r1' });
+    expect(parseRoute('#/workers?status=failed')).toEqual({ page: 'workers' });
+    expect(parseRoute('#/workflow/checkout?x=1')).toEqual({
+      page: 'workflow',
+      workflow: 'checkout',
+    });
+    expect(sameRoute(parseRoute('#/run/r1'), parseRoute('#/run/r1?status=failed'))).toBe(true);
+    expect(sameRoute(parseRoute('#/run/r1'), parseRoute('#/run/r2'))).toBe(false);
   });
 });
