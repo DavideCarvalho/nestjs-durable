@@ -146,10 +146,18 @@ export class TransportPool {
       if (transport.groupHealth) reports.push(await transport.groupHealth(group));
     }
     if (reports.length === 0) return undefined;
+    // A shared-queue report (BullMQ `taskQueues: 'grouped'`) keeps naming its queue; with several,
+    // the first one that names one does.
+    const shared = reports.find((r) => r.queue !== undefined);
+    const draining = reports.reduce((sum, r) => sum + (r.drainingDepth ?? 0), 0);
     return {
       group,
       depth: reports.reduce((sum, r) => sum + r.depth, 0),
       liveWorkers: reports.flatMap((r) => r.liveWorkers),
+      ...(shared?.queue !== undefined ? { queue: shared.queue } : {}),
+      ...(shared?.queueDepth !== undefined ? { queueDepth: shared.queueDepth } : {}),
+      ...(reports.some((r) => r.depthSampled) ? { depthSampled: true } : {}),
+      ...(draining > 0 ? { drainingDepth: draining } : {}),
     };
   }
 

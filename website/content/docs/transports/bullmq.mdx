@@ -195,6 +195,67 @@ module, construct the transport with `deferConsumers: true` (or call `deferConsu
 `handle()` / `onResult()`). Pub/sub (heartbeats, control, run replies, tenant events) is broadcast
 and is not parked.
 
+## Grouped task queues
+
+By default every handler has its own queue (`<P>-tasks-<token>`), consumed by its own BullMQ
+`Worker` with its own blocking connection. Each idle worker re-polls its queue every `drainDelay`
+and runs a stalled-job check every `stalledInterval`, so a process with 85 `@Step` handlers polls
+85 queues and holds 85+ connections while nothing happens.
+
+`taskQueues: 'grouped'` puts every step handler of a partition on ONE queue:
+
+```ts
+new BullMQTransport({ connection, taskQueues: 'grouped' })
+```
+
+- The queue is `<P>-taskgroup`, or `<P>-taskgroup@<partition>` for a partitioned token. It is the
+  AdonisJS durable lib's grouped queue (same name, same job shape), so both fleets can share it.
+- One `Worker` consumes it and routes each job to its handler by the routing token in the job
+  (`group`). The API does not change: `handle()`, `dispatch()` and results work as before.
+- Each handler keeps its own `concurrency` limit (fixed or adaptive) through an in-process limiter.
+  The shared worker runs two limits' worth of slots per handler; a job of a handler at its limit
+  waits in-process (its lock keeps renewing), and past one limit's worth of waiters it goes back to
+  the queue with a growing delay, so one handler's backlog never starves the others.
+  `stepTimeoutMs`, stalled-job recovery and the terminal-failure bridge apply as before. Priority
+  still orders the shared queue, but under contention it is weaker than per-handler: jobs waiting
+  in-process for a handler slot are served first in, first out, and a job handed back re-enters by
+  its due time, so a high-priority job can wait behind earlier lower-priority jobs of the same
+  handler.
+- Every process consuming a partition's grouped queue must register the handlers dispatched to it.
+  A job for a handler the process lacks goes back to the queue (delayed 10 s) for another process.
+  It is logged, and logged again every 5 minutes with how many bounced since, so a handler nothing
+  serves keeps showing up.
+- **Workflow tasks** (`dispatchWorkflowTask`) stay on `<P>-tasks-<token>`: their consumers here
+  (`@dudousxd/durable-worker` and the Python worker) read per-handler queues.
+- `groupHealth()` reports the handler's share of the shared queue (from a sample of up to 500 jobs,
+  `depthSampled` when it did not cover the queue), the shared queue's name and total
+  (`queue`, `queueDepth`), and what still waits on the handler's own queue (`drainingDepth`). The
+  dashboard counts a shared queue once per partition and marks it.
+
+Measured with 85 handlers in one worker process plus one engine (registry legacy switches off, 60 s
+idle window): 43.6 commands/s and 179 connections per-handler, 1.5 commands/s and 9 connections
+grouped (23.3 and 0.9 commands/s with `stalledInterval: 120_000`). A 3-step run cost 326 commands
+per-handler and 259 grouped.
+
+### Switching layouts
+
+Dispatchers and step workers of a fleet must agree on the layout, which a rolling deploy cannot
+guarantee. `taskQueueDrain` covers the gap: a process also consumes the OTHER layout's queues of the
+handlers it serves while they hold jobs (waiting, delayed, prioritized, paused, or active under a
+worker that died). In `'grouped'` mode that is the per-handler queues (on by default); in
+`'per-handler'` mode it is the grouped queue (off by default, turn it on for a rollback). Each
+interval (60 s) costs one batched `EXISTS` while those queues are all empty, plus one `EXISTS` per
+queue while any holds jobs; a drain worker starts only on a queue that holds jobs and stops once it
+is empty.
+
+1. Deploy `taskQueues: 'grouped'` to the workers and the engines. Jobs already on per-handler queues,
+   and jobs older engines still dispatch there, are drained by the grouped workers.
+2. To roll back, deploy `taskQueues: 'per-handler'` with `taskQueueDrain: true`, so the jobs left on
+   the grouped queue still run.
+
+Python and `@dudousxd/durable-worker` step handlers only consume per-handler queues: keep
+`'per-handler'` while any of them serves steps this fleet dispatches.
+
 ## Worker registry
 
 Workers advertise which handler queues they consume (liveness plus live status), their
@@ -282,6 +343,8 @@ lifecycle events and cancellation — and carries the tenant `start-run` / `run-
 | `resultConcurrency` | The most step results this instance handles at once from the results queue, when above the built-in 512. One run's results still resume it in order. See [Result concurrency](#result-concurrency). |
 | `drainDelay` | Seconds each BullMQ worker blocks on an **empty** queue before polling it again. A new job wakes the worker at once (BullMQ's marker) and a delayed job's due time shortens the block, so this only sets how often idle queues are re-polled (a `BZPOPMIN` and a `moveToActive` script per queue). Closing is not held up by it. Defaults to `30` (BullMQ's own default is 5). |
 | `stalledInterval` | Milliseconds between each worker's stalled-job checks (one script per queue). Raising it lowers idle Redis load and delays recovering a job whose worker died. Defaults to BullMQ's 30 000. |
+| `taskQueues` | `'per-handler'` (default) or `'grouped'`: one queue per handler, or one shared queue per partition. See [Grouped task queues](#grouped-task-queues). |
+| `taskQueueDrain` | While switching layouts, also consume the other layout's queues of the handlers this process serves until they are empty. `true` / `false` / `{ intervalMs }` (default `60_000`). Defaults to `true` with `'grouped'`, `false` with `'per-handler'`. |
 | `workerRegistry` | `{ legacyWrites?, legacyWriteIntervalMs?, legacyScan?, legacyScanIntervalMs?, connection? }`: what the worker registry still writes and reads for older versions, and an optional separate connection for its hash. See [Worker registry](#worker-registry). Defaults to `{ legacyWrites: true, legacyWriteIntervalMs: 30_000, legacyScan: true, legacyScanIntervalMs: 60_000 }`. |
 
 The payload is the documented `RemoteTask` / `StepResult` JSON, so a non-Node worker on the same
