@@ -617,15 +617,12 @@ export async function ensureTypeOrmDurableSchema(
     // every query; both keep the scan, bounded by the poller's 10 s interval.
     if (isPg) {
       try {
-        const built = await ensurePgLifecyclePendingIndex(
-          (sql, params) => runner.query(sql, params),
-          {
-            schema,
-            table: runs,
-            createdAt: runsCol('createdAt'),
-            predicate: `${runsCol('tags')} LIKE '${LIFECYCLE_PENDING_LIKE}'`,
-          },
-        );
+        const built = await ensurePgLifecyclePendingIndex((sql: string) => runner.query(sql), {
+          schema,
+          table: runs,
+          createdAt: runsCol('createdAt'),
+          predicate: `${runsCol('tags')} LIKE '${LIFECYCLE_PENDING_LIKE}'`,
+        });
         if (built && !created.has('durable_workflow_runs'))
           repairs.push(`created index ${LIFECYCLE_PENDING_INDEX} on durable_workflow_runs`);
       } catch (error) {
