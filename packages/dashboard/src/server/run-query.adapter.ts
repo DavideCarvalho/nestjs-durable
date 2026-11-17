@@ -15,6 +15,7 @@ import type {
   SortItem,
 } from '@dudousxd/nestjs-filter';
 import { BadRequestException, Injectable, type Type } from '@nestjs/common';
+import { appScopedGateway, currentConsoleApps } from './app-scope.js';
 import { ATTRIBUTE_FIELD, DURABLE_RUN_FIELDS, DurableRun, runValueAxisFor } from './durable-run.js';
 import { RunQueryDraft } from './run-query-draft.js';
 
@@ -93,7 +94,13 @@ export async function listRunsAndCount(
  */
 @Injectable()
 export class RunQueryAdapter implements FilterAdapter {
-  constructor(private readonly gateway: RunGateway) {}
+  constructor(private readonly runGateway: RunGateway) {}
+
+  /** The gateway for this request, confined to the viewer's apps when `authorize` granted a list. */
+  private get gateway(): RunGateway {
+    const apps = currentConsoleApps();
+    return apps ? appScopedGateway(this.runGateway, apps) : this.runGateway;
+  }
 
   createQueryBuilder<E>(entity: Type<E>): unknown {
     this.assertDurableRun(entity);

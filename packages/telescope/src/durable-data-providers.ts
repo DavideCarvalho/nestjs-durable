@@ -24,12 +24,33 @@ type EntryStorage = {
   get(q: {
     type?: string;
     familyHash?: string;
+    tag?: string;
     limit?: number;
     before?: Date;
   }): Promise<{ data: StorageEntry[] }>;
 };
 
 const RUN_EVENTS_LIMIT = 5_000;
+
+/**
+ * The tenant app a provider is asked about (`query.app`), or `undefined` for every app. On a control
+ * plane, a tenant's runs live in its partition (`run.namespace`), its worker groups are
+ * `<name>@<app>`, and the watcher tags its entries `app:<app>`.
+ */
+function appOf(query: Record<string, unknown> | undefined): string | undefined {
+  const app = query?.app;
+  return typeof app === 'string' && app !== '' ? app : undefined;
+}
+
+/** The run-query narrowing of `app` (nothing for every app). */
+function inApp(app: string | undefined): { namespace?: string } {
+  return app !== undefined ? { namespace: app } : {};
+}
+
+/** Whether a worker group serves `app` (its routing token is suffixed `@<app>`). */
+function groupOfApp(group: string, app: string | undefined): boolean {
+  return app === undefined || group.endsWith(`@${app}`);
+}
 
 /**
  * The latest run-level lifecycle entries, up to `limit` of each of `events`, newest first.
@@ -43,14 +64,23 @@ async function fetchRunEntries(
   ctx: ExtensionContext,
   events: readonly string[] = ['run.started', 'run.completed', 'run.failed'],
   limit = RUN_EVENTS_LIMIT,
+  app?: string | undefined,
 ): Promise<StorageEntry[]> {
   const storage = ctx.moduleRef.get(TELESCOPE_STORAGE, { strict: false }) as EntryStorage;
   const pages = await Promise.all(
     events.map((event) =>
-      storage.get({ type: 'durable', familyHash: runEventFamily(event) as string, limit }),
+      storage.get({
+        type: 'durable',
+        familyHash: runEventFamily(event) as string,
+        // One app's entries (a control plane tags them `app:<partition>`), so `limit` is that app's.
+        ...(app !== undefined ? { tag: `app:${app}` } : {}),
+        limit,
+      }),
     ),
   );
   const entries = pages.flatMap((page) => page.data);
+  // An app's entries were all recorded with their family: no older, unfamilied ones to look for.
+  if (app !== undefined) return entries.sort((a, b) => entryTime(b) - entryTime(a));
   if (entries.length === 0) return (await storage.get({ type: 'durable', limit })).data;
   // With every family read in full, anything older than its oldest entry was recorded without a
   // family; it is read the way it was written, below that point, so history keeps its older runs.
@@ -164,9 +194,13 @@ const STATE_CAP = 10_000;
  * tens of thousands of runs in one status, which the capped listing would both under-count and pay
  * for by loading every row.
  */
-function countByStatus(store: StateStore, status: RunStatus): Promise<number> {
-  if (store.countRuns) return store.countRuns({ status });
-  return store.listRuns({ status, limit: STATE_CAP }).then((runs) => runs.length);
+function countByStatus(
+  store: StateStore,
+  status: RunStatus,
+  app?: string | undefined,
+): Promise<number> {
+  if (store.countRuns) return store.countRuns({ status, ...inApp(app) });
+  return store.listRuns({ status, ...inApp(app), limit: STATE_CAP }).then((runs) => runs.length);
 }
 
 // ─── Existing providers ───────────────────────────────────────────────────────
@@ -178,7 +212,7 @@ export function durableStateProvider(): DataProvider {
     async resolve(query, ctx: ExtensionContext) {
       const store = ctx.moduleRef.get(STATE_STORE_CANONICAL, { strict: false }) as StateStore;
       const status = (query?.status as RunStatus) ?? 'dead';
-      return { value: await countByStatus(store, status) };
+      return { value: await countByStatus(store, status, appOf(query)) };
     },
   };
 }
@@ -193,7 +227,12 @@ export function durableTimeseriesProvider(): DataProvider {
     name: 'durable.timeseries',
     async resolve(query, ctx: ExtensionContext) {
       const limit = Math.min(RUN_EVENTS_LIMIT, Math.max(100, Number(query?.limit ?? 2_000)));
-      const entries = await fetchRunEntries(ctx, ['run.completed', 'run.failed'], limit);
+      const entries = await fetchRunEntries(
+        ctx,
+        ['run.completed', 'run.failed'],
+        limit,
+        appOf(query),
+      );
 
       let completed = 0;
       let failed = 0;
@@ -240,8 +279,8 @@ export function durableRecentFailuresProvider(): DataProvider {
       const windowMs = query?.windowMs === undefined ? 24 * 60 * 60 * 1000 : Number(query.windowMs);
       const cutoff = windowMs > 0 ? Date.now() - windowMs : 0;
       const [failed, dead] = await Promise.all([
-        store.listRuns({ status: 'failed', limit }),
-        store.listRuns({ status: 'dead', limit }),
+        store.listRuns({ status: 'failed', ...inApp(appOf(query)), limit }),
+        store.listRuns({ status: 'dead', ...inApp(appOf(query)), limit }),
       ]);
       const rows = [...failed, ...dead]
         .filter((r) => +new Date(r.updatedAt) >= cutoff)
@@ -271,7 +310,8 @@ export function durableWorkerHealthProvider(): DataProvider {
     name: 'durable.workerHealth',
     async resolve(query, ctx: ExtensionContext) {
       const engine = ctx.moduleRef.get(WorkflowEngine, { strict: false }) as WorkflowEngine;
-      const health = await engine.workerHealth();
+      const app = appOf(query);
+      const health = (await engine.workerHealth()).filter((g) => groupOfApp(g.group, app));
       const isStarved = (g: { depth: number; liveWorkers: unknown[] }) =>
         g.depth > 0 && g.liveWorkers.length === 0;
       if ((query?.metric as string) === 'starvedCount') {
@@ -354,9 +394,10 @@ function fmtNum(n: number | undefined, status: WorkerStatus | undefined): number
 export function durableWorkerStatusProvider(): DataProvider {
   return {
     name: 'durable.workerStatus',
-    async resolve(_query, ctx: ExtensionContext) {
+    async resolve(query, ctx: ExtensionContext) {
       const engine = ctx.moduleRef.get(WorkflowEngine, { strict: false }) as WorkflowEngine;
-      const health = await engine.workerHealth();
+      const app = appOf(query);
+      const health = (await engine.workerHealth()).filter((g) => groupOfApp(g.group, app));
       const rows = health
         .slice()
         // Groups with a backlog first (the workers worth scrutinising), then by group name.
@@ -416,7 +457,9 @@ export function durableDurationProvider(): DataProvider {
     name: 'durable.duration',
     async resolve(query, ctx: ExtensionContext) {
       // Dedup triplicated lifecycle events so paired durations aren't double-counted.
-      const entries = dedupeRunEvents(await fetchRunEntries(ctx));
+      const entries = dedupeRunEvents(
+        await fetchRunEntries(ctx, undefined, undefined, appOf(query)),
+      );
 
       // Index run.started entries by runId for the pairing fallback.
       const startedAt = new Map<string, number>();
@@ -481,7 +524,9 @@ export function durableRunsOverTimeProvider(): DataProvider {
   return {
     name: 'durable.runsOverTime',
     async resolve(query, ctx: ExtensionContext) {
-      const entries = dedupeRunEvents(await fetchRunEntries(ctx));
+      const entries = dedupeRunEvents(
+        await fetchRunEntries(ctx, undefined, undefined, appOf(query)),
+      );
       const n = Number((query as Record<string, unknown>)?.buckets ?? 24);
       const now = Date.now();
 
@@ -530,7 +575,9 @@ export function durableSuccessRateProvider(): DataProvider {
   return {
     name: 'durable.successRate',
     async resolve(query, ctx: ExtensionContext) {
-      const entries = dedupeRunEvents(await fetchRunEntries(ctx));
+      const entries = dedupeRunEvents(
+        await fetchRunEntries(ctx, undefined, undefined, appOf(query)),
+      );
       const windowMs = Number((query as Record<string, unknown>)?.windowMs ?? 24 * 60 * 60 * 1000);
       const now = Date.now();
       const { current, previous } = splitWindows(entries, windowMs, now);
@@ -566,7 +613,9 @@ export function durableThroughputProvider(): DataProvider {
   return {
     name: 'durable.throughput',
     async resolve(query, ctx: ExtensionContext) {
-      const entries = dedupeRunEvents(await fetchRunEntries(ctx));
+      const entries = dedupeRunEvents(
+        await fetchRunEntries(ctx, undefined, undefined, appOf(query)),
+      );
       const windowMs = Number((query as Record<string, unknown>)?.windowMs ?? 24 * 60 * 60 * 1000);
       const now = Date.now();
       const { current, previous } = splitWindows(entries, windowMs, now);
@@ -628,10 +677,11 @@ const STATE_BREAKDOWN_PALETTE = [
 export function durableStateBreakdownProvider(): DataProvider {
   return {
     name: 'durable.stateBreakdown',
-    async resolve(_query, ctx: ExtensionContext) {
+    async resolve(query, ctx: ExtensionContext) {
       const store = ctx.moduleRef.get(STATE_STORE_CANONICAL, { strict: false }) as StateStore;
+      const app = appOf(query);
       const counts = await Promise.all(
-        STATE_BREAKDOWN_STATUSES.map((status) => countByStatus(store, status)),
+        STATE_BREAKDOWN_STATUSES.map((status) => countByStatus(store, status, app)),
       );
       const segments = STATE_BREAKDOWN_STATUSES.map((label, i) => ({
         label,
@@ -659,10 +709,14 @@ function stamp(at: Date | string | undefined): string {
  * The recorded `run.trigger_failed` entries, newest first, one per (run, subscriber): every pod
  * records the event, so the same failure is otherwise listed once per pod.
  */
-async function triggerFailures(ctx: ExtensionContext, limit: number): Promise<StorageEntry[]> {
+async function triggerFailures(
+  ctx: ExtensionContext,
+  limit: number,
+  app?: string | undefined,
+): Promise<StorageEntry[]> {
   const seen = new Set<string>();
   const out: StorageEntry[] = [];
-  for (const entry of await fetchRunEntries(ctx, ['run.trigger_failed'], limit)) {
+  for (const entry of await fetchRunEntries(ctx, ['run.trigger_failed'], limit, app)) {
     const c = (entry.content ?? {}) as { event?: string; runId?: string; name?: string };
     if (c.event !== 'run.trigger_failed') continue;
     const key = `${c.runId}\u0000${c.name}`;
@@ -685,7 +739,7 @@ export function durableFailedTriggersProvider(): DataProvider {
       const limit = Math.min(200, Math.max(10, Number(query?.limit ?? 50)));
       const windowMs = query?.windowMs === undefined ? 24 * 60 * 60 * 1000 : Number(query.windowMs);
       const cutoff = windowMs > 0 ? Date.now() - windowMs : 0;
-      const rows = (await triggerFailures(ctx, RUN_EVENTS_LIMIT))
+      const rows = (await triggerFailures(ctx, RUN_EVENTS_LIMIT, appOf(query)))
         .filter((entry) => entryTime(entry) >= cutoff)
         .slice(0, limit)
         .map((entry) => {
@@ -725,6 +779,7 @@ export function durableOwedLifecycleProvider(): DataProvider {
       const limit = Math.min(200, Math.max(10, Number(query?.limit ?? 50)));
       const cutoff = Date.now() - LIFECYCLE_GRACE_MS;
       const runs = await store.listRuns({
+        ...inApp(appOf(query)),
         tag: LIFECYCLE_PENDING_TAG,
         statuses: ['completed', 'failed', 'cancelled', 'dead'],
         limit: 1000,
@@ -756,16 +811,16 @@ export function durableLifecycleTriggersProvider(): DataProvider {
     name: 'durable.lifecycleTriggers',
     async resolve(query, ctx: ExtensionContext) {
       const seen = new Set<string>();
-      const entries = (await fetchRunEntries(ctx, ['run.triggered', 'run.trigger_failed'])).filter(
-        (entry) => {
-          const c = (entry.content ?? {}) as { event?: string; runId?: string; name?: string };
-          if (c.event !== 'run.triggered' && c.event !== 'run.trigger_failed') return false;
-          const key = `${c.event}\u0000${c.runId}\u0000${c.name}`;
-          if (seen.has(key)) return false;
-          seen.add(key);
-          return true;
-        },
-      );
+      const entries = (
+        await fetchRunEntries(ctx, ['run.triggered', 'run.trigger_failed'], undefined, appOf(query))
+      ).filter((entry) => {
+        const c = (entry.content ?? {}) as { event?: string; runId?: string; name?: string };
+        if (c.event !== 'run.triggered' && c.event !== 'run.trigger_failed') return false;
+        const key = `${c.event}\u0000${c.runId}\u0000${c.name}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
       if ((query?.metric as string) === 'bySubscriber') {
         const limit = Math.max(1, Number(query?.limit ?? 10));
         const counts = new Map<string, number>();

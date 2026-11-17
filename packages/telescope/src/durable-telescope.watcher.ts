@@ -1,6 +1,11 @@
 import {
+  type AttributedEngineEvent,
+  DURABLE_OPTIONS_CANONICAL,
   type EngineEvent,
+  RunAppStamper,
+  type RunAppTopologyOptions,
   WorkflowEngine,
+  controlPlaneAttribution,
   lifecycleSourceOf,
   parentRunIdOf,
   traceIdOfTraceparent,
@@ -52,6 +57,15 @@ const isRemote = (event: object): boolean =>
  * A **remote workflow** (a run whose body itself lives in another runtime) is likewise unwrapped:
  * the engine dispatches a workflow task and awaits a decision rather than executing a body, and a
  * scope around a dispatch would describe the wrong thing.
+ *
+ * ## With a control plane
+ *
+ * On `topology: 'control-plane'` every entry of a tenant's run is also tagged `app:<partition>` (and
+ * carries `app` in its content), step entries included: the app is read off the run events and, for
+ * a run this process has seen no event of yet, from the store once. The control plane's own runs are
+ * tagged as before. A tenant pod has no local event stream, so it records no lifecycle entries (the
+ * control plane does), but its step handlers and workflow turns still run in the run's trace, so the
+ * queries and exceptions inside them join the control plane's entries on `trace:<id>`.
  */
 export class DurableTelescopeWatcher implements Watcher {
   readonly type = 'durable';
@@ -74,98 +88,113 @@ export class DurableTelescopeWatcher implements Watcher {
     // instead of throwing "engine.subscribe is not a function".
     if (typeof (engine as Partial<WorkflowEngine>)?.subscribe !== 'function') return;
     const tracer = trace.getTracer('@dudousxd/nestjs-durable-telescope');
+    const attribution = controlPlaneAttribution(durableOptions(ctx), (runId) =>
+      engine.getRun(runId),
+    );
+    const stamper = attribution ? new RunAppStamper(attribution) : undefined;
 
     engine.subscribe((event) => {
       // Every pod hears every event; the one that produced it records it.
       if (isRemote(event)) return;
-      const family = runEventFamily(event.type);
-      const source = lifecycleSourceOfEvent(event);
-      const record = () =>
-        ctx.record({
-          type: this.type,
-          ...(family !== undefined ? { familyHash: family } : {}),
-          // Stated explicitly rather than left to the ambient span, and the Recorder honours an
-          // explicit `traceId` above everything else. A lifecycle event is very often emitted
-          // OUTSIDE any execution scope — a remote step's result lands in a transport callback, a
-          // recovery sweep emits for a run this process never executed — and those entries are
-          // exactly the ones an operator follows into the trace. We know the run, so we know the
-          // trace; there is no reason to let it depend on where the emit happened to land.
-          traceId: runTraceId(event.runId),
-          content: {
-            event: event.type,
-            workflow: event.workflow,
-            runId: event.runId,
-            parentRunId: parentRunIdOf(event.runId),
-            seq: event.seq,
-            name: event.name,
-            kind: event.kind,
-            output: event.output,
-            error: event.error,
-            durationMs: event.durationMs,
-            reason: event.reason,
-            triggeredRunId: event.triggeredRunId,
-            ...(source
-              ? {
-                  lifecycleSourceRunId: source.runId,
-                  lifecycleKind: source.kind,
-                  lifecycleSourceTraceId: runTraceId(source.runId),
-                }
-              : {}),
-          },
-          tags: this.tags(event),
-        });
-
-      // Anchor on the run's trace. Derived from the run id, so this event groups with the entries
-      // recorded *inside* the turn/step scopes without either side having to hand the other a span —
-      // which is the only thing that works once a step executes on a later turn, or in another pod.
-      const base = runTraceContext(event.runId);
-
-      // A step/signal/sleep event → give it its own child span so it's a distinct node in the
-      // trace; run-level events record against the run's own span context. Either way the active
-      // span at record time carries the run's trace id, so all entries group into one trace.
-      if (event.name != null && event.seq != null) {
-        const step = tracer.startSpan(
-          `step ${event.name}`,
-          {
-            attributes: {
-              'durable.run_id': event.runId,
-              'durable.step.seq': event.seq,
-              'durable.step.kind': event.kind,
-            },
-          },
-          base,
-        );
-        if (event.type === 'step.failed') {
-          const message = event.error?.message;
-          step.setStatus(
-            message !== undefined
-              ? { code: SpanStatusCode.ERROR, message }
-              : { code: SpanStatusCode.ERROR },
-          );
-        }
-        context.with(trace.setSpan(base, step), record);
-        step.end();
-      } else if (source) {
-        // The started run's first entry sits in a span linked to its source run's trace, so the
-        // two traces reference each other in Telescope and in any OTel backend.
-        const started = tracer.startSpan(
-          `run ${event.workflow ?? event.runId}`,
-          {
-            attributes: {
-              'durable.run_id': event.runId,
-              'durable.lifecycle.source_run_id': source.runId,
-              'durable.lifecycle.kind': source.kind,
-            },
-            links: [{ context: runSpanContext(source.runId) }],
-          },
-          base,
-        );
-        context.with(trace.setSpan(base, started), record);
-        started.end();
-      } else {
-        context.with(base, record);
-      }
+      if (stamper) stamper.stamp(event, (attributed) => this.recordEvent(ctx, tracer, attributed));
+      else this.recordEvent(ctx, tracer, event);
     });
+  }
+
+  /** Record one engine event as an entry in its run's trace. */
+  private recordEvent(
+    ctx: WatcherContext,
+    tracer: ReturnType<typeof trace.getTracer>,
+    event: AttributedEngineEvent,
+  ): void {
+    const family = runEventFamily(event.type);
+    const source = lifecycleSourceOfEvent(event);
+    const record = () =>
+      ctx.record({
+        type: this.type,
+        ...(family !== undefined ? { familyHash: family } : {}),
+        // Stated explicitly rather than left to the ambient span, and the Recorder honours an
+        // explicit `traceId` above everything else. A lifecycle event is very often emitted
+        // OUTSIDE any execution scope — a remote step's result lands in a transport callback, a
+        // recovery sweep emits for a run this process never executed — and those entries are
+        // exactly the ones an operator follows into the trace. We know the run, so we know the
+        // trace; there is no reason to let it depend on where the emit happened to land.
+        traceId: runTraceId(event.runId),
+        content: {
+          event: event.type,
+          workflow: event.workflow,
+          runId: event.runId,
+          parentRunId: parentRunIdOf(event.runId),
+          seq: event.seq,
+          name: event.name,
+          kind: event.kind,
+          output: event.output,
+          error: event.error,
+          durationMs: event.durationMs,
+          reason: event.reason,
+          triggeredRunId: event.triggeredRunId,
+          ...(event.app !== undefined ? { app: event.app } : {}),
+          ...(source
+            ? {
+                lifecycleSourceRunId: source.runId,
+                lifecycleKind: source.kind,
+                lifecycleSourceTraceId: runTraceId(source.runId),
+              }
+            : {}),
+        },
+        tags: this.tags(event),
+      });
+
+    // Anchor on the run's trace. Derived from the run id, so this event groups with the entries
+    // recorded *inside* the turn/step scopes without either side having to hand the other a span —
+    // which is the only thing that works once a step executes on a later turn, or in another pod.
+    const base = runTraceContext(event.runId);
+
+    // A step/signal/sleep event → give it its own child span so it's a distinct node in the
+    // trace; run-level events record against the run's own span context. Either way the active
+    // span at record time carries the run's trace id, so all entries group into one trace.
+    if (event.name != null && event.seq != null) {
+      const step = tracer.startSpan(
+        `step ${event.name}`,
+        {
+          attributes: {
+            'durable.run_id': event.runId,
+            'durable.step.seq': event.seq,
+            'durable.step.kind': event.kind,
+          },
+        },
+        base,
+      );
+      if (event.type === 'step.failed') {
+        const message = event.error?.message;
+        step.setStatus(
+          message !== undefined
+            ? { code: SpanStatusCode.ERROR, message }
+            : { code: SpanStatusCode.ERROR },
+        );
+      }
+      context.with(trace.setSpan(base, step), record);
+      step.end();
+    } else if (source) {
+      // The started run's first entry sits in a span linked to its source run's trace, so the
+      // two traces reference each other in Telescope and in any OTel backend.
+      const started = tracer.startSpan(
+        `run ${event.workflow ?? event.runId}`,
+        {
+          attributes: {
+            'durable.run_id': event.runId,
+            'durable.lifecycle.source_run_id': source.runId,
+            'durable.lifecycle.kind': source.kind,
+          },
+          links: [{ context: runSpanContext(source.runId) }],
+        },
+        base,
+      );
+      context.with(trace.setSpan(base, started), record);
+      started.end();
+    } else {
+      context.with(base, record);
+    }
   }
 
   /**
@@ -179,8 +208,10 @@ export class DurableTelescopeWatcher implements Watcher {
     this.disposeScope = undefined;
   }
 
-  private tags(event: EngineEvent): string[] {
+  private tags(event: AttributedEngineEvent): string[] {
     const tags = ['durable', event.type, `run:${event.runId}`];
+    // The tenant app of the run, on a control plane: how one app's workflow entries are found.
+    if (event.app !== undefined && event.app !== '') tags.push(`app:${event.app}`);
     // A child run's own trace is separate from its parent's; this tag is how the entries of every
     // child of one run (a whole `ctx.all` fan) are found from the parent.
     const parent = parentRunIdOf(event.runId);
@@ -215,4 +246,13 @@ function lifecycleSourceOfEvent(
 ): { runId: string; kind: 'completed' | 'failed' } | undefined {
   if (event.type !== 'run.started' || !event.workflow) return undefined;
   return lifecycleSourceOf({ id: event.runId, workflow: event.workflow });
+}
+
+/** `DurableModule`'s resolved options, when it is in the app. */
+function durableOptions(ctx: WatcherContext): RunAppTopologyOptions | undefined {
+  try {
+    return ctx.moduleRef.get<RunAppTopologyOptions>(DURABLE_OPTIONS_CANONICAL, { strict: false });
+  } catch {
+    return undefined;
+  }
 }

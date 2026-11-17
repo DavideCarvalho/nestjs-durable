@@ -138,6 +138,26 @@ the API replaces the console with an access-denied screen.
 The console has no sign-in of its own. Sign in with your app's own authentication, and return
 `{ redirectTo: '/login' }` for a guest.
 
+### Confining a viewer to some apps
+
+On a control plane, an allow may name the tenant apps (partitions) the viewer may see:
+
+```ts
+authorize: (ctx) => {
+  const user = ctx.switchToHttp().getRequest().user;
+  if (!user) return { redirectTo: '/login' };
+  return { allowed: true, apps: user.isAdmin ? '*' : user.apps };
+},
+```
+
+`apps: '*'` (or no `apps`) is every app plus the control plane's own runs. A list confines the console
+to those apps: the run list, its counts and facets, the filter pickers, run reads and the live tail
+(another app's run answers `404`), every action including bulk ones, worker health (`<name>@<app>`
+groups) and schedules (by namespace). `/metrics` answers `403`, since its counters span every app,
+and a workflow's lifecycle page lists only the subscriptions of those apps, without the process-wide
+trigger counts. `anyAuthorize` keeps the grant
+of the form that allowed.
+
 ### A bearer token
 
 `authorizeByToken` allows a request carrying `Authorization: Bearer <token>`, compared in constant

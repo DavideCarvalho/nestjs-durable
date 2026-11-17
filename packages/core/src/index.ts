@@ -36,6 +36,7 @@ export {
 } from './run-wait';
 export * from './metrics';
 export * from './remote-event';
+export * from './run-app';
 export * from './on-error';
 export * from './origin';
 export {

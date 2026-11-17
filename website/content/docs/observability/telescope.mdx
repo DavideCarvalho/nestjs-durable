@@ -199,3 +199,41 @@ Telescope is the health and visibility view, and deep-links out: **per-run actio
 and the **workflow graph** stay in the [durable dashboard](/docs/observability/dashboard). For the
 extensions mechanism itself, see Telescope's `concepts/extensions` page in the
 [`@dudousxd/nestjs-telescope`](https://github.com/DavideCarvalho/nestjs-telescope) docs.
+
+## Observability with a control plane
+
+With `topology: 'control-plane'` and tenant pods, the control plane is the one place every tenant's
+workflow lifecycle is recorded, each event attributed to its tenant app. Only the control plane needs
+Telescope to see every app's workflows; a tenant adds Telescope only for what happens inside its steps.
+
+**Who records what.** The process that coordinates an action records its event. The control plane
+coordinates every run, so it records every run and step event of every tenant. A tenant pod has no
+local event stream (its `WorkflowEngine` is a start-only client), so it records no lifecycle entries
+and nothing is recorded twice.
+
+- **Control plane.** Every entry of a tenant's run, step entries included, is tagged
+  `app:<partition>` and carries `app` in its content. Run events name the partition; a step event's is
+  remembered from its run's events, or read from the store once for a run this process has not seen
+  yet (a run resumed after a restart). Events keep their order: a run's events wait behind that read,
+  other runs' do not. A read that fails or times out records the entry without `app` and is retried on
+  the run's next event. The control plane's own runs (no namespace, `default`, or its own
+  `namespace`/`partition`) are recorded as before, without `app`.
+- **Tenant pod.** With the watcher wired, each step handler and workflow turn still runs in its run's
+  trace, so the queries, HTTP calls and exceptions inside it carry `trace:<id>` and join the control
+  plane's lifecycle entries for that run.
+- **Diagnostics bus.** `DurableDiagnosticsModule` on a control plane emits each tenant event with
+  `app` in the payload and on the envelope (the `app` option of `@dudousxd/nestjs-diagnostics` 0.12+;
+  older versions ignore it) and with the run's trace id. On a tenant pod it emits nothing.
+- **Standalone.** Unchanged: no `app`, no extra reads.
+
+Every `durable.*` data provider takes `query.app` to show one app: the store-backed ones read that
+partition's runs (`namespace`), the worker providers keep its `<name>@<app>` groups, and the
+entry-backed ones read its `app:<app>` entries. Without it they cover every app.
+
+```ts
+{ provider: 'durable.state', query: { status: 'dead', app: 'billing-api' } }
+```
+
+To confine a viewer of the durable console to some apps, return an `apps` grant from its
+[`authorize`](/docs/observability/dashboard#confining-a-viewer-to-some-apps).
+

@@ -199,6 +199,25 @@ detach(); // stop bridging
 This is exactly what `DurableDiagnosticsModule` does on `onApplicationBootstrap` (attach) and
 `onApplicationShutdown` (call the returned `detach`).
 
+## On a control plane
+
+The process that coordinates an action emits its event. With `topology: 'control-plane'` the
+module attaches with tenant attribution: every event of a tenant's run, step events included,
+carries `app: <partition>` in its payload and on the envelope (`emit`'s `app` option, which
+`@dudousxd/nestjs-diagnostics` 0.12+ stamps and its Telescope watcher tags `app:<name>`), and is
+emitted with its run's trace id (`runTraceId(runId)`). The control plane's own runs are emitted as
+before. A tenant pod has no local event stream, so the module emits nothing there: the control plane
+emits for it. Attaching by hand, pass the attribution yourself:
+
+```ts
+import { controlPlaneAttribution } from '@dudousxd/nestjs-durable-core';
+
+const tenants = controlPlaneAttribution({ topology: 'control-plane' }, (id) => engine.getRun(id));
+const detach = attachDurableDiagnostics(engine, { tenants });
+```
+
+See [Observability with a control plane](/docs/observability/telescope#observability-with-a-control-plane).
+
 ## See also
 
 - **[OpenTelemetry](/docs/observability/otel)** — the same events as traces + metrics.

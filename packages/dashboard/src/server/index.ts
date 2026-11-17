@@ -1,4 +1,12 @@
 export * from './console-authorize.js';
+export {
+  ConsoleAppScopeInterceptor,
+  appScopedGateway,
+  currentConsoleApps,
+  grantedApps,
+  withConsoleApps,
+  type ConsoleAppGrant,
+} from './app-scope.js';
 export * from './console-shell.js';
 export { DASHBOARD_SHELL } from './tokens.js';
 export * from './dashboard.service.js';

@@ -13,9 +13,11 @@ import {
   type Type,
   UseFilters,
   UseGuards,
+  UseInterceptors,
   applyDecorators,
 } from '@nestjs/common';
 import { HttpAdapterHost, ModuleRef } from '@nestjs/core';
+import { CONSOLE_APPS, ConsoleAppScopeInterceptor, grantedApps } from './app-scope.js';
 
 // ---------------------------------------------------------------------------------------------
 // The console access contract. Every Aviary console declares these LOCALLY with identical names
@@ -26,10 +28,15 @@ import { HttpAdapterHost, ModuleRef } from '@nestjs/core';
  * What an `authorize` check answers. An allow may name who it let in (`caller`, for example
  * `'user:42'`): the dev MCP endpoint logs it as the caller of a developer tool. Never put a secret
  * in it.
+ *
+ * On a control plane an allow may also name the tenant `apps` (partitions) the viewer may see:
+ * `'*'` (or omitted) is every app plus the control plane's own runs; a list confines the console's
+ * listings, counts, facets, run reads, live tail, actions, worker health and schedules to those
+ * apps, and refuses the process-wide `/metrics`.
  */
 export type ConsoleAuthorizeResult =
   | boolean
-  | { allowed: true; caller?: string }
+  | { allowed: true; caller?: string; apps?: '*' | string[] }
   | { allowed: false; reason?: 'unauthenticated' | 'forbidden' }
   | { redirectTo: string };
 
@@ -53,7 +60,7 @@ export type ConsoleAuthorize =
   | string;
 
 export type ConsoleDecision =
-  | { allowed: true; caller?: string }
+  | { allowed: true; caller?: string; apps?: '*' | string[] }
   | { allowed: false; reason: 'unauthenticated' | 'forbidden'; redirectTo?: string };
 
 /** What a resolved `authorize` is: called once per request, never throws. */
@@ -76,8 +83,18 @@ export const CONSOLE_AUTHORIZE_MISSING_WARNING = `[${PACKAGE}] console has no \`
 
 // Factories, not shared constants: every decision is a fresh object, so a caller mutating one can
 // never change the answer for the next request.
-const allow = (caller?: string): ConsoleDecision =>
-  caller !== undefined && caller !== '' ? { allowed: true, caller } : { allowed: true };
+const allow = (caller?: string, apps?: '*' | string[]): ConsoleDecision => ({
+  allowed: true,
+  ...(caller !== undefined && caller !== '' ? { caller } : {}),
+  ...(apps !== undefined ? { apps } : {}),
+});
+
+/** An `apps` grant: `'*'`, a list of non-empty names, or `undefined` (not granted). */
+function appsGrant(value: unknown): '*' | string[] | undefined {
+  if (value === '*') return '*';
+  if (!Array.isArray(value)) return undefined;
+  return value.filter((app): app is string => typeof app === 'string' && app !== '');
+}
 const forbidden = (): ConsoleDecision => ({ allowed: false, reason: 'forbidden' });
 const unauthenticated = (): ConsoleDecision => ({ allowed: false, reason: 'unauthenticated' });
 
@@ -125,12 +142,16 @@ export function normalizeConsoleResult(result: unknown): ConsoleDecision {
     reason?: unknown;
     redirectTo?: unknown;
     caller?: unknown;
+    apps?: unknown;
   };
   if (typeof shape.redirectTo === 'string' && shape.allowed !== true) {
     return { allowed: false, reason: 'unauthenticated', redirectTo: shape.redirectTo };
   }
   if (shape.allowed === true) {
-    return allow(typeof shape.caller === 'string' ? shape.caller : undefined);
+    return allow(
+      typeof shape.caller === 'string' ? shape.caller : undefined,
+      appsGrant(shape.apps),
+    );
   }
   return shape.reason === 'unauthenticated' ? unauthenticated() : forbidden();
 }
@@ -419,7 +440,15 @@ export class ConsoleAuthorizeGuard implements CanActivate {
   async canActivate(context: ExecutionContext): Promise<boolean> {
     if (Reflect.getMetadata(CONSOLE_PUBLIC_METADATA, context.getHandler()) === true) return true;
     const decision = await this.decide(context);
-    if (decision.allowed) return true;
+    if (decision.allowed) {
+      // The viewer's app grant, for `ConsoleAppScopeInterceptor` to confine the handler to.
+      const apps = grantedApps(decision.apps);
+      if (apps !== undefined && context.getType() === 'http') {
+        const request = context.switchToHttp().getRequest<Record<symbol, unknown> | undefined>();
+        if (request) request[CONSOLE_APPS] = apps;
+      }
+      return true;
+    }
     throw new ConsoleAccessDenied(decision, isPageNavigation(context));
   }
 }
@@ -467,8 +496,12 @@ export class ConsoleAuthorizeFilter implements ExceptionFilter {
 }
 
 /**
- * The guard and its filter as one class decorator, for a console you mount yourself
- * (`routes: false`). List it ABOVE your authentication guards, so it runs after them.
+ * The guard, its filter and the app-grant scope as one class decorator, for a console you mount
+ * yourself (`routes: false`). List it ABOVE your authentication guards, so it runs after them.
  */
 export const UseConsoleAuthorize = (): ClassDecorator & MethodDecorator =>
-  applyDecorators(UseGuards(ConsoleAuthorizeGuard), UseFilters(ConsoleAuthorizeFilter));
+  applyDecorators(
+    UseGuards(ConsoleAuthorizeGuard),
+    UseFilters(ConsoleAuthorizeFilter),
+    UseInterceptors(ConsoleAppScopeInterceptor),
+  );
