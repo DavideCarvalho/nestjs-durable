@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-transport-bullmq
 
+## 0.27.0
+
+### Minor Changes
+
+- [#473](https://github.com/DavideCarvalho/nestjs-durable/pull/473) [`4225456`](https://github.com/DavideCarvalho/nestjs-durable/commit/4225456c166e073b584406f255ad5abe8b77adbd) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - New `drainDelay` (seconds) and `stalledInterval` (ms) options, forwarded to every BullMQ worker. `drainDelay` now defaults to 30 (BullMQ's default is 5): a new job still wakes an idle worker at once and a delayed job runs at its time, so this only spaces out the idle `BZPOPMIN` + `moveToActive` polls of empty queues, one pair per queue. Closing a worker is not held up by it. `stalledInterval` keeps BullMQ's default unless set.
+
 ## 0.26.0
 
 ### Minor Changes
