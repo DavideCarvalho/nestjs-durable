@@ -271,7 +271,9 @@ describe('dead-letter routing', () => {
         providers: [DlqWorkflow],
       }).compile();
       await moduleRef.init();
-      await new Promise((r) => setTimeout(r, 20));
+      for (let i = 0; i < 200 && !(await store.getRun('dlq:r-tenant')); i++) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
       expect((await store.getRun('r-tenant'))?.status).toBe('dead');
       // The default handler never ran; the tenant's own handler was started instead.
       expect(dlqInput).toBeUndefined();

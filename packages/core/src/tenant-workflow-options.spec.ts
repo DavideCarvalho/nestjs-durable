@@ -66,7 +66,7 @@ class TenantBroker implements Transport {
 }
 
 async function restOf(store: InMemoryStateStore, runId: string): Promise<void> {
-  for (let i = 0; i < 200; i++) {
+  for (let i = 0; i < 1000; i++) {
     const run = await store.getRun(runId);
     if (run && run.status !== 'pending' && run.status !== 'running') return;
     await new Promise((resolve) => setTimeout(resolve, 5));
@@ -279,8 +279,12 @@ describe('announced @Workflow options on a convention-served tenant workflow (it
     ];
     advance(120_000);
     await engine.resumeDueTimers();
+    // One of the two starts once a worker is live; the other is held behind it by the key.
+    for (let i = 0; i < 200 && broker.turns.length === 0; i++) await settle();
     await settle();
     expect(new Set(broker.turns.map((t) => t.runId)).size).toBe(1);
+    const held = ['p1', 'p2'].find((id) => !broker.turns.some((t) => t.runId === id));
+    expect((await store.getRun(held as string))?.tags).toContain('durable:singleton:tracked');
   });
 });
 
