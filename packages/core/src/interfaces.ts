@@ -1600,7 +1600,15 @@ export type RunRequestKind =
   // wire as ISO strings.
   | { kind: 'republishLifecycle'; target: RepublishLifecycleTarget }
   // Who starts whom through lifecycle events, for one workflow (no run, so no ownership check).
-  | { kind: 'workflowLifecycle'; workflow: string };
+  | { kind: 'workflowLifecycle'; workflow: string }
+  // Deliver a signal. Answered only when a run of the requester's namespace waits on `token`
+  // (`null` otherwise, and nothing is buffered), so a requester can never signal another's run.
+  | { kind: 'signal'; token: string; payload: unknown }
+  // Pause, resume or trigger a persisted schedule of the requester's namespace.
+  | { kind: 'schedule'; id: string; action: ScheduleAction };
+
+/** What a console may do to a persisted schedule over the wire (see `RunRequestKind`). */
+export type ScheduleAction = 'pause' | 'resume' | 'trigger';
 
 /** The control plane's answer to a {@link RunRequest}, correlated by `requestId`. */
 export interface RunReply {

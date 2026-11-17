@@ -19,6 +19,11 @@ import {
   DASHBOARD_BASE_PATH,
   DurableUiController,
 } from './durable-ui.controller.js';
+import {
+  DASHBOARD_FEDERATION,
+  type DurableConsoleFederation,
+  assertValidFederation,
+} from './federation.js';
 import { RUN_QUERY_ADAPTER, RunQueryAdapter } from './run-query.adapter.js';
 import { RunFilter } from './run.filter.js';
 import { DASHBOARD_DEV_TOOLS, DASHBOARD_SHELL } from './tokens.js';
@@ -146,6 +151,16 @@ export interface DurableDashboardOptions {
    * (`account.signOut`), else none. Only same-origin paths (`/x`) are ever sent to the page.
    */
   signOut?: ConsoleSignOutOption;
+  /**
+   * Make this a federated console: it also shows the runs of other apps, each kept in that app's
+   * own store and executed by that app's own engine. The console gets an app switcher and the
+   * selected app goes in the URL (`?app=<name>`); every read and action of a request is then
+   * served by that app's `gateway` (build one with `federatedAppGateway` from
+   * `@dudousxd/nestjs-durable`: reads from the app's store, actions sent to the app over its
+   * broker). An `authorize` `apps` grant names the federated apps a viewer may select. Omitted: the
+   * console shows its own app only, as before.
+   */
+  federation?: DurableConsoleFederation;
 }
 
 /** `routes: false` mounts nothing, so `decorators` would decorate nothing. Refuse it at boot. */
@@ -188,6 +203,8 @@ export class DurableApiModule {
     authorize?: ConsoleAuthorize;
     /** See {@link DurableDashboardOptions.devTools}. Default: on when the routes are mounted. */
     devTools?: boolean;
+    /** See {@link DurableDashboardOptions.federation}. */
+    federation?: DurableConsoleFederation;
   }): DynamicModule {
     const routes = options.routes !== false;
     return {
@@ -201,6 +218,7 @@ export class DurableApiModule {
         : [],
       providers: [
         DashboardService,
+        { provide: DASHBOARD_FEDERATION, useValue: options.federation ?? null },
         { provide: DASHBOARD_DEV_TOOLS, useValue: options.devTools ?? routes },
         DurableDevToolsRegistration,
         // Resolved at boot: a gate name without nestjs-authz, or a policy without
@@ -242,8 +260,8 @@ export class DurableApiModule {
       // is only exported then: exporting it from a mounted console would shadow a host's own
       // `FilterModule` runner in whatever module imports the dashboard.
       exports: routes
-        ? [DashboardService, CONSOLE_AUTHORIZE_DECIDE]
-        : [DashboardService, FilterRunner, CONSOLE_AUTHORIZE_DECIDE],
+        ? [DashboardService, CONSOLE_AUTHORIZE_DECIDE, DASHBOARD_FEDERATION]
+        : [DashboardService, FilterRunner, CONSOLE_AUTHORIZE_DECIDE, DASHBOARD_FEDERATION],
     };
   }
 }
@@ -261,6 +279,7 @@ export class DurableApiModule {
 @Module({})
 export class DurableDashboardModule {
   static forRoot(options: DurableDashboardOptions = {}): DynamicModule {
+    assertValidFederation(options.federation);
     const basePath = normalize(options.basePath ?? '/durable');
     const apiBasePath = normalize(options.apiBasePath ?? `${basePath}/api`);
     const pathProviders: Provider[] = [
@@ -280,6 +299,7 @@ export class DurableDashboardModule {
         ...(options.imports ? { imports: options.imports } : {}),
         ...(options.authorize !== undefined ? { authorize: options.authorize } : {}),
         ...(options.devTools !== undefined ? { devTools: options.devTools } : {}),
+        ...(options.federation !== undefined ? { federation: options.federation } : {}),
         routes: false,
       });
       return {
@@ -305,6 +325,7 @@ export class DurableDashboardModule {
           ...(options.decorators ? { decorators: options.decorators } : {}),
           ...(options.authorize !== undefined ? { authorize: options.authorize } : {}),
           ...(options.devTools !== undefined ? { devTools: options.devTools } : {}),
+          ...(options.federation !== undefined ? { federation: options.federation } : {}),
         }),
         RouterModule.register([
           { path: basePath, module: DurableDashboardModule }, // the UI controller below

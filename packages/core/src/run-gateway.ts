@@ -10,6 +10,7 @@ import type {
   RunValueFacetOptions,
   RunValueFacetRow,
   RunWaiting,
+  ScheduleAction,
   StepCheckpoint,
   WorkflowRun,
 } from './interfaces';
@@ -21,6 +22,7 @@ import type {
   WorkflowLifecycleLinks,
 } from './lifecycle-events';
 import type { FanPage, FanPageQuery, FanSummary } from './run-detail-summary';
+import type { ScheduleDescription, ScheduleListQuery } from './schedules';
 
 /** A run as returned by the gateway's list — the durable run plus an optional {@link RunWaiting}
  *  descriptor the control plane resolves (what a suspended run is parked on), so the dashboard can
@@ -45,6 +47,21 @@ export interface DurableTopology {
    * left out (or no object at all, as from every durable gateway) means supported.
    */
   capabilities?: ConsoleCapabilities;
+  /**
+   * Set by a federated console (see the dashboard's `federation` option): the other apps whose runs
+   * it reads, and which one the response speaks for (`current`, absent for the console's own app).
+   */
+  federation?: ConsoleFederation;
+}
+
+/** The apps a federated console can switch between (see {@link DurableTopology.federation}). */
+export interface ConsoleFederation {
+  /** How the console's own app is labelled in the switcher. */
+  local: { label: string };
+  /** The other apps, as the viewer may see them. */
+  apps: { name: string; label: string }[];
+  /** The app this answer is for; absent for the console's own app. */
+  current?: string;
 }
 
 /** See {@link DurableTopology.capabilities}. `false` hides the control; absent means supported. */
@@ -268,6 +285,25 @@ export abstract class RunGateway {
     kind: LifecycleKind,
     namespace: string,
   ): Promise<string[]>;
+  /**
+   * The persisted schedules, soonest-due first (see `WorkflowEngine.schedules`). Optional: a console
+   * reads them from its own engine unless its gateway serves another app (a federated app's gateway).
+   */
+  listSchedules?(query: ScheduleListQuery): Promise<ScheduleDescription[]>;
+  /** One persisted schedule, or null when there is none with that id. Optional, like {@link listSchedules}. */
+  getSchedule?(id: string): Promise<ScheduleDescription | null>;
+  /**
+   * Pause, resume or trigger a persisted schedule. Resolves the schedule after a pause/resume and
+   * the started run after a trigger. Optional, like {@link listSchedules}.
+   */
+  scheduleAction?(id: string, action: ScheduleAction): Promise<ScheduleDescription | RunResult>;
+  /**
+   * Deliver `payload` to the run waiting on `token` (`WorkflowEngine.signal`). Null when no run waits
+   * on it. Optional, like {@link listSchedules}.
+   */
+  signal?(token: string, payload: unknown): Promise<RunResult | null>;
+  /** The id of the run waiting on signal `token`, or null when none waits on it yet. Optional. */
+  signalWaiter?(token: string): Promise<string | null>;
   /** Live lifecycle events for one run; returns an unsubscribe fn. Framework-agnostic (no rxjs). */
   abstract subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void;
 }

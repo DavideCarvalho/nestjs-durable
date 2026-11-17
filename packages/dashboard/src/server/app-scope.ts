@@ -9,10 +9,19 @@ import type {
 import {
   type CallHandler,
   type ExecutionContext,
+  Inject,
   Injectable,
   type NestInterceptor,
+  NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { Observable } from 'rxjs';
+import {
+  DASHBOARD_FEDERATION,
+  type DurableConsoleFederation,
+  selectedAppName,
+  withFederatedApp,
+} from './federation.js';
 
 /**
  * The apps a console viewer may see on a control plane, from `authorize`'s `apps` grant (the same
@@ -47,15 +56,36 @@ export function withConsoleApps<T>(apps: readonly string[] | undefined, fn: () =
 /**
  * Runs each console handler inside the request's app grant (left on the request by the console
  * guard), so every read and action it makes is confined to those apps. A no-op without a grant.
+ *
+ * On a federated console (the dashboard's `federation` option), a request that selects another app
+ * (`x-durable-app` header or `?app=`) runs for that app instead: the app must be configured and, when
+ * the grant is a list, named in it, else the request answers 404. The grant covers the selected app
+ * as a whole, so its runs are not narrowed further by namespace.
  */
 @Injectable()
 export class ConsoleAppScopeInterceptor implements NestInterceptor {
+  constructor(
+    @Optional()
+    @Inject(DASHBOARD_FEDERATION)
+    private readonly federation?: DurableConsoleFederation | null,
+  ) {}
+
   intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
     const request =
       context.getType() === 'http'
         ? context.switchToHttp().getRequest<Record<symbol, unknown> | undefined>()
         : undefined;
     const apps = request?.[CONSOLE_APPS] as readonly string[] | undefined;
+    const selected = this.federation ? selectedAppName(request) : undefined;
+    if (selected !== undefined) {
+      const app = this.federation?.apps.find((a) => a.name === selected);
+      if (!app || (apps !== undefined && !apps.includes(selected))) {
+        throw new NotFoundException(`no app "${selected}" on this console`);
+      }
+      return new Observable((subscriber) =>
+        withFederatedApp(app, apps, () => next.handle().subscribe(subscriber)),
+      );
+    }
     if (apps === undefined) return next.handle();
     // Subscribing inside the scope runs the handler (and every async continuation it starts) in it.
     return new Observable((subscriber) =>

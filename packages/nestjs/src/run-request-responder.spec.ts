@@ -354,4 +354,94 @@ describe('RunRequestResponder', () => {
       error: { message: 'already terminal' },
     });
   });
+
+  it('acts on a schedule of the requester namespace only, and reads another one as missing', async () => {
+    const schedule = (namespace: string) =>
+      ({ id: 's1', workflow: 'wf', input: null, namespace }) as never;
+    const scheduleAction = vi.fn(async () => ({ runId: 'started', status: 'pending' }) as never);
+    const tx = fakeTransport();
+    new RunRequestResponder(
+      tx,
+      fakeGateway({ getSchedule: vi.fn(async () => schedule('beta')), scheduleAction }),
+    ).start();
+    await tx.deliver({
+      requestId: 'q1',
+      tenant: 'acme',
+      body: { kind: 'schedule', id: 's1', action: 'trigger' },
+    });
+    expect(tx.replies[0]?.result).toMatchObject({ ok: false, error: { code: 'not-found' } });
+    expect(scheduleAction).not.toHaveBeenCalled();
+
+    await tx.deliver({
+      requestId: 'q2',
+      tenant: 'beta',
+      body: { kind: 'schedule', id: 's1', action: 'trigger' },
+    });
+    expect(tx.replies[1]?.result).toEqual({
+      ok: true,
+      data: { runId: 'started', status: 'pending' },
+    });
+    expect(scheduleAction).toHaveBeenCalledWith('s1', 'trigger');
+
+    await tx.deliver({
+      requestId: 'q3',
+      tenant: 'beta',
+      body: { kind: 'schedule', id: 's1', action: 'drop' as never },
+    });
+    expect(tx.replies[2]?.result).toMatchObject({ ok: false, error: { code: 'bad-request' } });
+  });
+
+  it('signals only a run of the requester namespace, and buffers nothing for a token no run waits on', async () => {
+    const signal = vi.fn(async () => ({ runId: 'r1', status: 'running' }) as RunResult);
+    const waiters: Record<string, string> = { 'tok-acme': 'r1', 'tok-beta': 'r2' };
+    const tx = fakeTransport();
+    new RunRequestResponder(
+      tx,
+      fakeGateway({
+        getRun: vi.fn(async (id: string) => fakeRun(id, id === 'r1' ? 'acme' : 'beta')),
+        signalWaiter: vi.fn(async (token: string) => waiters[token] ?? null),
+        signal,
+      }),
+    ).start();
+
+    for (const token of ['tok-beta', 'tok-nobody']) {
+      await tx.deliver({
+        requestId: token,
+        tenant: 'acme',
+        body: { kind: 'signal', token, payload: 1 },
+      });
+    }
+    expect(tx.replies.map((r) => r.result)).toEqual([
+      { ok: true, data: null },
+      { ok: true, data: null },
+    ]);
+    expect(signal).not.toHaveBeenCalled();
+
+    await tx.deliver({
+      requestId: 'q3',
+      tenant: 'acme',
+      body: { kind: 'signal', token: 'tok-acme', payload: 1 },
+    });
+    expect(signal).toHaveBeenCalledWith('tok-acme', 1);
+    expect(tx.replies[2]?.result).toEqual({ ok: true, data: { runId: 'r1', status: 'running' } });
+  });
+
+  it('answers a signal or schedule request unsupported when its gateway cannot serve it', async () => {
+    const tx = fakeTransport();
+    new RunRequestResponder(tx, fakeGateway()).start();
+    await tx.deliver({
+      requestId: 'q1',
+      tenant: 'acme',
+      body: { kind: 'signal', token: 't', payload: null },
+    });
+    await tx.deliver({
+      requestId: 'q2',
+      tenant: 'acme',
+      body: { kind: 'schedule', id: 's', action: 'pause' },
+    });
+    expect(tx.replies.map((r) => r.result)).toMatchObject([
+      { ok: false, error: { code: 'unsupported-request' } },
+      { ok: false, error: { code: 'unsupported-request' } },
+    ]);
+  });
 });

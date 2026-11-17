@@ -17,6 +17,7 @@ import type {
 import { BadRequestException, Injectable, type Type } from '@nestjs/common';
 import { appScopedGateway, currentConsoleApps } from './app-scope.js';
 import { ATTRIBUTE_FIELD, DURABLE_RUN_FIELDS, DurableRun, runValueAxisFor } from './durable-run.js';
+import { currentFederatedApp } from './federation.js';
 import { RunQueryDraft } from './run-query-draft.js';
 
 /** DI token for {@link RunQueryAdapter} — named on `@Filterable({ adapter })` so the run filter uses
@@ -98,6 +99,8 @@ export class RunQueryAdapter implements FilterAdapter {
 
   /** The gateway for this request, confined to the viewer's apps when `authorize` granted a list. */
   private get gateway(): RunGateway {
+    const federated = currentFederatedApp();
+    if (federated) return federated.gateway;
     const apps = currentConsoleApps();
     return apps ? appScopedGateway(this.runGateway, apps) : this.runGateway;
   }

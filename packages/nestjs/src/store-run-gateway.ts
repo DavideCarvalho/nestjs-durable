@@ -24,6 +24,9 @@ import {
   type RunWaiting,
   STATE_STORE_CANONICAL,
   SUMMARY_CHILD_LIMIT,
+  type ScheduleAction,
+  type ScheduleDescription,
+  type ScheduleListQuery,
   type StateStore,
   WorkflowEngine,
   type WorkflowLifecycleLinks,
@@ -387,6 +390,32 @@ export class StoreRunGateway implements RunGateway {
 
   republishLifecycle(target: RepublishLifecycleTarget): Promise<RepublishLifecycleResult> {
     return this.engine.republishLifecycle(target);
+  }
+
+  /** The persisted schedules (`[]` when the store does not persist them). */
+  async listSchedules(query: ScheduleListQuery): Promise<ScheduleDescription[]> {
+    return this.engine.schedules?.supported ? this.engine.schedules.list(query) : [];
+  }
+
+  async getSchedule(id: string): Promise<ScheduleDescription | null> {
+    if (!this.engine.schedules?.supported) return null;
+    return (await this.engine.schedules.get(id)) ?? null;
+  }
+
+  scheduleAction(id: string, action: ScheduleAction): Promise<ScheduleDescription | RunResult> {
+    if (action === 'pause') return this.engine.schedules.pause(id);
+    if (action === 'resume') return this.engine.schedules.resume(id);
+    if (action === 'trigger') return this.engine.schedules.trigger(id);
+    return Promise.reject(new Error(`unknown schedule action ${String(action)}`));
+  }
+
+  signal(token: string, payload: unknown): Promise<RunResult | null> {
+    return this.engine.signal(token, payload);
+  }
+
+  async signalWaiter(token: string): Promise<string | null> {
+    const waiter = (await this.store.listSignalWaiters(token)).find((w) => w.token === token);
+    return waiter?.runId ?? null;
   }
 
   /**
