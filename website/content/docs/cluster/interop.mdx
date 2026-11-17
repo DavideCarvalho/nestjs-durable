@@ -20,6 +20,7 @@ Interop rides the [BullMQ transport](/docs/transports/bullmq). The control-plane
 | Purpose | Channel | Mechanism |
 |---------|---------|-----------|
 | Task dispatch (step + workflow) | `${P}-tasks-${token}` | BullMQ queue |
+| Step dispatch with `taskQueues: 'grouped'` (NestJS and Adonis; not the Python worker) | `${P}-taskgroup` (`${P}-taskgroup@${partition}` for a partitioned token) | BullMQ queue shared by every handler of the partition, routed by the job's `group` |
 | Step result | `${P}-results` | queue |
 | Step results, batched (Node and Python workers, while an engine reads them) | `${P}-results-batch` | queue, job data `{ results: StepResult[] }` |
 | Step result for one engine (a task stamped `replyTo`, while that engine is alive) | `${P}-results-to-${instance}` | queue, one `StepResult` or `{ results: StepResult[] }` |
