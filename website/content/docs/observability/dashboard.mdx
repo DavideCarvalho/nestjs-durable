@@ -512,6 +512,10 @@ action is scoped to precisely the set the list was showing, unattributed runs in
   MikroORM and TypeORM adapters add it on boot, and Prisma emits it through Migrate.
 </Callout>
 
+### Filters in the URL
+
+The board's filters live in the URL, so copy the link to share a filtered view, bookmark it or reload it. `/durable#?status=failed&tag=vip` opens the board on failed runs tagged `vip`, `/durable#/run/<id>?status=failed` opens a run with that filter kept, and Back/Forward step through your picks. The params are `status`, `tag`, `namespace`, `attr` (comma-separated sets) and `origin` (a package name, or `(app)` for the app's own runs). A filter at its default is left out, so plain `#/run/<id>` links open as before, and the filters still survive a trip to Workers and back.
+
 ### At scale: paging, facets and what the numbers mean
 
 A control plane accumulates runs for as long as its retention policy keeps them, so "list the runs" is
