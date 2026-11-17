@@ -5,6 +5,7 @@ import { readShellConfig } from '../aviary-kit/shell-config';
 import { AppShell, type NavSection, PageBody } from '../aviary-kit/shell/app-shell';
 import { splitHash, subscribeHashUrl } from '../aviary-kit/url-state/hash-url';
 import { NuqsHashAdapter } from '../aviary-kit/url-state/nuqs-hash-adapter';
+import { AppSelector } from './AppSelector';
 import { SchedulesPanel } from './SchedulesPanel';
 import { WorkflowPage } from './WorkflowLifecycle';
 import { supports, useTopology } from './capabilities';
@@ -178,7 +179,12 @@ function Console() {
       title={title}
       searchPlaceholder="Search runs, workflows, media, threads…"
       contentClassName={route.page === 'runs' ? 'overflow-hidden' : undefined}
-      actions={<LiveIndicator />}
+      actions={
+        <>
+          <AppSelector />
+          <LiveIndicator />
+        </>
+      }
     >
       <ErrorBoundary label={TITLES[route.page]} resetKeys={[route.page]}>
         {route.page === 'workflow' ? (

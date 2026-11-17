@@ -4,6 +4,7 @@
   "pages": [
     "index",
     "dashboard",
+    "federated-console",
     "otel",
     "metrics",
     "telescope",

@@ -69,6 +69,12 @@ export interface DurableTopology {
   engine?: string;
   /** Features the server cannot serve, as `false`; the SPA hides their controls. */
   capabilities?: ConsoleCapabilities;
+  /** Mirrors core's `ConsoleFederation`: the apps a federated console switches between. */
+  federation?: {
+    local: { label: string };
+    apps: { name: string; label: string }[];
+    current?: string;
+  };
 }
 
 /** Mirrors core's `ConsoleCapabilities`: `false` hides a control, absent means supported. */
@@ -539,8 +545,31 @@ async function denyAccess(res: Response): Promise<never> {
   throw new ConsoleAccessError(status);
 }
 
+/** The query parameter a federated console names the selected app in (see `selectedApp`). */
+export const APP_PARAM = 'app';
+
+/**
+ * The app a federated console shows, from the page URL (`?app=<name>`), or undefined for the
+ * console's own app. Every API call names it in the `x-durable-app` header (the SSE stream, which
+ * can't send headers, as `?app=`), and the server serves the call from that app.
+ */
+export function selectedApp(): string | undefined {
+  if (typeof window === 'undefined') return undefined;
+  const app = new URLSearchParams(window.location.search).get(APP_PARAM);
+  return app ? app : undefined;
+}
+
+/** `init` with the selected app's header added (unchanged when no app is selected). */
+function withApp(init: RequestInit | undefined): RequestInit | undefined {
+  const app = selectedApp();
+  if (app === undefined) return init;
+  const headers = new Headers(init?.headers);
+  headers.set('x-durable-app', app);
+  return { ...init, headers };
+}
+
 async function http<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(apiBase() + path, init);
+  const res = await fetch(apiBase() + path, withApp(init));
   if (res.status === 401 || res.status === 403) return denyAccess(res);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as T;
@@ -754,7 +783,12 @@ export const durableClient = {
    * returns a function to close the stream. Cross-pod when the server transport has a control plane.
    */
   streamRun(id: string, onEvent: (event: EngineEvent) => void): () => void {
-    const source = new EventSource(`${apiBase()}/runs/${encodeURIComponent(id)}/stream`);
+    const app = selectedApp();
+    const source = new EventSource(
+      `${apiBase()}/runs/${encodeURIComponent(id)}/stream${
+        app !== undefined ? `?${APP_PARAM}=${encodeURIComponent(app)}` : ''
+      }`,
+    );
     source.onmessage = (msg) => {
       try {
         onEvent(JSON.parse(msg.data) as EngineEvent);

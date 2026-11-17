@@ -41,6 +41,8 @@ const KNOWN_KINDS: ReadonlySet<string> = new Set<RunRequestKind['kind']>([
   'waitingFor',
   'republishLifecycle',
   'workflowLifecycle',
+  'signal',
+  'schedule',
 ]);
 
 /** A wire `since`/`until` (an ISO string after JSON) back to a `Date`. */
@@ -287,6 +289,44 @@ export class RunRequestResponder {
       return { requestId: msg.requestId, result: { ok: true, data } };
     }
 
+    if (body.kind === 'schedule') {
+      // Not runId-bearing: the schedule's own namespace is checked against the requester's, so a
+      // requester can only pause, resume or trigger the schedules of its own namespace.
+      const { getSchedule, scheduleAction } = this.gateway;
+      if (!getSchedule || !scheduleAction) return unsupported(msg.requestId, body.kind);
+      if (body.action !== 'pause' && body.action !== 'resume' && body.action !== 'trigger') {
+        return badRequest(msg.requestId, `unknown schedule action ${JSON.stringify(body.action)}`);
+      }
+      const schedule = await getSchedule.call(this.gateway, body.id);
+      if (!schedule || schedule.namespace !== msg.tenant) {
+        // Another namespace's schedule reads as missing: its existence is not the requester's to learn.
+        return {
+          requestId: msg.requestId,
+          result: {
+            ok: false,
+            error: { message: `schedule "${body.id}" not found`, code: 'not-found' },
+          },
+        };
+      }
+      return this.answer(msg.requestId, () =>
+        scheduleAction.call(this.gateway, body.id, body.action),
+      );
+    }
+
+    if (body.kind === 'signal') {
+      // A token names no run, so the run waiting on it is looked up and checked like a runId-bearing
+      // verb. A token no run waits on yet is answered `null` and NOT buffered: buffering would let a
+      // requester plant a payload for a wait another namespace opens later.
+      const { signal, signalWaiter } = this.gateway;
+      if (!signal || !signalWaiter) return unsupported(msg.requestId, body.kind);
+      const waiterRunId = await signalWaiter.call(this.gateway, body.token);
+      const waiter = waiterRunId ? await this.runOf(waiterRunId) : null;
+      if (!waiter || waiter.namespace !== msg.tenant) {
+        return { requestId: msg.requestId, result: { ok: true, data: null } };
+      }
+      return this.answer(msg.requestId, () => signal.call(this.gateway, body.token, body.payload));
+    }
+
     if (body.kind === 'republishLifecycle' && !this.gateway.republishLifecycle) {
       return unsupported(msg.requestId, body.kind);
     }
@@ -343,6 +383,25 @@ export class RunRequestResponder {
     } catch (err) {
       return {
         requestId: msg.requestId,
+        result: { ok: false, error: { message: err instanceof Error ? err.message : String(err) } },
+      };
+    }
+  }
+
+  /** The run alone (`getRun`, else from its detail), or null when it does not exist. */
+  private async runOf(runId: string) {
+    return this.gateway.getRun
+      ? this.gateway.getRun(runId)
+      : ((await this.gateway.getRunDetail(runId))?.run ?? null);
+  }
+
+  /** `call`'s result as an `ok` reply, or its rejection as an error reply. */
+  private async answer(requestId: string, call: () => Promise<unknown>): Promise<RunReply> {
+    try {
+      return { requestId, result: { ok: true, data: await call() } };
+    } catch (err) {
+      return {
+        requestId,
         result: { ok: false, error: { message: err instanceof Error ? err.message : String(err) } },
       };
     }
@@ -422,6 +481,8 @@ export class RunRequestResponder {
       | { kind: 'workerHealth' }
       | { kind: 'waitingFor' }
       | { kind: 'workflowLifecycle' }
+      | { kind: 'signal' }
+      | { kind: 'schedule' }
     >,
   ): Promise<unknown> {
     switch (body.kind) {
@@ -454,6 +515,8 @@ function runIdOf(
     | { kind: 'workerHealth' }
     | { kind: 'waitingFor' }
     | { kind: 'workflowLifecycle' }
+    | { kind: 'signal' }
+    | { kind: 'schedule' }
   >,
 ): string {
   if (body.kind !== 'republishLifecycle') return body.runId;

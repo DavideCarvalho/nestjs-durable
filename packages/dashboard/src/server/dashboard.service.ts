@@ -38,6 +38,13 @@ import {
 } from '@nestjs/common';
 import { Observable } from 'rxjs';
 import { appScopedGateway, currentConsoleApps, namespaceInApps } from './app-scope.js';
+import {
+  DASHBOARD_FEDERATION,
+  type DurableConsoleFederation,
+  currentFederatedApp,
+  describeFederation,
+  federatedGrant,
+} from './federation.js';
 import { listRunsAndCount } from './run-query.adapter.js';
 
 // Single source of truth: core owns `RunDetail` (`run-gateway.ts`) — re-exported here (not
@@ -73,6 +80,9 @@ export class DashboardService {
     private readonly gateway: RunGateway,
     @Optional() @Inject(STATE_STORE_CANONICAL) private readonly store?: StateStore,
     @Optional() private readonly engine?: WorkflowEngine,
+    @Optional()
+    @Inject(DASHBOARD_FEDERATION)
+    private readonly federation?: DurableConsoleFederation | null,
   ) {
     // Only the control plane (which has the canonical store) has a FULL engine to accumulate from;
     // on a tenant `this.engine` is a store-less start client with no `subscribe`, so guard on store.
@@ -84,6 +94,9 @@ export class DashboardService {
    * (see `ConsoleAppGrant`), the whole gateway otherwise.
    */
   private gw(): RunGateway {
+    // A federated app's gateway: the viewer's grant already admitted the whole app.
+    const federated = currentFederatedApp();
+    if (federated) return federated.gateway;
     const apps = currentConsoleApps();
     return apps ? appScopedGateway(this.gateway, apps) : this.gateway;
   }
@@ -96,6 +109,7 @@ export class DashboardService {
 
   /** A confined viewer may touch schedule `id` only when it is in one of its apps: else a 404. */
   private async assertScheduleVisible(id: string): Promise<void> {
+    if (currentFederatedApp()) return; // the app's own gateway answers a missing schedule
     const apps = currentConsoleApps();
     if (apps === undefined) return;
     const schedule = await this.engine?.schedules?.get(id);
@@ -113,6 +127,13 @@ export class DashboardService {
    * on engine presence, which is truthy on a tenant too).
    */
   private controlPlane(): { store: StateStore; engine: WorkflowEngine } {
+    const federated = currentFederatedApp();
+    if (federated) {
+      // The console's own engine never acts on another app's runs.
+      throw new NotImplementedException(
+        `This durable dashboard operation is not available for the federated app "${federated.name}".`,
+      );
+    }
     if (!this.store || !this.engine) {
       // A 501, not a 500: a tenant is a supported deployment that simply doesn't serve this
       // operation (a third-party webhook POSTed to a tenant must go to the control plane).
@@ -129,6 +150,8 @@ export class DashboardService {
    * panel instead of special-casing either.
    */
   async listSchedules(query: ScheduleListQuery): Promise<ScheduleDescription[]> {
+    const federated = currentFederatedApp();
+    if (federated) return (await federated.gateway.listSchedules?.(query)) ?? [];
     if (!this.store || !this.engine?.schedules?.supported) return [];
     const apps = currentConsoleApps();
     if (apps === undefined) return this.engine.schedules.list(query);
@@ -150,6 +173,8 @@ export class DashboardService {
 
   /** Pause a persisted schedule (control plane only). */
   pauseSchedule(id: string): Promise<ScheduleDescription> {
+    const federated = this.federatedSchedules();
+    if (federated) return federated(id, 'pause') as Promise<ScheduleDescription>;
     // Synchronous on a tenant: the 501 is thrown, not rejected.
     const { engine } = this.controlPlane();
     return this.assertScheduleVisible(id).then(() => engine.schedules.pause(id));
@@ -157,6 +182,8 @@ export class DashboardService {
 
   /** Resume a persisted schedule from its next window (control plane only). */
   resumeSchedule(id: string): Promise<ScheduleDescription> {
+    const federated = this.federatedSchedules();
+    if (federated) return federated(id, 'resume') as Promise<ScheduleDescription>;
     // Synchronous on a tenant: the 501 is thrown, not rejected.
     const { engine } = this.controlPlane();
     return this.assertScheduleVisible(id).then(() => engine.schedules.resume(id));
@@ -164,9 +191,26 @@ export class DashboardService {
 
   /** Start one run of a persisted schedule now, outside its cadence (control plane only). */
   triggerSchedule(id: string): Promise<RunResult> {
+    const federated = this.federatedSchedules();
+    if (federated) return federated(id, 'trigger') as Promise<RunResult>;
     // Synchronous on a tenant: the 501 is thrown, not rejected.
     const { engine } = this.controlPlane();
     return this.assertScheduleVisible(id).then(() => engine.schedules.trigger(id));
+  }
+
+  /** The federated app's schedule actions, when the request is for one (else undefined). */
+  private federatedSchedules():
+    | ((id: string, action: 'pause' | 'resume' | 'trigger') => Promise<unknown>)
+    | undefined {
+    const federated = currentFederatedApp();
+    if (!federated) return undefined;
+    const { gateway } = federated;
+    if (!gateway.scheduleAction) {
+      throw new NotImplementedException(
+        `The federated app "${federated.name}" does not serve schedule actions.`,
+      );
+    }
+    return (id, action) => gateway.scheduleAction?.(id, action) as Promise<unknown>;
   }
 
   /**
@@ -241,7 +285,14 @@ export class DashboardService {
    *  badge. Routes through the gateway, which knows its own topology (store-backed = operator, proxy =
    *  tenant). Works on both topologies (no store/engine needed). */
   topology(): DurableTopology {
-    return this.gw().topology();
+    const topology = this.gw().topology();
+    if (!this.federation) return topology;
+    const federated = currentFederatedApp();
+    const grant = federated ? federatedGrant() : currentConsoleApps();
+    return {
+      ...topology,
+      federation: describeFederation(this.federation, grant, federated?.name),
+    };
   }
 
   /** Per-group worker health (queue backlog + live worker heartbeats) for the Workers panel. The
@@ -309,8 +360,8 @@ export class DashboardService {
   private triggerCountsOf(
     links: WorkflowLifecycleLinks,
   ): Record<string, { triggered: number; failed: number }> | undefined {
-    // Process-wide counters span every app.
-    if (currentConsoleApps() !== undefined) return undefined;
+    // Process-wide counters span every app, and count this process's engine only.
+    if (currentConsoleApps() !== undefined || currentFederatedApp()) return undefined;
     const snapshot = this.metricsCollector?.snapshot();
     if (!snapshot || links.startsOnSettle.length === 0) return undefined;
     const triggered = snapshot.triggeredBySubscriber[links.workflow] ?? {};
@@ -393,6 +444,10 @@ export class DashboardService {
    * `schedules` (persisted schedules). Both are false on a store-less tenant.
    */
   capabilities(): { controlPlane: boolean; schedules: boolean } {
+    const federated = currentFederatedApp();
+    if (federated) {
+      return { controlPlane: false, schedules: federated.gateway.listSchedules !== undefined };
+    }
     const controlPlane = this.store !== undefined && this.engine !== undefined;
     return { controlPlane, schedules: controlPlane && this.engine?.schedules?.supported === true };
   }
@@ -419,6 +474,15 @@ export class DashboardService {
    * Control-plane-only.
    */
   signal(token: string, payload: unknown): Promise<RunResult | null> {
+    const federated = currentFederatedApp();
+    if (federated) {
+      if (!federated.gateway.signal) {
+        throw new NotImplementedException(
+          `The federated app "${federated.name}" does not serve signals.`,
+        );
+      }
+      return federated.gateway.signal(token, payload);
+    }
     return this.controlPlane().engine.signal(token, payload);
   }
 

@@ -1,0 +1,145 @@
+---
+title: Federated console
+description: One durable console on a central app that shows the runs of several apps. Each app keeps its own store and executes its own runs; the console reads their stores and sends actions to them over their brokers.
+icon: Network
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+A federated console is one [dashboard](/docs/observability/dashboard) mounted on a central app (a
+"hub") that also shows the workflows of other apps. Nothing moves: each app keeps its runs in its own
+store (its own database, or its own schema in a shared one) and keeps executing them with its own
+engine. The hub's console:
+
+- **reads** each app's store directly, through a store adapter with read-only database access;
+- **sends actions** (cancel, retry, continue, retry with input, redispatch, republish, signal,
+  pause/resume/trigger a schedule) to the app over the app's broker, where the app's engine executes
+  them. The hub never drives, recovers or executes another app's run;
+- **live-tails** an app's run on the app's control channel, the broadcast its engines already publish
+  every lifecycle event on.
+
+The console gets an app switcher in its header, and the selected app is in the URL
+(`/durable?app=orders`), so a link opens the same app's view. No `?app=` is the hub's own app.
+
+Use it when the apps already run durable on their own (`standalone`, each with a store and a broker
+transport) and you want one place to watch and operate all of them, without a data migration or a
+change to how they run. If you want the apps to run through a shared control plane instead, see
+[roles and config](/docs/cluster/roles-and-config).
+
+## Set it up on the hub
+
+For each app, build a gateway with `federatedAppGateway` from `@dudousxd/nestjs-durable` and pass
+them to `DurableDashboardModule.forRoot({ federation })`:
+
+```ts title="hub/app.module.ts"
+import { DurableModule, federatedAppGateway } from '@dudousxd/nestjs-durable';
+import { DurableDashboardModule } from '@dudousxd/nestjs-durable-dashboard';
+import { DrizzlePgStateStore } from '@dudousxd/nestjs-durable-store-drizzle/pg';
+import { BullMQTransport } from '@dudousxd/nestjs-durable-transport-bullmq';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { Pool } from 'pg';
+
+// The hub reads the apps' schemas as `hub_console`, a database user with SELECT only (see below).
+const readOnly = drizzle(new Pool({ connectionString: process.env.HUB_CONSOLE_DATABASE_URL }));
+const redis = { host: process.env.REDIS_HOST, port: 6379 };
+
+function app(name: string, label: string) {
+  return {
+    name,
+    label,
+    gateway: federatedAppGateway({
+      // Reads: the app's own schema.
+      store: new DrizzlePgStateStore(readOnly, { schema: `${name}_durable` }),
+      // Actions and live events: the app's broker, on the app's own prefix.
+      transport: new BullMQTransport({ connection: redis, prefix: `${name}-durable` }),
+    }),
+  };
+}
+
+@Module({
+  imports: [
+    DurableModule.forRoot({ store: hubStore, transport: hubTransport }),
+    DurableDashboardModule.forRoot({
+      authorize: consoleAccess,
+      federation: {
+        localLabel: 'Hub',
+        apps: [app('orders', 'Orders'), app('billing', 'Billing')],
+      },
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+- `store` is any store adapter pointed at the app's data. The console only reads through it; it never
+  calls `ensureSchema` on it, and no engine drives it.
+- `transport` must be a transport on the app's broker **with the app's prefix**, and dedicated to this
+  gateway (not the hub's own transport). The gateway publishes run requests on it and subscribes to
+  the replies and to the app's control channel. It consumes none of the app's queues, so it never
+  takes the app's work.
+- `tenantToken` (optional) is for an app whose engine authenticates requesters with `verifyTenant`
+  (see [authenticate tenants](/docs/cluster/authenticate-tenants)): `(namespace) =>
+  signTenantToken(namespace, secret)` signs every action with the app's secret.
+- `timeoutMs` (default 10 s) bounds how long an action waits for the app to answer.
+
+## What each app needs
+
+Nothing to configure. An app whose `DurableModule` has a `store` and a broker transport that carries
+run requests (BullMQ) already answers them: the same responder that serves a `tenant` process
+answers the hub. Each action names the namespace of the run it acts on, and the app checks the run
+against it before acting, exactly as it checks a tenant's request. An app with `verifyTenant` rejects
+an action the hub did not sign with its secret.
+
+The app must run a release of `@dudousxd/nestjs-durable` that knows the `signal` and `schedule`
+requests for those two actions; an older one answers them as unsupported (the console shows a 501),
+while every run action works with older releases too. At least one of the app's instances must drive
+(the default; `drive: false` instances don't answer).
+
+## Database grants
+
+The hub reads each app's tables and writes none. Give it a user of its own with `SELECT` only:
+
+```sql
+CREATE ROLE hub_console LOGIN PASSWORD '...';
+
+-- Once per app schema:
+GRANT USAGE ON SCHEMA orders_durable TO hub_console;
+GRANT SELECT ON ALL TABLES IN SCHEMA orders_durable TO hub_console;
+-- Tables the app's migrations add later:
+ALTER DEFAULT PRIVILEGES FOR ROLE orders_app IN SCHEMA orders_durable
+  GRANT SELECT ON TABLES TO hub_console;
+```
+
+`orders_app` is the role that owns the app's durable tables (the one its migrations run as). Run the
+same three statements for every app schema. With MySQL, `GRANT SELECT ON orders_durable.* TO
+'hub_console'@'%'`.
+
+<Callout type="info">
+Read access is what the console needs; it is also all the hub's database user should have. Every
+change to an app's runs goes through the app's own engine, which keeps its invariants (leases,
+checkpoints, the cancel cascade) in one place.
+</Callout>
+
+## Who sees which app
+
+`authorize` decides access as it does for any console. Its `apps` grant names the apps a viewer may
+select: `{ allowed: true, apps: ['orders'] }` shows the switcher with Orders only, and a request for
+another app answers 404. The grant admits the whole selected app: its runs are not narrowed further.
+`'*'` (or no `apps`) is every app. A list confines the hub's own runs to those namespaces, as before,
+so a grant that names federated apps only shows no runs of the hub itself.
+
+## The selected app on the wire
+
+The console's client names the selected app in the `x-durable-app` header of every API call, and as
+`?app=` on the live stream (an `EventSource` sends no headers). Any API client can do the same:
+
+```bash
+curl -H 'x-durable-app: orders' https://hub.example.com/durable/api/runs?filter[status]=failed
+```
+
+## What stays local
+
+Operations that need the hub's own engine answer 501 for a federated app: the Prometheus `/metrics`
+(scrape each app instead), `ctx.setEvent` live queries and `ctx.onUpdate` updates, and webhook
+callbacks (a webhook URL is always the app's own). Workflow lifecycle trigger counts are not shown
+for a federated app, since they are counted by the process that runs the workflow.

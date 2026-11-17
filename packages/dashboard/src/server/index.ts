@@ -44,3 +44,12 @@ export {
   type VisibleConsole,
   type VisibleConsoles,
 } from './console-switcher.js';
+// Federated console: one console showing several apps' runs (see `federation`).
+export {
+  DASHBOARD_FEDERATION,
+  FEDERATED_APP_HEADER,
+  FEDERATED_APP_PARAM,
+  currentFederatedApp,
+  type DurableConsoleFederation,
+  type FederatedConsoleApp,
+} from './federation.js';

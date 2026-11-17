@@ -14,6 +14,7 @@ export type {
   TenantVerifierOption,
 } from './tenant-contracts';
 export * from './entity';
+export * from './federated-app-gateway';
 export * from './in-app-worker';
 export * from './proxy-run-gateway';
 export * from './role';
