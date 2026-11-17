@@ -1,4 +1,5 @@
 import type { DurableWorkerRuntime } from '@dudousxd/durable-worker';
+import { type AnnouncedWorkflowOptions, parseDuration } from '@dudousxd/nestjs-durable-core';
 import type { MetadataScanner } from '@nestjs/core';
 import { type WorkflowMeta, getOnEvents } from './decorators';
 import type { WorkflowInstance } from './discovery-helpers';
@@ -18,6 +19,8 @@ export function registerOnRuntime(
   meta: WorkflowMeta,
   instance: WorkflowInstance,
   origin: string | undefined,
+  /** The workflow its dead-lettered runs route to, announced so a control plane starts it. */
+  deadLetter?: string,
 ): void {
   const { handlers, routes } = onErrorHandlersOf(meta, instance, scanner);
   const announced = {
@@ -46,6 +49,30 @@ export function registerOnRuntime(
         }
       : {}),
     ...(subscribes.length > 0 ? { subscribes } : {}),
+    ...announcedOptions(meta),
+    ...(deadLetter !== undefined ? { deadLetter } : {}),
   });
   for (const [name, fn] of handlers) runtime.registerWorkflow(name, fn, announced);
+}
+
+/**
+ * The `@Workflow` options a worker announces (see `WorkflowRegistration.options`): the data ones a
+ * control plane serving the workflow by convention applies. `{}` when the decorator states none, so
+ * such a registration keeps its pre-options bytes and hash.
+ */
+export function announcedOptions(meta: WorkflowMeta): { options?: AnnouncedWorkflowOptions } {
+  const options: AnnouncedWorkflowOptions = {};
+  if (meta.tags !== undefined && meta.tags.length > 0) options.tags = [...meta.tags];
+  if (meta.executionTimeout !== undefined) {
+    options.executionTimeoutMs = parseDuration(meta.executionTimeout);
+  }
+  if (meta.singleton !== undefined) {
+    options.singleton = {
+      ...(meta.singleton.limit !== undefined ? { limit: meta.singleton.limit } : {}),
+      ...(meta.singleton.maxQueueDepth !== undefined
+        ? { maxQueueDepth: meta.singleton.maxQueueDepth }
+        : {}),
+    };
+  }
+  return Object.keys(options).length > 0 ? { options } : {};
 }

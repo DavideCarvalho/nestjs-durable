@@ -27,6 +27,9 @@ import {
   type ScheduleAction,
   type ScheduleDescription,
   type ScheduleListQuery,
+  type SignalOptions,
+  type StartOptions,
+  type StartRunMessage,
   type StateStore,
   WorkflowEngine,
   type WorkflowLifecycleLinks,
@@ -409,8 +412,21 @@ export class StoreRunGateway implements RunGateway {
     return Promise.reject(new Error(`unknown schedule action ${String(action)}`));
   }
 
-  signal(token: string, payload: unknown): Promise<RunResult | null> {
-    return this.engine.signal(token, payload);
+  signal(token: string, payload: unknown, opts?: SignalOptions): Promise<RunResult | null> {
+    return this.engine.signal(token, payload, opts);
+  }
+
+  signalWithStartForTenant(
+    start: StartRunMessage & { runId: string },
+    namespace: string,
+    clientTenant: Pick<StartOptions, 'tenantId' | 'tenantKind'>,
+    signal: { token: string; payload?: unknown },
+  ): Promise<{ runId: string; signalled: boolean }> {
+    return this.engine.signalWithStartForTenant(start, namespace, clientTenant, signal);
+  }
+
+  publishEventForTenant(name: string, payload: unknown, namespace: string): Promise<number> {
+    return this.engine.publishEventForTenant(name, payload, namespace);
   }
 
   async signalWaiter(token: string): Promise<string | null> {

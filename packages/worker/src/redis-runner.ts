@@ -560,6 +560,8 @@ export interface StartRunOptions {
   startAt?: number | Date | undefined;
   /** A start-time concurrency quota, checked on the control plane (see {@link StartRunMessage.concurrency}). */
   concurrency?: StartRunMessage['concurrency'];
+  /** The workflow's singleton key, evaluated by the caller (see {@link StartRunMessage.singleton}). */
+  singleton?: StartRunMessage['singleton'];
   /** Queue key prefix. Defaults to `'durable'` (matches `BullMQTransport` default). */
   prefix?: string | undefined;
   /**
@@ -615,6 +617,7 @@ export async function startRun(connection: RedisConnection, opts: StartRunOption
     msg.startAt = opts.startAt instanceof Date ? opts.startAt.getTime() : opts.startAt;
   }
   if (opts.concurrency !== undefined) msg.concurrency = opts.concurrency;
+  if (opts.singleton !== undefined) msg.singleton = opts.singleton;
   try {
     await queue.add('startRun', msg, { removeOnComplete: true, removeOnFail: true });
   } finally {

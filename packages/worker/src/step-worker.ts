@@ -1,4 +1,9 @@
-import type { RemoteTask, StepEvent, StepResult } from '@dudousxd/nestjs-durable-core';
+import type {
+  RemoteTask,
+  StepEvent,
+  StepInterceptor,
+  StepResult,
+} from '@dudousxd/nestjs-durable-core';
 import {
   createStepLogger,
   runDurableExecution,
@@ -22,8 +27,23 @@ export type StepHandler<I = unknown, O = unknown> = (input: I, log: StepLog) => 
  */
 export class StepWorker {
   private readonly handlers = new Map<string, StepHandler>();
+  private readonly interceptors: StepInterceptor[] = [];
 
   constructor(readonly group = 'steps') {}
+
+  /**
+   * Wrap every step handler this worker runs with `interceptor` (the engine's `engine.use`
+   * contract: call `next()` to run the handler, return or transform its result, throw to fail the
+   * step). First registered runs outermost. The invocation's `workflow` is `''`: a dispatched step
+   * task does not carry its workflow's name. Returns an unregister function.
+   */
+  use(interceptor: StepInterceptor): () => void {
+    this.interceptors.push(interceptor);
+    return () => {
+      const i = this.interceptors.indexOf(interceptor);
+      if (i >= 0) this.interceptors.splice(i, 1);
+    };
+  }
 
   /** Register `handler` as the step `name`. `handler(input, log)`. */
   register<I = unknown, O = unknown>(name: string, handler: StepHandler<I, O>): this {
@@ -77,7 +97,9 @@ export class StepWorker {
         },
         // A handler is not the workflow body: never let an in-process caller's ambient ctx leak in.
         async () =>
-          runOutsideWorkflowCtx(() => runInStepLogger(log, () => handler(task.input, log))),
+          runOutsideWorkflowCtx(() =>
+            runInStepLogger(log, () => this.intercepted(task, () => handler(task.input, log))),
+          ),
       );
       const result: StepResult = { ...base, status: 'completed', output };
       if (events.length > 0) result.events = events;
@@ -87,5 +109,22 @@ export class StepWorker {
       if (events.length > 0) result.events = events;
       return result;
     }
+  }
+
+  /** `body` inside the registered interceptors (just `body` when there are none). */
+  private intercepted(task: RemoteTask, body: () => Promise<unknown> | unknown): Promise<unknown> {
+    const run = async () => body();
+    if (this.interceptors.length === 0) return run();
+    const invocation = {
+      runId: task.runId,
+      workflow: '',
+      stepName: task.name,
+      seq: task.seq,
+      attempt: task.attempt,
+    };
+    return this.interceptors.reduceRight<() => Promise<unknown>>(
+      (next, interceptor) => () => interceptor(invocation, next),
+      run,
+    )();
   }
 }

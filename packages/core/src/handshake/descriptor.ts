@@ -47,6 +47,39 @@ export interface WorkflowRegistration {
    * nothing.
    */
   subscribes?: string[];
+  /**
+   * The `@Workflow` options a control plane applies to this workflow when it serves it by convention
+   * (it knows a tenant's workflow by name alone). Only the data options travel: the ones that are
+   * functions of the input (a singleton or concurrency `key`, an input schema, `validateInput`) are
+   * evaluated by the starting app and carried on its start-run (see `StartRunMessage.singleton`).
+   * Absent = not stated, which applies nothing (the behaviour before this field).
+   */
+  options?: AnnouncedWorkflowOptions;
+  /**
+   * The workflow this workflow's dead-lettered runs are routed to: an inline `@DeadLetter()` handler
+   * (`<name>.dlq`, served by the same worker), a `deadLetterWorkflow` reference, or the app's
+   * module-level default. A control plane serving the workflow by convention starts it, in the dead
+   * run's namespace, when no dead-letter route of its own applies. Absent = not stated.
+   */
+  deadLetter?: string;
+}
+
+/**
+ * The JSON-safe `@Workflow` options a worker announces for a workflow (see
+ * {@link WorkflowRegistration.options}). Every field is optional and means "not stated" when absent.
+ */
+export interface AnnouncedWorkflowOptions {
+  /** Static tags stamped on every run, merged with the start's own tags. */
+  tags?: string[];
+  /** Max wall-clock lifetime of a run, in ms (`@Workflow({ executionTimeout })`). */
+  executionTimeoutMs?: number;
+  /**
+   * The workflow is a singleton (`@Workflow({ singleton })`): its runs that share a key are admitted
+   * at most `limit` (default 1) at a time. The key is a function of the input, so the starter computes
+   * it and the run carries it as its `singleton:<key>` tag; this states the limit the control plane
+   * admits against on every turn.
+   */
+  singleton?: { limit?: number; maxQueueDepth?: number };
 }
 
 /**
@@ -73,6 +106,12 @@ export interface AnnouncedSchedule {
   overlap?: 'allow' | 'skip';
   /** Delay each fire by a stable offset of up to this many ms. */
   jitterMs?: number;
+  /**
+   * The workflow's `@Workflow({ singleton })` key, evaluated by the app against this schedule's
+   * `input` (a key is a function of the input, which the control plane cannot run). Its fires are
+   * serialized with the app's other runs of that key. Absent = not a singleton.
+   */
+  singleton?: { key: string; limit?: number; maxQueueDepth?: number };
 }
 
 /**
@@ -267,6 +306,9 @@ function canonicalizeRegistrations(regs: readonly WorkflowRegistration[]): unkno
     // Conditional, so a registration that states no routes keeps the hash it had before routes existed.
     ...(r.onError !== undefined ? { onError: canonicalRoutes(r.onError) } : {}),
     ...(r.subscribes !== undefined ? { subscribes: [...new Set(r.subscribes)].sort() } : {}),
+    // Conditional too: a registration without them keeps its hash; a changed option changes it.
+    ...(r.options !== undefined ? { options: stableJson(r.options) } : {}),
+    ...(r.deadLetter !== undefined ? { deadLetter: r.deadLetter } : {}),
   }));
   const byJson = new Map<string, unknown>();
   for (const entry of canonical) byJson.set(JSON.stringify(entry), entry);

@@ -38,11 +38,30 @@ import {
   type Provider,
 } from '@nestjs/common';
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
+import { eventBatchOf, getOnEvents, getWorkflowMeta, isDeadLetterHandler } from './decorators';
 import { scanSteps, scanWorkflows } from './discovery-helpers';
+import type { DurableStartClient, TenantWorkflowStartPolicy } from './durable-start-client';
 import type { DurableModuleOptions, ResolvedTenantAuth } from './durable.module';
+import { getEntityMeta } from './entity';
 import { registerOnRuntime } from './runtime-registration';
+import { type DurableStepInterceptor, isStepInterceptor } from './step-interceptor';
 import { TENANT_AUTH } from './tokens';
 import { createWorkerRuntime, runRedisWorker as defaultRunRedisWorker } from './worker-sdk';
+import { workflowIo } from './workflow-io';
+
+/** The instance's `@DeadLetter()` method bound to it, or undefined if it has none. */
+function deadLetterHandlerOf(
+  instance: object,
+  scanner: MetadataScanner,
+): ((ctx: unknown, input: unknown) => Promise<unknown>) | undefined {
+  for (const name of scanner.getAllMethodNames(Object.getPrototypeOf(instance))) {
+    const method = (instance as Record<string, unknown>)[name];
+    if (typeof method === 'function' && isDeadLetterHandler(method)) {
+      return (ctx, input) => method.call(instance, ctx, input);
+    }
+  }
+  return undefined;
+}
 
 /**
  * The `runRedisWorker` function the module uses to start each partition's BullMQ consumer.
@@ -95,12 +114,50 @@ export class ThinWorkflowRegistrar implements OnModuleInit {
     const runtime = this.runtime;
     if (runtime === null || !isPureThinWorker(this.options)) return;
     const starter = this.starter;
+    this.assertNoEntities();
+    this.useInterceptors(runtime);
+    const fallback = this.options.deadLetterWorkflow
+      ? workflowName(this.options.deadLetterWorkflow)
+      : undefined;
     // The `@Workflow` metadata is also what this worker ANNOUNCES about each body it serves (design
     // §7.9) — version, capability demand, and the declaring package `scanWorkflows` derived. It is
     // passed straight through: the registry states what the decorator states, and an option the
     // decorator left off stays un-stated rather than becoming a default.
     scanWorkflows(this.discovery, (meta, instance, origin) => {
-      registerOnRuntime(runtime, this.metadataScanner, meta, instance, origin);
+      // A dead run of this workflow is routed by the control plane to the handler announced here: an
+      // inline `@DeadLetter()` method (registered beside the body as `<name>.dlq`, so it runs on this
+      // app), else the `deadLetterWorkflow` reference, else the module-level default.
+      const inline = deadLetterHandlerOf(instance as unknown as object, this.metadataScanner);
+      if (inline && meta.deadLetterWorkflow) {
+        throw new Error(
+          `@Workflow ${meta.name} declares both an inline @DeadLetter() method and a deadLetterWorkflow option. Use one: the inline handler, or the reference.`,
+        );
+      }
+      const deadLetter = inline
+        ? `${meta.name}.dlq`
+        : meta.deadLetterWorkflow
+          ? workflowName(meta.deadLetterWorkflow)
+          : fallback;
+      registerOnRuntime(runtime, this.metadataScanner, meta, instance, origin, deadLetter);
+      if (inline) {
+        runtime.registerWorkflow(`${meta.name}.dlq`, inline, {
+          version: meta.version,
+          ...(origin !== undefined ? { origin } : {}),
+        });
+      }
+      // The options only this app can evaluate (they are functions of the input), applied by its
+      // own starts: the input schema, the singleton key, the default quota, the event subscriptions.
+      const declare = (starter as unknown as Partial<DurableStartClient>).declareWorkflow;
+      if (typeof declare === 'function') {
+        const policy: TenantWorkflowStartPolicy = {
+          validateInput: workflowIo(meta).validateAtStart,
+          singleton: meta.singleton,
+          concurrency: meta.concurrency,
+          onEvent: getOnEvents(meta, instance.constructor),
+          coalesces: eventBatchOf(meta, instance.constructor) !== undefined,
+        };
+        declare.call(starter, meta.name, policy);
+      }
       // Class-first statics (`MyWorkflow.start()`), as on an operator: bound to the start facade, so
       // they publish a start-run message to the control plane. `waitForRun` stays unbound (a tenant
       // has no store), so `MyWorkflow.execute()` outside a workflow fails with a clear error.
@@ -108,6 +165,46 @@ export class ThinWorkflowRegistrar implements OnModuleInit {
         start: (name, input, runId, opts) => starter.start(name, input, runId, opts),
       });
     });
+  }
+
+  /**
+   * `@Entity` providers are refused on a tenant, at boot: an entity's state is a run on the store
+   * and its `@On` handlers run inside the engine that owns that store (`EntityService` and
+   * `ctx.callEntity`/`signalEntity` read and serialize it there). A tenant has no store and no
+   * engine, so an entity declared here would never run. Declare it on the control plane.
+   */
+  private assertNoEntities(): void {
+    const entities = this.discovery
+      .getProviders()
+      .map((w) => w.instance as object | undefined)
+      .filter((i): i is object => !!i && typeof i === 'object' && !!getEntityMeta(i.constructor))
+      .map((i) => getEntityMeta(i.constructor)?.name);
+    if (entities.length === 0) return;
+    throw new Error(
+      `@Entity ${entities.join(', ')} cannot be declared on a DurableModule tenant (connection, no store): an entity's state and handlers live in the engine that owns the store. Declare it on the control plane.`,
+    );
+  }
+
+  /**
+   * `@StepInterceptor()` providers wrap every step this tenant runs (each `ctx.step` its workers
+   * execute), as `engine.use` does on an engine. A `@durable-worker` too old to take interceptors
+   * says so instead of dropping them silently.
+   */
+  private useInterceptors(runtime: DurableWorkerRuntime): void {
+    for (const wrapper of this.discovery.getProviders()) {
+      const instance = wrapper.instance as object | undefined;
+      if (!instance || typeof instance !== 'object' || !isStepInterceptor(instance.constructor)) {
+        continue;
+      }
+      const interceptor = instance as DurableStepInterceptor;
+      if (typeof runtime.use !== 'function') {
+        console.warn(
+          `[nestjs-durable] @StepInterceptor ${instance.constructor.name} is not applied: this @dudousxd/durable-worker predates step interceptors on a tenant; upgrade it.`,
+        );
+        continue;
+      }
+      runtime.use((invocation, next) => interceptor.intercept(invocation, next));
+    }
   }
 }
 
@@ -229,6 +326,17 @@ function announcedSchedule(s: ScheduledWorkflow): AnnouncedSchedule {
   if (s.paused === true) item.paused = true;
   if (s.overlap !== undefined) item.overlap = s.overlap;
   if (s.jitter !== undefined && s.jitter > 0) item.jitterMs = s.jitter;
+  // A singleton workflow's key is a function of the input, so it is evaluated here, once, against
+  // the schedule's fixed input (by class only: a name gives no `@Workflow` metadata to read).
+  const singleton =
+    typeof s.workflow === 'function' ? getWorkflowMeta(s.workflow)?.singleton : undefined;
+  if (singleton) {
+    item.singleton = {
+      key: singleton.key(s.input),
+      ...(singleton.limit !== undefined ? { limit: singleton.limit } : {}),
+      ...(singleton.maxQueueDepth !== undefined ? { maxQueueDepth: singleton.maxQueueDepth } : {}),
+    };
+  }
   return item;
 }
 

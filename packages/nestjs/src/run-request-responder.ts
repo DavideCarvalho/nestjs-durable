@@ -7,9 +7,12 @@ import {
   type RunRequest,
   type RunRequestKind,
   type RunWaiting,
+  type StartOptions,
   type TenantVerifier,
+  type VerifiedTenant,
+  grantsClientTenant,
   lifecycleKindOf,
-  resolveWireTenant,
+  verifyWireTenant,
 } from '@dudousxd/nestjs-durable-core';
 
 /**
@@ -43,6 +46,8 @@ const KNOWN_KINDS: ReadonlySet<string> = new Set<RunRequestKind['kind']>([
   'workflowLifecycle',
   'signal',
   'schedule',
+  'signalWithStart',
+  'publishEvent',
 ]);
 
 /** A wire `since`/`until` (an ISO string after JSON) back to a `Date`. */
@@ -165,7 +170,8 @@ export class RunRequestResponder {
   }
 
   private async handle(wire: RunRequest): Promise<RunReply> {
-    const tenant = await resolveWireTenant(wire.tenant, this.verifyTenant);
+    const verified = await verifyWireTenant(wire.tenant, this.verifyTenant);
+    const tenant = verified?.tenant ?? null;
     if (tenant === null) {
       return {
         requestId: wire.requestId,
@@ -324,7 +330,28 @@ export class RunRequestResponder {
       if (!waiter || waiter.namespace !== msg.tenant) {
         return { requestId: msg.requestId, result: { ok: true, data: null } };
       }
-      return this.answer(msg.requestId, () => signal.call(this.gateway, body.token, body.payload));
+      return this.answer(msg.requestId, () =>
+        body.opts === undefined
+          ? signal.call(this.gateway, body.token, body.payload)
+          : signal.call(this.gateway, body.token, body.payload, body.opts),
+      );
+    }
+
+    if (body.kind === 'signalWithStart') {
+      return this.signalWithStart(msg.requestId, body, msg.tenant, verified);
+    }
+
+    if (body.kind === 'publishEvent') {
+      // Scoped to the requester: only its own namespace's waiting runs are resumed, and nothing is
+      // buffered (see `WorkflowEngine.publishEventForTenant`).
+      const { publishEventForTenant } = this.gateway;
+      if (!publishEventForTenant) return unsupported(msg.requestId, body.kind);
+      if (typeof body.name !== 'string' || body.name === '') {
+        return badRequest(msg.requestId, 'publishEvent needs an event name');
+      }
+      return this.answer(msg.requestId, () =>
+        publishEventForTenant.call(this.gateway, body.name, body.payload, msg.tenant),
+      );
     }
 
     if (body.kind === 'republishLifecycle' && !this.gateway.republishLifecycle) {
@@ -386,6 +413,63 @@ export class RunRequestResponder {
         result: { ok: false, error: { message: err instanceof Error ? err.message : String(err) } },
       };
     }
+  }
+
+  /**
+   * A tenant's `signalWithStart`: the run it names must be the requester's when it exists, and so
+   * must a run already waiting on the token; anything else is refused `cross-tenant` before the
+   * gateway is called. The run is started in the requester's namespace (a customer tenant it claims
+   * is kept only when its verified token grants it, as for a start-run).
+   */
+  private async signalWithStart(
+    requestId: string,
+    body: Extract<RunRequestKind, { kind: 'signalWithStart' }>,
+    tenant: string,
+    verified: VerifiedTenant | null,
+  ): Promise<RunReply> {
+    const { signalWithStartForTenant, signalWaiter } = this.gateway;
+    if (!signalWithStartForTenant) return unsupported(requestId, body.kind);
+    const start = body.start;
+    if (
+      !start ||
+      typeof start.runId !== 'string' ||
+      start.runId === '' ||
+      typeof start.workflow !== 'string' ||
+      start.workflow === '' ||
+      typeof body.signal?.token !== 'string' ||
+      body.signal.token === ''
+    ) {
+      return badRequest(requestId, 'signalWithStart needs a workflow, a run id and a signal token');
+    }
+    const crossTenant: RunReply = {
+      requestId,
+      result: {
+        ok: false,
+        error: { message: 'run belongs to another tenant', code: 'cross-tenant' },
+      },
+    };
+    const existing = await this.runOf(start.runId);
+    if (existing && existing.namespace !== tenant) return crossTenant;
+    const waiterRunId = signalWaiter
+      ? await signalWaiter.call(this.gateway, body.signal.token)
+      : null;
+    const waiter = waiterRunId ? await this.runOf(waiterRunId) : null;
+    if (waiter && waiter.namespace !== tenant) return crossTenant;
+    const claim: Pick<StartOptions, 'tenantId' | 'tenantKind'> =
+      start.tenantId !== undefined
+        ? grantsClientTenant(verified, start.tenantId)
+          ? {
+              tenantId: start.tenantId,
+              ...(start.tenantKind !== undefined ? { tenantKind: start.tenantKind } : {}),
+            }
+          : { tenantId: null }
+        : {};
+    return this.answer(requestId, () =>
+      signalWithStartForTenant.call(this.gateway, { ...start, tenant }, tenant, claim, {
+        token: body.signal.token,
+        payload: body.signal.payload,
+      }),
+    );
   }
 
   /** The run alone (`getRun`, else from its detail), or null when it does not exist. */
@@ -483,6 +567,8 @@ export class RunRequestResponder {
       | { kind: 'workflowLifecycle' }
       | { kind: 'signal' }
       | { kind: 'schedule' }
+      | { kind: 'signalWithStart' }
+      | { kind: 'publishEvent' }
     >,
   ): Promise<unknown> {
     switch (body.kind) {
@@ -517,6 +603,8 @@ function runIdOf(
     | { kind: 'workflowLifecycle' }
     | { kind: 'signal' }
     | { kind: 'schedule' }
+    | { kind: 'signalWithStart' }
+    | { kind: 'publishEvent' }
   >,
 ): string {
   if (body.kind !== 'republishLifecycle') return body.runId;

@@ -1052,6 +1052,17 @@ export class DurableModule {
                 } as DurableModuleOptions,
                 undefined,
                 resolveAccessor(moduleRef),
+                // `signal`/`signalWithStart`/`publishEvent` go to the control plane as run requests,
+                // over the one `ProxyRunGateway` bound under `RunGateway` (it owns the reply
+                // subscription). Resolved lazily: that gateway is built after this facade.
+                () => {
+                  try {
+                    const gateway = moduleRef.get(RunGateway, { strict: false });
+                    return gateway instanceof ProxyRunGateway ? gateway : undefined;
+                  } catch {
+                    return undefined;
+                  }
+                },
               );
             }
             if (!store) {

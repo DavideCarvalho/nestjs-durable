@@ -234,12 +234,57 @@ basics behave as on a standalone app:
   The tenant caller has already returned, so the refusal has to be stored where you can find it
   by run id. A start whose input the control plane's own registration rejects is stored the same
   way, with `'invalid_input'`.
-- **Not yet: workflow-level guards.** `singleton`, a `@Workflow({ concurrency })` default and the
-  input schema declared **only on the tenant** are not enforced by the control plane, which knows
-  the workflow by name from the worker's announcement and nothing more. Pass `concurrency` per start
-  until the announcement carries them (plan item 9). A control plane that registers the workflow
-  itself applies its own registration, `singleton` back-pressure included
-  (`'singleton_queue_full'`).
+- **`@Workflow` options declared on the tenant.** The control plane knows a tenant's workflow by name
+  only, so the tenant carries its options:
+  - **Evaluated by the tenant, on each start.** An `input` schema and `validateInput` reject a bad
+    input in `start()` itself, before anything is sent. A `singleton` key and a default `concurrency`
+    quota are functions of the input, so the tenant evaluates them and sends the result with the
+    start. The control plane stamps the run `singleton:<partition>/<key>` (namespaced, so two tenants
+    using the same key never share a slot) and admits it like a local singleton, on every turn.
+  - **Announced by its workers.** Static `tags`, `executionTimeout` and the singleton `limit` ride on
+    the worker's registration (`WorkflowRegistration.options`). The control plane merges the tags
+    into each run, cancels a run that outlives the timeout (`execution_timeout`), and admits a
+    singleton key up to the limit. When replicas disagree (a rolling deploy), the worker that started
+    last wins, as for schedules.
+  - **Precedence.** A per-start option beats the workflow's (`opts.concurrency` over
+    `@Workflow({ concurrency })`; start `tags` are merged with the workflow's). A registration of the
+    workflow on the control plane itself (`register`, `registerRemote`, a `@Workflow` there) beats
+    anything the tenant announces: the announced options apply only to a workflow the control plane
+    serves by convention.
+  - **Not carried.** `searchAttributes` schemas are checked where `ctx.upsertSearchAttributes` runs.
+    `debounce`/`batch` coalescing needs the control plane's accumulator: a tenant's own `publishEvent`
+    starts such a subscriber once per event, with a warning. A start that does not come from the
+    tenant (a control-plane `engine.start` by name) has no singleton key to stamp; a tenant schedule
+    of a singleton workflow class does, evaluated once against the schedule's input.
+- **`signal`, `signalWithStart` and `publishEvent` from tenant code.** They go to the control plane as
+  run requests over the tenant's `transport` (the `ProxyRunGateway` channel), scoped to the tenant's
+  own partition:
+  - `engine.signal(token, payload, { id })` resumes the run of this partition waiting on `token`, and
+    resolves `null` when none waits. Unlike on a control plane it is **not buffered** for a wait
+    opened later: another partition's run could open it. A run of another partition waiting on the
+    token reads as nobody.
+  - `engine.signalWithStart(workflow, input, runId, { token, payload })` starts the run in this
+    partition (with the same options and policy as `start`) unless it exists, then signals it. The
+    signal is buffered until the run waits **only when the token contains the run id** (a run-scoped
+    token like `` `${runId}:add` ``, the pattern `signalWithStart` is for); another token is delivered
+    only to a run of this partition already waiting on it. A run id or a waiting run that belongs to
+    another partition is refused with `cross-tenant`.
+  - `engine.publishEvent(name, payload, { id })` starts this app's own `onEvent` subscribers (their
+    `where` and `input` applied here) through the start path, as `evt:<id>:<workflow>`, and has the
+    control plane resume the runs of this partition waiting on the event. Nothing is buffered.
+  - Without `transport` on the tenant's `DurableModule` these reject, naming it.
+- **`@DeadLetter` handlers and interceptors.** A tenant's inline `@DeadLetter()` method is registered
+  on its worker as `<name>.dlq`, and the worker announces it as the workflow's dead-letter route (else
+  the `deadLetterWorkflow` reference, else the tenant's module-level `deadLetterWorkflow`). When a run
+  of that workflow dead-letters on the control plane, the control plane starts the route in the run's
+  partition, as `dlq:<runId>` with the `DeadLetter` payload, so the handler runs **on the tenant**.
+  With no live worker it waits `blocked` like any tenant start. The control plane's own
+  `deadLetterWorkflow` default stands aside for a workflow whose workers announce a route.
+  `@StepInterceptor()` providers on a tenant wrap every step its workers run (`workflow` is `''` in
+  the invocation: a dispatched step does not carry it).
+- **Entities stay on the control plane.** An entity's state is a run on the store and its `@On`
+  handlers run in the engine that owns that store, which a tenant does not have. An `@Entity` provider
+  on a tenant fails at boot, naming the entity.
 - **A start is never lost.** When no worker serves the workflow yet (the tenant pod is down, rolling
   or not deployed), the control plane creates the run `blocked` with `error.code: 'no_live_worker'`
   and starts it once a worker is live. It checks every `blockedPollMs`, backing off to once a minute
@@ -334,6 +379,14 @@ Starts follow the same rule: a field one side does not know is ignored.
 | --- | --- | --- |
 | this release | older | The old control plane ignores `version`, `priority`, `startAt` and `concurrency` and starts the newest version at once. A start with no live worker is dropped, as before. `MyWorkflow.start()` works on the tenant either way. |
 | older | this release | The start carries no options and runs as before. A start with no live worker now waits `blocked` instead of being dropped, and a turn whose worker dies is re-driven after `reconcileMs`. |
+
+The `@Workflow` options, dead-letter routes and run requests of this release follow it as well:
+
+| Tenant | Control plane | What happens |
+| --- | --- | --- |
+| this release | older | The old control plane ignores `options`, `deadLetter` and a start's `singleton`: no announced tags, timeout or singleton gate, and a dead run goes to the control plane's own default, as before. The input schema and the default quota still apply, since the tenant evaluates them. `signal` gets no answer it knows (the oldest responders reply with nothing) and rejects `unsupported-request`, as do `signalWithStart` and `publishEvent`; `publishEvent` starts the tenant's own subscribers first. |
+| older | this release | The old worker announces no options or route, so nothing new applies and its dead runs go to the control plane's default. Its `signal`, `signalWithStart` and `publishEvent` reject on the tenant, as before. |
+| this release, on an older `@dudousxd/durable-worker` | any | `@StepInterceptor()` providers are not applied, with a warning at boot; a start's singleton key is not sent. |
 
 Schedules follow it too. The announcement is an optional descriptor field.
 

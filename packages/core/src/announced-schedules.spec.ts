@@ -338,6 +338,21 @@ describe('firing an announced schedule', () => {
     expect((await store.getRun('sched:app:acme:daily:180000'))?.namespace).toBe('acme');
   });
 
+  it('a singleton key the app evaluated is stamped on each fire, namespaced by the app', async () => {
+    let now = 120_000;
+    const { engine, fleet, store } = controlPlane({ clock: () => now });
+    fleet.descriptors = [
+      worker('a-1', 'acme', [{ ...digest, singleton: { key: 'digest:ops', limit: 1 } }]),
+    ];
+    await engine.syncAnnouncedSchedules();
+    fleet.descriptors = [];
+    now = 180_000;
+    await engine.schedules.tick(now, { tag: ANNOUNCED_SCHEDULE_TAG });
+    expect((await store.getRun('sched:app:acme:daily:180000'))?.tags).toContain(
+      'singleton:acme/digest:ops',
+    );
+  });
+
   it('"run now" on an announced schedule waits for a worker too', async () => {
     const { engine, fleet, store } = controlPlane();
     fleet.descriptors = [worker('a-1', 'acme', [digest])];

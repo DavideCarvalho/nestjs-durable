@@ -126,3 +126,38 @@ describe('StepWorker.processTask', () => {
     expect(r.events?.[0].message).toBe('about to fail');
   });
 });
+
+describe('StepWorker.use (step interceptors)', () => {
+  it('wraps each handler outermost-first, may transform the output, and unregisters', async () => {
+    const w = new StepWorker();
+    w.register('do', (input: number) => input * 2);
+    const order: string[] = [];
+    const off = w.use(async (inv, next) => {
+      order.push(`outer:${inv.stepName}:${inv.seq}:${inv.attempt}`);
+      return ((await next()) as number) + 1;
+    });
+    w.use(async (_inv, next) => {
+      order.push('inner');
+      return next();
+    });
+    expect(await w.processTask(task({ input: 5, seq: 4, attempt: 2 }))).toMatchObject({
+      status: 'completed',
+      output: 11,
+    });
+    expect(order).toEqual(['outer:do:4:2', 'inner']);
+    off();
+    expect((await w.processTask(task({ input: 5 }))).output).toBe(10);
+  });
+
+  it('a throwing interceptor fails the step', async () => {
+    const w = new StepWorker();
+    w.register('do', () => 1);
+    w.use(async () => {
+      throw new Error('denied');
+    });
+    expect(await w.processTask(task())).toMatchObject({
+      status: 'failed',
+      error: { message: 'denied' },
+    });
+  });
+});

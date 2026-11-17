@@ -3,10 +3,11 @@ import {
   InMemoryTransport,
   type StateStore,
   type WorkflowCtx,
+  WorkflowEngine,
 } from '@dudousxd/nestjs-durable-core';
 import type { Provider } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { DeadLetter, Workflow } from './decorators';
 import { DurableModule, type DurableModuleOptions } from './durable.module';
 
@@ -235,5 +236,48 @@ describe('dead-letter routing', () => {
     expect(specificInput?.deadRunId).toBe('r4');
     expect((await store.getRun('dlq:r4'))?.output).toBe('specific-handled');
     expect(dlqInput).toBeUndefined(); // the global default was NOT used
+  });
+
+  it('a tenant workflow whose workers announce their own dead-letter route is not sent to the module default', async () => {
+    // What a control plane reads off a tenant's live workers (see `WorkflowEngine.announcedDeadLetter`).
+    const announced = vi
+      .spyOn(WorkflowEngine.prototype, 'announcedDeadLetter')
+      .mockImplementation(async (run) =>
+        run.workflow === 'tenant-poison' ? 'tenant-poison.dlq' : undefined,
+      );
+    try {
+      // A run of a workflow nothing here registers (a tenant's), unresumable past the grace period.
+      const store = new InMemoryStateStore();
+      await store.createRun({
+        id: 'r-tenant',
+        workflow: 'tenant-poison',
+        workflowVersion: '1',
+        status: 'running',
+        namespace: 'acme',
+        input: {},
+        createdAt: new Date(0),
+        updatedAt: new Date(0),
+      });
+      const moduleRef = await Test.createTestingModule({
+        imports: [
+          DurableModule.forRoot({
+            store,
+            transport: new InMemoryTransport(),
+            timerPollMs: 0,
+            unregisteredWorkflowGraceMs: 1,
+            deadLetterWorkflow: 'pipeline-dlq',
+          }),
+        ],
+        providers: [DlqWorkflow],
+      }).compile();
+      await moduleRef.init();
+      await new Promise((r) => setTimeout(r, 20));
+      expect((await store.getRun('r-tenant'))?.status).toBe('dead');
+      // The default handler never ran; the tenant's own handler was started instead.
+      expect(dlqInput).toBeUndefined();
+      expect((await store.getRun('dlq:r-tenant'))?.workflow).toBe('tenant-poison.dlq');
+    } finally {
+      announced.mockRestore();
+    }
   });
 });

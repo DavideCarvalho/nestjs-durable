@@ -1575,6 +1575,22 @@ export interface StartRunMessage {
    * the tenant caller has already returned.
    */
   concurrency?: ConcurrencyQuota | undefined;
+  /**
+   * The workflow's `@Workflow({ singleton })`, evaluated by the starting app against this input: the
+   * serialization key, the limit and the queue depth. A control plane that serves the workflow by
+   * convention (it has no registration of its own, so it cannot evaluate the key) stamps the run
+   * `singleton:<key>` and admits it against `limit`, like a local singleton. A control plane with its
+   * own registration of the workflow applies its own `singleton` instead, and one older than this
+   * field ignores it.
+   */
+  singleton?: StartRunSingleton | undefined;
+}
+
+/** A singleton key the starter evaluated (see {@link StartRunMessage.singleton}). */
+export interface StartRunSingleton {
+  key: string;
+  limit?: number | undefined;
+  maxQueueDepth?: number | undefined;
 }
 
 /**
@@ -1623,7 +1639,18 @@ export type RunRequestKind =
   | { kind: 'workflowLifecycle'; workflow: string }
   // Deliver a signal. Answered only when a run of the requester's namespace waits on `token`
   // (`null` otherwise, and nothing is buffered), so a requester can never signal another's run.
-  | { kind: 'signal'; token: string; payload: unknown }
+  | { kind: 'signal'; token: string; payload: unknown; opts?: SignalOptions | undefined }
+  // Ensure the run `start.runId` exists in the requester's namespace (started like a start-run if it
+  // does not), then signal `signal.token`, buffered until the run waits on it. Refused when the run,
+  // or a run waiting on the token, belongs to another namespace.
+  | {
+      kind: 'signalWithStart';
+      start: Omit<StartRunMessage, 'tenant'> & { runId: string };
+      signal: { token: string; payload?: unknown };
+    }
+  // Publish an event scoped to the requester's namespace: it resumes the requester's runs waiting on
+  // it and starts the subscribers its own workers announce. Never buffered.
+  | { kind: 'publishEvent'; name: string; payload: unknown; opts?: { id?: string } | undefined }
   // Pause, resume or trigger a persisted schedule of the requester's namespace.
   | { kind: 'schedule'; id: string; action: ScheduleAction };
 

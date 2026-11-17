@@ -8,6 +8,7 @@ import type {
   ScheduleQuery,
   ScheduleRecord,
   SearchAttributes,
+  StartRunSingleton,
   StateStore,
   WorkflowRun,
 } from './interfaces';
@@ -203,6 +204,8 @@ interface AnnounceDoc {
   fingerprint: string;
   /** The app declared it `paused`. */
   declaredPaused?: boolean | undefined;
+  /** The singleton key the app evaluated against the schedule's input (see `AnnouncedSchedule`). */
+  singleton?: StartRunSingleton | undefined;
   /** First sync at which no live worker of the app announced it any more. */
   missingSince?: number | undefined;
   /** When it was paused for staying unannounced past the grace period. */
@@ -239,6 +242,7 @@ export interface ScheduleHost {
     input: unknown,
     runId: string,
     opts?: StartOptions,
+    singleton?: StartRunSingleton,
   ): Promise<RunResult>;
   getRun(runId: string): Promise<WorkflowRun | null>;
   /** True once the engine has begun shutting down; `tick` fires nothing more after that. */
@@ -424,7 +428,10 @@ export class ScheduleClient {
     const input = specOf(record).input;
     const opts = startOptions(record);
     if (isAnnounced(record) && this.host.startParked) {
-      return this.host.startParked(record.workflow, input, runId, opts);
+      const singleton = (record.state as StateDoc).announce?.singleton;
+      return singleton
+        ? this.host.startParked(record.workflow, input, runId, opts, singleton)
+        : this.host.startParked(record.workflow, input, runId, opts);
     }
     return this.host.start(record.workflow, input, runId, opts);
   }
@@ -634,7 +641,12 @@ export class ScheduleClient {
           state: stripUndefined({
             ...(existing.state as StateDoc),
             ...(resume ? { window } : {}),
-            announce: { key: doc.key, fingerprint, declaredPaused: doc.declaredPaused },
+            announce: {
+              key: doc.key,
+              fingerprint,
+              declaredPaused: doc.declaredPaused,
+              singleton: doc.singleton,
+            },
           }) as Record<string, unknown>,
           updatedAt: new Date(now),
         });
@@ -679,7 +691,14 @@ export class ScheduleClient {
             ...(existing ? {} : { tenantId: null }),
           },
           existing ?? null,
-          { announce: { key: item.key, fingerprint, declaredPaused } },
+          {
+            announce: {
+              key: item.key,
+              fingerprint,
+              declaredPaused,
+              ...(validSingleton(item.singleton) ? { singleton: item.singleton } : {}),
+            },
+          },
         );
         out.adopted.push(id);
       } catch (error) {
@@ -822,6 +841,16 @@ function specOf(record: ScheduleRecord): SpecDoc {
 }
 
 /** Adopted from a tenant's announcement (see {@link ScheduleClient.syncAnnounced}). */
+/** A well-formed announced singleton key (anything else from the wire is ignored). */
+function validSingleton(value: unknown): value is StartRunSingleton {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    typeof (value as StartRunSingleton).key === 'string' &&
+    (value as StartRunSingleton).key !== ''
+  );
+}
+
 function isAnnounced(record: ScheduleRecord): boolean {
   return (record.state as StateDoc | undefined)?.announce !== undefined;
 }

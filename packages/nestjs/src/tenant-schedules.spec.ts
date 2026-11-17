@@ -62,6 +62,28 @@ describe('a tenant announces its schedules on its worker', () => {
     await moduleRef.close();
   });
 
+  it('evaluates a singleton workflow key against the schedule input', async () => {
+    @Workflow({
+      name: 'tenant-single',
+      version: '1',
+      singleton: { key: (input) => `to:${(input as { to: string }).to}`, maxQueueDepth: 3 },
+    })
+    class SingleWorkflow extends DurableWorkflow {
+      async run(): Promise<null> {
+        return null;
+      }
+    }
+    const { moduleRef, calls } = await bootTenant({
+      schedules: [{ key: 's', workflow: SingleWorkflow, input: { to: 'ops' }, everyMs: 5_000 }],
+    });
+    expect(calls[0]?.schedules?.items[0]).toMatchObject({
+      key: 's',
+      workflow: 'tenant-single',
+      singleton: { key: 'to:ops', maxQueueDepth: 3 },
+    });
+    await moduleRef.close();
+  });
+
   it('states an empty set when it declares none, and presents its tenant token when it has one', async () => {
     const { moduleRef, calls } = await bootTenant({ tenantToken: 'signed-token' });
     expect(calls[0]?.schedules).toEqual({ tenant: 'signed-token', items: [] });
