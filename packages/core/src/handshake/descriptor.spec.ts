@@ -293,3 +293,55 @@ describe('describeWorker — the one builder both TS advertisers publish through
     expect(one.registrations?.map((r) => r.name)).toEqual(['extraction', 'pipeline']);
   });
 });
+
+describe('schedule announcement on the descriptor', () => {
+  const items = [
+    { key: 'weekly', workflow: 'digest', cron: '0 8 * * 1' },
+    { key: 'daily', workflow: 'digest', everyMs: 86_400_000, input: { b: 1, a: 2 } },
+  ];
+
+  it('is omitted when not given, so the published bytes and hash do not change', () => {
+    const base = { instanceId: 'i', runtime: 'node' as const, sdk: { name: 's', version: '1' } };
+    const without = describeWorker({ ...base, steps: [], startedAt: 0 });
+    expect('schedules' in without).toBe(false);
+    expect(descriptorHash(without)).toBe(descriptorHash(makeDescriptorLike(without)));
+  });
+
+  it('is kept (an empty set too), sorted by key, and survives normalization', () => {
+    const d = describeWorker({
+      instanceId: 'i',
+      runtime: 'node',
+      sdk: { name: 's', version: '1' },
+      steps: [],
+      startedAt: 0,
+      schedules: { tenant: 'acme', items },
+    });
+    expect(d.schedules?.items.map((i) => i.key)).toEqual(['daily', 'weekly']);
+    expect(normalizeDescriptor(d).schedules).toEqual(d.schedules);
+    const empty = describeWorker({
+      instanceId: 'i',
+      runtime: 'node',
+      sdk: { name: 's', version: '1' },
+      steps: [],
+      startedAt: 0,
+      schedules: { tenant: 'acme', items: [] },
+    });
+    expect(empty.schedules).toEqual({ tenant: 'acme', items: [] });
+  });
+
+  it('changes the hash with the announced content, not with its order', () => {
+    const a = makeDescriptor({ schedules: { tenant: 'acme', items } });
+    const b = makeDescriptor({ schedules: { tenant: 'acme', items: [...items].reverse() } });
+    const c = makeDescriptor({
+      schedules: { tenant: 'acme', items: [{ ...items[0], cron: '0 9 * * 1' }, items[1]] },
+    });
+    expect(descriptorHash(a)).toBe(descriptorHash(b));
+    expect(descriptorHash(a)).not.toBe(descriptorHash(c));
+    expect(descriptorHash(a)).not.toBe(descriptorHash(makeDescriptor()));
+  });
+});
+
+/** A copy of a descriptor through JSON, as a reader gets it off the wire. */
+function makeDescriptorLike(d: WorkerDescriptor): WorkerDescriptor {
+  return JSON.parse(JSON.stringify(d)) as WorkerDescriptor;
+}

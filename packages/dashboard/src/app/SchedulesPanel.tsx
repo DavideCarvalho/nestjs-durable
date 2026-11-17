@@ -41,8 +41,23 @@ export function relativeTo(iso: string, now = Date.now()): string {
 type ScheduleAction = 'pause' | 'resume' | 'trigger';
 
 /**
+ * Where a schedule comes from: `null` for one created through `engine.schedules`, else the app
+ * (partition) that announces it, and whether that app still does. An announced schedule is owned by
+ * the control plane like any other: pause, resume and "run now" work on it.
+ */
+export function scheduleOrigin(
+  s: Pick<ScheduleSummary, 'announcedKey' | 'namespace' | 'unannouncedSince' | 'withdrawnAt'>,
+): { app: string; state: 'announced' | 'unannounced' | 'withdrawn' } | null {
+  if (s.announcedKey === undefined) return null;
+  const state = s.withdrawnAt ? 'withdrawn' : s.unannouncedSince ? 'unannounced' : 'announced';
+  return { app: s.namespace, state };
+}
+
+/**
  * Schedules (OPERATIONS): the persisted schedules (`engine.schedules`) — each one's cadence, next
- * fire, last run and error, with pause/resume and "run now". Absent from the nav on a tenant
+ * fire, last run and error, with pause/resume and "run now". The schedules tenant apps announce
+ * are adopted as persisted schedules, so they are listed (and acted on) here too, labelled with
+ * their app. Absent from the nav on a tenant
  * deployment (its gateway has no runtime schedule control).
  *
  * Container: owns the `/schedules` poll and the three actions; {@link SchedulesView} is pure props.
@@ -100,7 +115,7 @@ export function SchedulesView({
     <PageBody>
       <PageHeader
         title="Schedules"
-        description="Cron and interval schedules the engine persists: cadence, next fire, last run."
+        description="Cron and interval schedules the engine persists, tenant apps included: cadence, next fire, last run."
       />
       <ErrorBoundary label="Schedule summary">
         {error ? (
@@ -154,17 +169,37 @@ export function SchedulesView({
               {
                 id: 'schedule',
                 header: 'Schedule',
-                cell: (s) => (
-                  <div className="flex min-w-0 flex-col">
-                    <span className="mono truncate text-[12px] text-fg" title={s.id}>
-                      {s.id}
-                    </span>
-                    <span className="mono truncate text-[10.5px] text-dim" title={s.workflow}>
-                      {s.workflow}
-                      {s.namespace !== 'default' ? ` @${s.namespace}` : ''}
-                    </span>
-                  </div>
-                ),
+                cell: (s) => {
+                  const origin = scheduleOrigin(s);
+                  return (
+                    <div className="flex min-w-0 flex-col">
+                      <span className="mono truncate text-[12px] text-fg" title={s.id}>
+                        {origin ? s.announcedKey : s.id}
+                      </span>
+                      <span className="mono truncate text-[10.5px] text-dim" title={s.workflow}>
+                        {s.workflow}
+                        {s.namespace !== 'default' ? ` @${s.namespace}` : ''}
+                      </span>
+                      {origin && (
+                        <span
+                          className="mt-0.5 flex items-center gap-1"
+                          title={
+                            origin.state === 'announced'
+                              ? `declared by app ${origin.app}; fired by the control plane`
+                              : origin.state === 'unannounced'
+                                ? `app ${origin.app} no longer announces it; paused once the grace period ends`
+                                : `app ${origin.app} stopped announcing it, so it was paused`
+                          }
+                        >
+                          <Badge variant={origin.state === 'announced' ? 'info' : 'warn'}>
+                            app {origin.app}
+                            {origin.state !== 'announced' ? ` · ${origin.state}` : ''}
+                          </Badge>
+                        </span>
+                      )}
+                    </div>
+                  );
+                },
               },
               {
                 id: 'cadence',

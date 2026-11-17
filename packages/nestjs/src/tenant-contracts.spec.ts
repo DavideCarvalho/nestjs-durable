@@ -473,7 +473,8 @@ describe('DurableModule tenantToken through Nest DI', () => {
   it('a string, a function and an object still work', async () => {
     expect(await bootTenant('static')).toEqual(['static', 'static']);
     let n = 0;
-    expect(await bootTenant(() => `fn-${++n}`)).toEqual(['fn-1', 'fn-2']);
+    // The first token goes to the worker's schedule announcement at boot, then one per request.
+    expect(await bootTenant(() => `fn-${++n}`)).toEqual(['fn-2', 'fn-3']);
     expect(await bootTenant({ token: () => 'object' })).toEqual(['object', 'object']);
   });
 

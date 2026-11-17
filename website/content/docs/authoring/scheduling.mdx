@@ -268,6 +268,12 @@ The four options compose — a schedule that skips pile-up, spreads load, and ca
 }
 ```
 
+<Callout title="On a tenant">
+A tenant (`connection`, no `store`) cannot fire schedules itself. Its workers announce them, and the
+control plane adopts them as persisted schedules, fires them, and shows them on its console. See
+[Schedules on a tenant](/docs/cluster/roles-and-config#schedules-on-a-tenant).
+</Callout>
+
 ## Exactly-once across instances
 
 The guarantee that makes scheduling safe in a multi-instance deployment is the **idempotent

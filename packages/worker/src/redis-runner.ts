@@ -1,5 +1,6 @@
 import { hostname } from 'node:os';
 import {
+  type ScheduleAnnouncement,
   type SearchAttributes,
   type StartRunMessage,
   type WorkerDescriptor,
@@ -136,6 +137,14 @@ export interface RunRedisWorkerOptions {
    */
   concurrency?: ConcurrencyOption;
   /**
+   * The recurring starts this worker's app declares, announced on its descriptor so the control
+   * plane adopts them as persisted schedules and fires them (see `ScheduleAnnouncement`). `tenant` is
+   * the wire tenant (the partition, or the signed tenant token). Omit when the app has no notion of
+   * schedules; pass `items: []` to state it declares none (that lets the control plane withdraw
+   * schedules the app stopped declaring).
+   */
+  schedules?: ScheduleAnnouncement;
+  /**
    * Injection seam for tests: supply fake `Worker`/`Queue`/`Redis` ctors instead of lazily importing
    * the real `bullmq`/`ioredis`. Production omits this and the runner imports the real peers.
    */
@@ -244,6 +253,7 @@ export function buildRunnerDescriptor(
   instanceId: string,
   partition?: string,
   startedAt: number = PROCESS_STARTED_AT,
+  schedules?: ScheduleAnnouncement,
 ): WorkerDescriptor {
   const { workflows, steps } = runtime.registeredNames();
   const registrations: WorkflowRegistration[] = runtime.workflowRegistrations().map((reg) => ({
@@ -257,6 +267,7 @@ export function buildRunnerDescriptor(
     steps,
     workflows,
     registrations,
+    ...(schedules !== undefined ? { schedules } : {}),
     startedAt,
     partition,
   });
@@ -427,7 +438,13 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       // Nest registrars run in `onModuleInit`, this runner starts in `onApplicationBootstrap`), so
       // rebuilding it per beat would re-serialize identical bytes every 10s for nothing. The ETag is
       // hashed once for the same reason and reused on every beat.
-      const descriptor = buildRunnerDescriptor(runtime, instanceId, partition);
+      const descriptor = buildRunnerDescriptor(
+        runtime,
+        instanceId,
+        partition,
+        PROCESS_STARTED_AT,
+        options.schedules,
+      );
       const descriptorJson = JSON.stringify(descriptor);
       const etag = descriptorHash(descriptor);
       const beat = () => {
