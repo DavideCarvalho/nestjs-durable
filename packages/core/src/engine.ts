@@ -6745,16 +6745,18 @@ export class WorkflowEngine {
     groups: Set<string>;
     consumers: WorkerHeartbeat[];
   }> {
-    const consumers = await this.pool
-      .liveRunConsumers({ namespace: this.namespace })
-      .catch(() => [] as WorkerHeartbeat[]);
     const groups = new Set<string>();
-    if (consumers.length === 0) return { groups, consumers };
     for (const def of this.workflows.values()) {
       // `__`-prefixed: the engine's own machinery (event accumulators, entities), not user workflows.
       if (def.remote || def.hasBody === false || def.name.startsWith('__')) continue;
       groups.add(tenantGroup(sanitizeQueueToken(def.name), this.namespace));
     }
+    // Nothing to report them under (a pure step worker, a remote-only plane): skip the Redis read.
+    if (groups.size === 0) return { groups, consumers: [] };
+    const consumers = await this.pool
+      .liveRunConsumers({ namespace: this.namespace })
+      .catch(() => [] as WorkerHeartbeat[]);
+    if (consumers.length === 0) groups.clear();
     return { groups, consumers };
   }
 

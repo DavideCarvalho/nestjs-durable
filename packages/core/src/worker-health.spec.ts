@@ -225,6 +225,8 @@ describe('engine.workerHealth — a control plane running its own workflows', ()
     expect(health).toEqual([
       { group: 'processing-workflows', depth: 2, liveWorkers: [], kind: 'workflow' },
     ]);
+    // With no in-process workflow to report them under, the consumers are not even read.
+    expect(transport.asked).toEqual([]);
   });
 
   it('does not list an instance twice when it also heartbeats on the queue', async () => {
