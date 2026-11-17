@@ -266,6 +266,62 @@ describe('tenant start — start options survive the wire (item 3)', () => {
     expect(broker.turns.map((t) => t.runId)).toEqual(['c1']);
   });
 
+  it('stamps a refused start with the same quota tag as an admitted one', async () => {
+    const { store, broker } = setup();
+    broker.live = ['invoice@acme'];
+    const concurrency = { key: 'acme', limit: 0 };
+
+    await broker.deliver({
+      tenant: 'acme',
+      workflow: 'invoice',
+      input: {},
+      runId: 'z',
+      concurrency,
+    });
+
+    expect((await store.getRun('z'))?.tags).toContain('concurrency:acme');
+  });
+
+  it('stores an input the control plane rejects as a failed run instead of throwing for redelivery', async () => {
+    const { store, broker, engine } = setup();
+    engine.register('strict', '1', async (_ctx, input) => input, {
+      validateInput: (input) => {
+        if ((input as { ok?: boolean }).ok !== true) throw new Error('ok must be true');
+      },
+    });
+
+    await broker.deliver({ tenant: 'acme', workflow: 'strict', input: {}, runId: 'bad' });
+
+    const run = await store.getRun('bad');
+    expect(run?.status).toBe('failed');
+    expect(run?.error?.code).toBe('invalid_input');
+  });
+
+  it('drops a message with no workflow name instead of throwing', async () => {
+    const { store, broker } = setup();
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    await broker.deliver({ tenant: 'acme', input: {} } as unknown as StartRunMessage);
+
+    expect(await store.listRuns({})).toEqual([]);
+    expect(error).toHaveBeenCalled();
+    error.mockRestore();
+  });
+
+  it('re-parks a waiting start for blockedPollMs when the liveness read fails', async () => {
+    const { store, broker, engine, advance, now } = setup();
+    await broker.deliver({ tenant: 'acme', workflow: 'invoice', input: {}, runId: 'outage' });
+    broker.listWorkerGroups = async () => {
+      throw new Error('redis down');
+    };
+
+    advance(10_000);
+    await engine.resumeDueTimers();
+
+    // Not left due (re-read on every poll of the outage), but looked at again shortly.
+    expect((await store.getRun('outage'))?.wakeAt).toBe(now() + 5_000);
+  });
+
   it('a message from an older tenant (no start options) starts exactly as before', async () => {
     const { store, broker } = setup();
     broker.live = ['invoice@acme'];

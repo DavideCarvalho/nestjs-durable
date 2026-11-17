@@ -230,9 +230,16 @@ basics behave as on a standalone app:
 - **Start options.** `version`, `priority`, `startAt` and `concurrency` travel with the start and
   the control plane applies them: the run is stamped with the priority, waits for its `startAt`,
   counts against the quota, and starts only on a live worker that declares the pinned version.
-  A start the quota refuses is recorded as a `failed` run with `error.code: 'concurrency_limit'`
-  (`'singleton_queue_full'` for singleton back-pressure). The tenant caller has already returned,
-  so the refusal has to be stored where you can find it by run id.
+  A start the quota refuses is recorded as a `failed` run with `error.code: 'concurrency_limit'`.
+  The tenant caller has already returned, so the refusal has to be stored where you can find it
+  by run id. A start whose input the control plane's own registration rejects is stored the same
+  way, with `'invalid_input'`.
+- **Not yet: workflow-level guards.** `singleton`, a `@Workflow({ concurrency })` default and the
+  input schema declared **only on the tenant** are not enforced by the control plane, which knows
+  the workflow by name from the worker's announcement and nothing more. Pass `concurrency` per start
+  until the announcement carries them (plan item 9). A control plane that registers the workflow
+  itself applies its own registration, `singleton` back-pressure included
+  (`'singleton_queue_full'`).
 - **A start is never lost.** When no worker serves the workflow yet (the tenant pod is down, rolling
   or not deployed), the control plane creates the run `blocked` with `error.code: 'no_live_worker'`
   and starts it once a worker is live. It checks every `blockedPollMs`, backing off to once a minute
@@ -240,7 +247,8 @@ basics behave as on a standalone app:
   so a worker that just booted is noticed within that window. Such a run is never dead-lettered for
   waiting; cancel it to drop it. A start the control plane fails to create (a store error) is put
   back on the start queue and retried with a delay that doubles up to a minute, for about an hour.
-  Redelivery is safe: a run id is started once.
+  Redelivery is safe: a run id is started once, and a start sent without one gets its id before
+  the first attempt.
 - **A dead worker does not hang its run.** A workflow turn dispatched to a worker carries a re-drive
   deadline: `remoteAdvanceSilenceMs` when you set it, else `reconcileMs` (5 minutes by default). The
   worker's run heartbeat (every 5 seconds while it replays the turn) pushes it forward. If the worker

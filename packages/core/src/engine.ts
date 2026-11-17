@@ -536,6 +536,14 @@ export const VERSION_UNDECLARED_TAG = 'version:undeclared';
  */
 export const NO_LIVE_WORKER = 'no_live_worker';
 
+/** A tenant start whose input the control plane's registration rejected (see `startForTenant`). */
+class TenantStartInvalid extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = 'TenantStartInvalid';
+  }
+}
+
 /** The longest a run parked {@link NO_LIVE_WORKER} waits between two checks of the live fleet. */
 const NO_LIVE_WORKER_MAX_POLL_MS = 60_000;
 
@@ -3914,7 +3922,16 @@ export class WorkflowEngine {
       );
     }
     // Validate the input up front — a bad payload is rejected before any run is created.
-    await registered.validateInput?.(input);
+    if (parkUnroutable && registered.validateInput) {
+      // A tenant start: a rejected input is an answer to store, not a failure to redeliver.
+      try {
+        await registered.validateInput(input);
+      } catch (err) {
+        throw new TenantStartInvalid(err);
+      }
+    } else {
+      await registered.validateInput?.(input);
+    }
     // Idempotent by run id: a redelivered trigger (at-least-once queues) or a scheduler re-tick for
     // the same id is a no-op, returning the existing run's state instead of starting a duplicate.
     const prior = await this.store.getRun(runId);
@@ -4074,8 +4091,10 @@ export class WorkflowEngine {
    * `pending`, so nothing here may lose the start:
    *  - a workflow no live worker serves yet is parked `blocked` ({@link NO_LIVE_WORKER}) and started
    *    by the blocked-recovery poll once one is live;
-   *  - a start the quota or singleton back-pressure rejects is recorded as a `failed` run carrying
-   *    the reason, so the caller's run id resolves to an answer instead of nothing;
+   *  - a start the quota or singleton back-pressure rejects, or whose input a registration here
+   *    rejects, is recorded as a `failed` run carrying the reason, so the caller's run id resolves
+   *    to an answer instead of nothing (and a deterministic failure is never redelivered);
+   *  - a message with no `workflow` is logged and dropped: there is nothing to start;
    *  - any other error (a store blip) is rethrown for the transport to redeliver the message, and a
    *    redelivery is a no-op once the run exists (idempotent by run id).
    */
@@ -4085,6 +4104,10 @@ export class WorkflowEngine {
     tenant: Pick<StartOptions, 'tenantId' | 'tenantKind'>,
   ): Promise<RunResult> {
     const runId = message.runId ?? globalThis.crypto.randomUUID();
+    if (typeof message.workflow !== 'string' || message.workflow === '') {
+      console.error(`[nestjs-durable] dropped a malformed start-run ${runId}: no workflow name`);
+      return { runId, status: 'failed', error: { message: 'malformed start-run: no workflow' } };
+    }
     const opts: StartOptions = {
       namespace,
       tags: message.tags,
@@ -4100,7 +4123,13 @@ export class WorkflowEngine {
     try {
       return await this.startWith(message.workflow, message.input, runId, opts, true);
     } catch (err) {
-      if (!(err instanceof ConcurrencyLimitError || err instanceof SingletonQueueFullError)) {
+      if (
+        !(
+          err instanceof ConcurrencyLimitError ||
+          err instanceof SingletonQueueFullError ||
+          err instanceof TenantStartInvalid
+        )
+      ) {
         throw err;
       }
       return this.recordRejectedStart(message.workflow, message.input, runId, opts, err);
@@ -4113,13 +4142,18 @@ export class WorkflowEngine {
     input: unknown,
     runId: string,
     opts: StartOptions,
-    err: ConcurrencyLimitError | SingletonQueueFullError,
+    err: ConcurrencyLimitError | SingletonQueueFullError | TenantStartInvalid,
   ): Promise<RunResult> {
     const prior = await this.store.getRun(runId);
     if (prior) return this.existingStartResult(prior);
     const error: StepError = {
       message: err.message,
-      code: err instanceof ConcurrencyLimitError ? 'concurrency_limit' : 'singleton_queue_full',
+      code:
+        err instanceof ConcurrencyLimitError
+          ? 'concurrency_limit'
+          : err instanceof SingletonQueueFullError
+            ? 'singleton_queue_full'
+            : 'invalid_input',
       retryable: false,
     };
     const now = new Date();
@@ -4131,7 +4165,11 @@ export class WorkflowEngine {
       error,
       namespace: poolNamespace(opts.namespace) ?? this.namespace,
       input,
-      tags: opts.tags,
+      // The same derived tags an admitted or parked start carries, so quota-key queries find it.
+      tags: mergeTags(opts.tags, [
+        ...(opts.concurrency ? [concurrencyTag(opts.concurrency.key)] : []),
+        ...(opts.version === undefined ? [VERSION_UNDECLARED_TAG] : []),
+      ])?.filter((tag) => !SINGLETON_RESERVED_TAGS.includes(tag)),
       searchAttributes: opts.searchAttributes,
       priority: opts.priority,
       ...this.startTenant(opts),
@@ -9679,7 +9717,10 @@ export class WorkflowEngine {
         const routed = await this.routeParkedStart(run, nowMs);
         if (routed) ready.push(routed);
       } catch {
-        // A liveness read failed: the run keeps its due `wakeAt` and is looked at on the next poll.
+        // A liveness read failed: look again after `blockedPollMs`, not on every poll of an outage.
+        await (this.store.updateRunIf ?? this.updateRunIfFallback)
+          .call(this.store, run.id, ['blocked'], { wakeAt: nowMs + this.blockedPollMs })
+          .catch(() => undefined);
       }
     }
     return ready;

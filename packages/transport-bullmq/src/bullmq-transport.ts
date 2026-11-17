@@ -2358,13 +2358,18 @@ export class BullMQTransport implements Transport, ControlPlane {
     this.startRunWorker = this.makeWorker(this.#startRunName(), async (job) => {
       const data = job.data as StartRunMessage & { [START_RUN_REDELIVERY]?: number };
       const { [START_RUN_REDELIVERY]: redelivered = 0, ...msg } = data;
+      // A start without a run id gets one here, carried on every redelivery, so a retried start
+      // converges on one run instead of the engine minting a new id per attempt.
+      if (msg.runId === undefined) msg.runId = globalThis.crypto.randomUUID();
       try {
         await handler(msg);
       } catch (err) {
         // The tenant producer enqueues with one attempt and `removeOnFail`, and it already answered
         // its caller `pending`: a failed job would drop the start for good. So the control plane
         // re-enqueues it itself, with a capped exponential delay. Safe to repeat: the engine starts a
-        // run id once, and a redelivery of a start that did create its run is a no-op.
+        // run id once, and a redelivery of a start that did create its run is a no-op. Only
+        // transient failures reach here: the engine stores deterministic refusals (quota, invalid
+        // input) as failed runs and drops a malformed message instead of throwing.
         if (redelivered >= START_RUN_MAX_REDELIVERIES) {
           console.error(
             `[nestjs-durable] dropped a start-run for "${msg.workflow}" after ${redelivered} redeliveries:`,

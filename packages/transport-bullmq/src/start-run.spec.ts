@@ -138,7 +138,8 @@ describe('BullMQTransport — onStartRun', () => {
     const msg = { tenant: 'acme', workflow: 'checkout', input: { qty: 1 } };
     await capturedProcessor?.({ data: msg });
     expect(received).toHaveLength(1);
-    expect(received[0]).toEqual(msg);
+    // A run id is minted when the message has none, so a redelivery converges on one run.
+    expect(received[0]).toEqual({ ...msg, runId: expect.any(String) });
 
     await transport.close();
   });
@@ -188,6 +189,23 @@ describe('BullMQTransport — onStartRun redelivery', () => {
     await processor({ data: retry?.data });
     expect(seen).toEqual([msg, msg]);
     expect(capturedJobAdds.filter((a) => a.queue === 'durable-start-run')).toHaveLength(1);
+    await transport.close();
+  });
+
+  it('gives a start without a run id one, kept across redeliveries', async () => {
+    resetCaptures();
+    const transport = new BullMQTransport({ connection });
+    const ids: Array<string | undefined> = [];
+    transport.onStartRun(async (msg) => {
+      ids.push(msg.runId);
+      throw new Error('store blip');
+    });
+    await capturedProcessor?.({ data: { tenant: 'acme', workflow: 'invoice', input: {} } });
+    const retry = capturedJobAdds.find((a) => a.queue === 'durable-start-run');
+    await capturedProcessor?.({ data: retry?.data });
+
+    expect(ids[0]).toEqual(expect.any(String));
+    expect(ids[1]).toBe(ids[0]);
     await transport.close();
   });
 
