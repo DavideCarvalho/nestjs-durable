@@ -29,6 +29,9 @@ import {
 } from './runner-core';
 import { RegistryWriter, type WorkerRegistryWriteOptions } from './worker-registry';
 
+/** How long `close()` waits for this worker's registry entries to be removed. */
+const REGISTRY_REMOVE_WAIT_MS = 1_000;
+
 // Worker liveness heartbeat: a worker stamps a TTL'd key while it's consuming; the key expiring is
 // the "this worker is gone/stalled" signal a monitor watches. TTL comfortably exceeds the interval
 // so one slow refresh doesn't flap. Mirrors the Python SDK's `_start_heartbeat` and the TS
@@ -464,8 +467,19 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       closing = true;
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       controller.stop();
-      // Leave the registry now rather than at expiry, so readers stop routing to this worker.
-      await registry?.remove();
+      // Leave the registry now rather than at expiry, so readers stop routing to this worker. Bounded:
+      // an unreachable Redis must not hold the shutdown (the entries expire on their own anyway).
+      if (registry) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          registry.remove(),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, REGISTRY_REMOVE_WAIT_MS);
+            timer.unref?.();
+          }),
+        ]);
+        if (timer) clearTimeout(timer);
+      }
       await Promise.all(workersRef.current.map((w) => w.close()));
       await Promise.all([decisions.close(), publisher.close(), stepEvents.close()]);
       controlSub?.disconnect();

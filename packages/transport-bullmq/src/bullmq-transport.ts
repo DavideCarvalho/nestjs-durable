@@ -274,6 +274,8 @@ export function parseHeartbeatValue(raw: string | null): {
   }
 }
 
+/** How long `close()` waits for this instance's registry entries to be removed. */
+const REGISTRY_REMOVE_WAIT_MS = 1_000;
 /** The most distinct descriptor values kept parsed before the cache starts over. */
 const PARSED_DESCRIPTORS_MAX = 256;
 
@@ -2114,8 +2116,13 @@ export class BullMQTransport implements Transport, ControlPlane {
     if (this.replySweepTimer) clearInterval(this.replySweepTimer);
     const deadline = Date.now() + this.closeTimeoutMs;
     // Leave the worker registry now rather than at expiry: readers stop routing to this instance.
-    if (this.workerHeartbeatRedis) {
-      await withTimeout(this.registry.removeAll(), this.closeTimeoutMs);
+    // Only over a live connection and briefly: an unreachable Redis must not hold the shutdown, and
+    // the entries expire on their own anyway.
+    if (this.workerHeartbeatRedis?.status === 'ready') {
+      await withTimeout(
+        this.registry.removeAll(),
+        Math.min(REGISTRY_REMOVE_WAIT_MS, this.closeTimeoutMs),
+      );
     }
     // A sweep in flight may be about to open a drain worker: let it see `closed` and stop, so every
     // drain it opened is in `replyDrains` when the workers are collected below.

@@ -43,16 +43,21 @@ async function waitUntil(predicate: () => Promise<boolean>, timeoutMs = 10_000):
   throw new Error('condition was never met');
 }
 
-/** Count the SCAN commands `client` sends, through MONITOR on a side connection. */
+/**
+ * Count, through MONITOR on a side connection, the SCAN walks of `pattern` (a walk starts at cursor
+ * `0`; the db may hold other suites' keys, so one walk can take several calls).
+ */
 async function countScans(
   conn: { host: string; port: number },
+  pattern: string,
   run: () => Promise<void>,
 ): Promise<number> {
   const monitorClient = new Redis(conn);
   const monitor = await monitorClient.monitor();
   let scans = 0;
   monitor.on('monitor', (_time: string, args: string[]) => {
-    if (String(args[0]).toLowerCase() === 'scan') scans++;
+    if (String(args[0]).toLowerCase() !== 'scan' || String(args[1]) !== '0') return;
+    if (args.includes(pattern)) scans++;
   });
   try {
     await run();
@@ -167,7 +172,7 @@ describe('BullMQ worker registry (real Redis)', () => {
       workerRegistry: { legacyScan: false, legacyWrites: false },
     });
     let groups: string[] = [];
-    const scans = await countScans(connection, async () => {
+    const scans = await countScans(connection, `${prefix}-worker-*`, async () => {
       groups = await noWalk.listWorkerGroups();
       await noWalk.readAllWorkerHeartbeats();
       await noWalk.groupHealth('ad.render');
@@ -184,7 +189,7 @@ describe('BullMQ worker registry (real Redis)', () => {
     if (!connection) return ctx.skip();
     const prefix = `durreg-${Date.now()}-c`;
     const reader = new BullMQTransport({ connection, prefix, instanceId: 'ts-r' });
-    const scans = await countScans(connection, async () => {
+    const scans = await countScans(connection, `${prefix}-worker-*`, async () => {
       for (let i = 0; i < 20; i++) {
         await Promise.all([
           reader.listWorkerGroups(),
@@ -194,7 +199,6 @@ describe('BullMQ worker registry (real Redis)', () => {
         ]);
       }
     });
-    // One walk of a near-empty db is one SCAN call.
     expect(scans).toBe(1);
     await reader.close();
   }, 30_000);
