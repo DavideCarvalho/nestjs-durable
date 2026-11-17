@@ -311,7 +311,9 @@ export interface DurableModuleSharedOptions {
    * returns a decision nor sends a run-scoped heartbeat within this window, the engine presumes it dead
    * and lets recovery re-drive; each heartbeat rearms the window so a slow-but-alive worker is never
    * re-driven. Pair with a worker SDK that emits run-scoped heartbeats (`@dudousxd/durable-worker` ≥ the
-   * release that ships them, and the Python `durable-worker`). Omit for the prior unbounded await.
+   * release that ships them, and the Python `durable-worker`). Omitted, a turn dispatched over a
+   * broker (a tenant's worker, another SDK's) takes {@link reconcileMs} as its window, so a run whose
+   * worker died mid-turn is re-driven within it; `reconcileMs: 0` keeps the unbounded wait.
    * Operator only.
    */
   remoteAdvanceSilenceMs?: number;
@@ -338,7 +340,8 @@ export interface DurableModuleSharedOptions {
   /**
    * Fallback wake-up (ms) for a run suspended on an event (child, signal, `waitForEvent`, remote
    * result) whose wake-up was lost: the reconcile pass re-drives it after this window, an idempotent
-   * replay that re-suspends a still-pending wait. Defaults to 300000 (5min); `0` disables it.
+   * replay that re-suspends a still-pending wait. Defaults to 300000 (5min); `0` disables it. Also
+   * the re-drive window of a dispatched workflow turn when {@link remoteAdvanceSilenceMs} is unset.
    * See `WorkflowEngineDeps.reconcileMs`. Operator only.
    */
   reconcileMs?: number;

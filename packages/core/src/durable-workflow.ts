@@ -55,7 +55,7 @@ function clientOf(ctor: WorkflowClass): WorkflowStartClient {
   const client = bindings.get(ctor);
   if (!client) {
     throw new Error(
-      `${workflowName(ctor)} is not bound to a durable engine — the class-first statics only work after the module that registers this workflow has booted (or, in a store-less tenant worker, use the injected WorkflowService/engine facade instead).`,
+      `${workflowName(ctor)} is not bound to a durable engine — the class-first statics only work after the module that registers this workflow (an operator, or a tenant's DurableModule) has booted.`,
     );
   }
   return client;
