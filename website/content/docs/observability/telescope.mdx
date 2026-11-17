@@ -43,6 +43,23 @@ pure function of the run rather than a span held in memory, this survives everyt
 workflow does — a run that suspends for a week and resumes on another pod is still one trace, and a
 worker in a different process derives the same id from the same run id.
 
+## Slowest jobs: step durations and names
+
+Each step's outcome (`step.completed`, `step.failed`) is recorded with the step's measured duration
+as the entry's own `durationMs` (whole milliseconds), with `durable:step:<step name>` as its
+`familyHash` (the same family for both outcomes), and a failed one tagged `failed`. Those are indexed
+columns, so Telescope's Overview **Slowest jobs** card (`@dudousxd/nestjs-telescope` 5.15.0+) ranks
+your workflow steps next to queue jobs by p95, with max, executions and failures, without reading
+any entry's content. A step name too long for the narrowest `family_hash` column (64 characters,
+prefix included) is cut and suffixed with a short hash of the full name, so two long names stay
+apart. Sleeps and signal waits are not work and get no family. An older release of this package
+records steps without family or duration; the card then says that step timings need this one.
+
+On a [control plane](#observability-with-a-control-plane) the watcher also names `durable` among the
+watchers Telescope runs for its tenants, so `GET meta` counts it on for every app in view and the
+card does not claim durable is off for an app whose pods do not run the watcher themselves (an older
+Telescope ignores it).
+
 ## Correlating what a workflow *did*
 
 Recording lifecycle events tells you a step failed. It does not tell you what the step was doing
@@ -175,8 +192,9 @@ Thirteen providers back the panels above, reading from three different sources:
   `durable:run.failed`, `durable:run.suspended`, `durable:run.triggered`, `durable:run.trigger_failed`),
   and these providers read up to the latest 5,000 entries
   of each family through Telescope's indexed `family_hash` column (one indexed read per family, tens
-  of milliseconds on a multi-million-row table). Step entries carry no family, so a wide step fan,
-  which records two entries per step, never crowds runs out of the panels. Telescope's stores
+  of milliseconds on a multi-million-row table). Step entries carry none of these families (a step's
+  outcome has its own, `durable:step:<name>`), so a wide step fan, which records two entries per
+  step, never crowds runs out of the panels. Telescope's stores
   already have the column and its index, so there is nothing to migrate. Run entries recorded by an
   older watcher have no family: while no run entry has one, the providers read the latest 5,000
   `durable` entries instead, and while the families hold fewer than 5,000 entries each, they also read
