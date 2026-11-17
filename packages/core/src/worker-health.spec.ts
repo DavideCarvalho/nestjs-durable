@@ -1,5 +1,5 @@
 import { WorkflowEngine } from './engine';
-import type { GroupHealth, Transport } from './interfaces';
+import type { GroupHealth, RunQueueOptions, Transport, WorkerHeartbeat } from './interfaces';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 import { InMemoryTransport } from './testing/in-memory-transport';
 
@@ -141,5 +141,103 @@ describe('engine.workerHealth', () => {
     expect(stuck?.depth).toBe(1);
     expect(stuck?.liveWorkers).toHaveLength(0); // depth>0, no worker -> the dashboard's no-worker state
     expect(stuck?.kind).toBe('step');
+  });
+});
+
+/** {@link HealthTransport} that also carries a run queue whose live consumers it reports. */
+class RunQueueHealthTransport extends HealthTransport {
+  readonly asked: (string | undefined)[] = [];
+  constructor(
+    health: Record<string, GroupHealth>,
+    discovered: string[],
+    private readonly consumers: WorkerHeartbeat[],
+  ) {
+    super(health, discovered);
+  }
+  async dispatchRuns(): Promise<void> {}
+  onDispatchedRun(): () => Promise<void> {
+    return async () => undefined;
+  }
+  async liveRunConsumers(opts?: RunQueueOptions): Promise<WorkerHeartbeat[]> {
+    this.asked.push(opts?.namespace);
+    return this.consumers;
+  }
+}
+
+const consumer = (instanceId: string, lastBeatAt = 1700): WorkerHeartbeat => ({
+  group: '',
+  instanceId,
+  lastBeatAt,
+  status: { runtime: 'node', concurrency: { mode: 'fixed', limit: 4 }, inFlight: 1 },
+});
+
+describe('engine.workerHealth — a control plane running its own workflows', () => {
+  it('reports the run-queue consumers as the live workers of its in-process workflows', async () => {
+    const transport = new RunQueueHealthTransport({}, [], [consumer('ts-hub-1')]);
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
+    engine.register('relay', '1', async () => ({}));
+
+    const health = await engine.workerHealth();
+    const relay = health.find((h) => h.group === 'relay');
+    expect(relay?.kind).toBe('workflow');
+    expect(relay?.liveWorkers).toEqual([{ ...consumer('ts-hub-1'), group: 'relay' }]);
+  });
+
+  it("names each workflow under the engine's namespace, and asks for that namespace's consumers", async () => {
+    const transport = new RunQueueHealthTransport({}, [], [consumer('ts-hub-1')]);
+    const engine = new WorkflowEngine({
+      store: new InMemoryStateStore(),
+      transport,
+      namespace: 'davi-local',
+    });
+    engine.register('relay:tick', '1', async () => ({}));
+
+    const health = await engine.workerHealth();
+    expect(health.map((h) => h.group)).toEqual(['relay-tick@davi-local']);
+    expect(transport.asked).toEqual(['davi-local']);
+  });
+
+  it('reports nothing extra while no instance consumes the run queue', async () => {
+    const transport = new RunQueueHealthTransport({}, [], []);
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
+    engine.register('relay', '1', async () => ({}));
+    expect(await engine.workerHealth()).toEqual([]);
+  });
+
+  it('leaves a group-served (remote) workflow to the workers that heartbeat on its queue', async () => {
+    const transport = new RunQueueHealthTransport(
+      { 'processing-workflows': { group: 'processing-workflows', depth: 2, liveWorkers: [] } },
+      [],
+      [consumer('ts-hub-1')],
+    );
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
+    engine.registerRemote('processing', '1', {
+      group: 'processing-workflows',
+      executor: {
+        async advance(run) {
+          return { taskId: 't', runId: run.id, status: 'completed', commands: [], output: {} };
+        },
+      },
+    });
+
+    const health = await engine.workerHealth();
+    // Still the alert state: the engine does not execute this body, so it is no worker for it.
+    expect(health).toEqual([
+      { group: 'processing-workflows', depth: 2, liveWorkers: [], kind: 'workflow' },
+    ]);
+  });
+
+  it('does not list an instance twice when it also heartbeats on the queue', async () => {
+    const beat: WorkerHeartbeat = { group: 'relay', instanceId: 'ts-hub-1', lastBeatAt: 1800 };
+    const transport = new RunQueueHealthTransport(
+      { relay: { group: 'relay', depth: 0, liveWorkers: [beat] } },
+      ['relay'],
+      [consumer('ts-hub-1'), consumer('ts-hub-2')],
+    );
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
+    engine.register('relay', '1', async () => ({}));
+
+    const [relay] = await engine.workerHealth();
+    expect(relay?.liveWorkers.map((w) => w.instanceId)).toEqual(['ts-hub-1', 'ts-hub-2']);
   });
 });

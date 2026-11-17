@@ -206,6 +206,23 @@ export class TransportPool {
   }
 
   /**
+   * The live run-queue consumers ({@link Transport.liveRunConsumers}) across every transport that
+   * reports them, one per instance (its latest beat): an engine consuming the run queue of two
+   * pinned transports is still one process.
+   */
+  async liveRunConsumers(opts?: RunQueueOptions): Promise<WorkerHeartbeat[]> {
+    const byInstance = new Map<string, WorkerHeartbeat>();
+    for (const { transport } of this.transports) {
+      if (!transport.liveRunConsumers) continue;
+      for (const beat of await transport.liveRunConsumers(opts)) {
+        const seen = byInstance.get(beat.instanceId);
+        if (!seen || beat.lastBeatAt > seen.lastBeatAt) byInstance.set(beat.instanceId, beat);
+      }
+    }
+    return [...byInstance.values()];
+  }
+
+  /**
    * The live handshake descriptors advertised for `group` (design §7.2), merged across every transport
    * that can report them. Returns `[]` when NO transport implements
    * {@link Transport.readWorkerDescriptors} (a pure in-process pool) OR when descriptors are supported

@@ -53,6 +53,9 @@ vi.mock('ioredis', () => ({
     subscribe: vi.fn().mockResolvedValue(undefined),
     on: vi.fn(),
     disconnect: vi.fn(),
+    // The run-queue consumer's liveness beat (see run-consumer-liveness.spec.ts).
+    set: vi.fn().mockResolvedValue('OK'),
+    del: vi.fn().mockResolvedValue(1),
   })),
 }));
 

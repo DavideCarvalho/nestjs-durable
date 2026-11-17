@@ -2057,6 +2057,18 @@ export interface Transport {
     handler: (run: RunDispatch) => Promise<void>,
     opts: RunConsumerOptions,
   ): () => Promise<void>;
+  /**
+   * The live consumers of the run queue `opts` names ({@link onDispatchedRun}): the engine instances
+   * executing this deployment's IN-PROCESS workflow bodies. They take no task queue, so they never
+   * appear in the worker-heartbeat keyspace {@link listWorkerGroups}/{@link groupHealth} read, and a
+   * control plane driving its own workflows looked like it had no worker at all. Kept in a keyspace of
+   * its own on purpose: a worker heartbeat makes its group a target for convention routing and the
+   * workflow directory, and nothing consumes a task queue under these names.
+   *
+   * Optional, like {@link groupHealth}: only a broker transport that can introspect liveness (BullMQ)
+   * implements it. The engine folds the result into {@link WorkflowEngine.workerHealth}.
+   */
+  liveRunConsumers?(opts?: RunQueueOptions): Promise<WorkerHeartbeat[]>;
   /** control plane → tenant worker: publish a correlated {@link RunReply} on `<effectivePrefix>-run-reply`
    *  (pub/sub; every tenant subscribes and filters by `requestId`). */
   publishRunReply?(reply: RunReply): Promise<void>;
