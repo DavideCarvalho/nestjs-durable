@@ -26,6 +26,15 @@ describe('stepEventFamily', () => {
     expect(stepEventFamily('step.failed', `${'x'.repeat(80)}-a`)).toBe(a);
   });
 
+  it('never cuts a surrogate pair in two', () => {
+    // 'durable:step:' is 13 code units; the head is cut at 55, so the emoji sits on 54-55.
+    const name = `${'x'.repeat(54 - 13)}😀${'y'.repeat(30)}`;
+    const family = stepEventFamily('step.completed', name);
+    expect(family).toBeDefined();
+    expect(family?.isWellFormed()).toBe(true);
+    expect(family?.endsWith(`x~${family.slice(-8)}`)).toBe(true);
+  });
+
   it('leaves run families as they were', () => {
     expect(runEventFamily('run.completed')).toBe('durable:run.completed');
     expect(runEventFamily('step.completed')).toBeUndefined();

@@ -40,7 +40,10 @@ export function stepEventFamily(
   const family = `${STEP_FAMILY_PREFIX}${name}`;
   if (family.length <= MAX_FAMILY_LENGTH) return family;
   const hash = createHash('sha1').update(name).digest('hex').slice(0, 8);
-  return `${family.slice(0, MAX_FAMILY_LENGTH - hash.length - 1)}~${hash}`;
+  let head = family.slice(0, MAX_FAMILY_LENGTH - hash.length - 1);
+  // Never leave half of a surrogate pair (an emoji cut in two) for a strict UTF-8 column to reject.
+  if (/[\uD800-\uDBFF]$/.test(head)) head = head.slice(0, -1);
+  return `${head}~${hash}`;
 }
 
 /** The family prefix of a step's outcome (see {@link stepEventFamily}). */

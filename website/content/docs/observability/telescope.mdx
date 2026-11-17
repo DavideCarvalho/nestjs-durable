@@ -56,8 +56,8 @@ apart. Sleeps and signal waits are not work and get no family. An older release 
 records steps without family or duration; the card then says that step timings need this one.
 
 On a [control plane](#observability-with-a-control-plane) the watcher also names `durable` among the
-watchers Telescope runs for its tenants, so `GET meta` counts it on for every app in view and the
-card does not claim durable is off for an app whose pods do not run the watcher themselves (an older
+watchers Telescope runs for its tenants, so `GET meta` counts it on for every app in view whenever it
+reports watchers at all (an unknown answer stays unknown), and the card does not claim durable is off for an app whose pods do not run the watcher themselves (an older
 Telescope ignores it).
 
 ## Correlating what a workflow *did*
