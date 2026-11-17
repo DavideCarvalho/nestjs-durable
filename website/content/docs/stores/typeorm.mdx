@@ -117,6 +117,23 @@ export class AddDurableTables implements MigrationInterface {
 DurableModule.forRoot({ store, transport, autoSchema: false });
 ```
 
+### Postgres: the owed-lifecycle index
+
+The timer poller lists the settled runs that still owe a lifecycle event (tag
+`durable:lifecycle:pending`) every 10 s. A tag filter is a leading-wildcard `LIKE`, which no B-tree
+serves, so on Postgres the schema helper adds a partial index over just those rows:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "durable_runs_lifecycle_pending_idx"
+  ON "durable_workflow_runs" ("created_at") WHERE "tags" LIKE '%"durable:lifecycle:pending"%';
+```
+
+It is built `CONCURRENTLY` (writes go on during the build), or plainly when the connection is inside
+a transaction block. An invalid leftover of a build that died is rebuilt on the next boot, and a
+build that fails is warned and retried on the next boot. The listing sends that predicate as a
+literal, so every plan can use the index. MySQL has no partial indexes and SQLite's would only match
+the exact predicate text, so both keep the scan, once per 10 s per instance.
+
 ### MySQL timestamp precision and large tables
 
 Every timestamp column is created with microsecond precision: `datetime(6)` on MySQL (`timestamptz`

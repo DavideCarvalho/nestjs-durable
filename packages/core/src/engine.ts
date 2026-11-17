@@ -1669,6 +1669,43 @@ export class WorkflowEngine {
   }
 
   /**
+   * Whether a poller may wait longer than its tick while there is nothing to do: a run another
+   * instance starts must reach this one without the pending-run poll, so this engine needs a control
+   * plane (the `enqueued` nudge, and the run events of other instances that tell a poller to look
+   * again) or a run queue it consumes (see {@link consumeRuns}). See {@link nextDueAt}.
+   */
+  get idleBackoffSupported(): boolean {
+    return this.controlPlane !== undefined || this.queuesRunsOverTransport;
+  }
+
+  /**
+   * The earliest known time (epoch ms) the poll has work, if it is at or before `byMs`: this
+   * namespace's next due timer (`listDueTimers` up to `byMs`, limit one: it returns the most overdue
+   * first), the next `blocked` run's recovery poll, and with `persistedSchedules` the next persisted
+   * schedule to fire (see {@link ScheduleClient.nextFireAt}). `undefined` when nothing is due by
+   * then. A poller reads it before waiting longer than its tick, so the wait never outlasts a timer.
+   */
+  async nextDueAt(
+    byMs: number,
+    opts: { persistedSchedules?: boolean } = {},
+  ): Promise<number | undefined> {
+    const [timers, blocked, schedule] = await Promise.all([
+      this.store.listDueTimers(byMs, this.namespace, 1),
+      this.dueBlockedRuns(byMs),
+      opts.persistedSchedules ? this.schedules.nextFireAt(byMs) : undefined,
+    ]);
+    let next: number | undefined;
+    for (const at of [
+      timers[0]?.wakeAt,
+      ...blocked.map((run) => run.wakeAt),
+      schedule ?? undefined,
+    ]) {
+      if (at !== undefined && (next === undefined || at < next)) next = at;
+    }
+    return next;
+  }
+
+  /**
    * Pick up a run another instance announced as enqueued: run it here if it is still `pending`.
    * Bounded by {@link LOCAL_RUN_CONCURRENCY}, and a run another instance already took is skipped
    * after one read, instead of being leased and replayed here once more.
@@ -3352,8 +3389,18 @@ export class WorkflowEngine {
    * {@link LIFECYCLE_SWEEP_SCAN_MAX}. Pages advance by offset over a set the sweep itself shrinks,
    * so a run that moves into an earlier page is reached on the next tick, which starts over. A run
    * whose lifecycle lease another publisher holds is left for the next tick.
+   *
+   * `options.owed: false` does only the cheap part: the registry heartbeat (itself throttled) and the
+   * run waits. The listing of marked runs filters on a tag (an unindexed `LIKE` on most stores, a
+   * partial index on Postgres) and the heal reads recent runs per source workflow, so a poller runs
+   * that part less often than its tick (see the NestJS timer poller) and passes `owed: false` in
+   * between. It returns 0 then.
    */
-  async sweepLifecycleEvents(nowMs: number = this.clock(), limit = 100): Promise<number> {
+  async sweepLifecycleEvents(
+    nowMs: number = this.clock(),
+    limit = 100,
+    options: { owed?: boolean } = {},
+  ): Promise<number> {
     await this.heartbeatLifecycleRegistry().catch((error) => {
       console.error(
         '[nestjs-durable] lifecycle registry heartbeat failed; retrying next tick:',
@@ -3363,6 +3410,7 @@ export class WorkflowEngine {
     await this.sweepRunWaits(limit).catch((error) => {
       console.error('[nestjs-durable] run-wait sweep failed; retrying next tick:', error);
     });
+    if (options.owed === false) return 0;
     await this.announcedSubscriptions();
     const pageSize = Math.max(1, limit);
     const scanMax = Math.max(pageSize, WorkflowEngine.LIFECYCLE_SWEEP_SCAN_MAX);

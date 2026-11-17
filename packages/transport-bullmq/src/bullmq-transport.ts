@@ -422,7 +422,27 @@ export interface BullMQTransportOptions {
    * results flowing.
    */
   resultConcurrency?: number;
+  /**
+   * Seconds each BullMQ worker of this transport blocks on an EMPTY queue before polling it again
+   * (BullMQ `drainDelay`). A job added to the queue wakes the worker at once (BullMQ's marker), and a
+   * delayed job's due time shortens the wait, so this only sets how often idle queues are re-polled:
+   * each poll is a `BZPOPMIN` plus a `moveToActive` script, per queue, and an instance consumes one
+   * queue per handler plus its own results, decisions and run queues. Closing a worker does not wait
+   * for it. Default 30 (BullMQ's own default is 5); a non-finite or non-positive value falls back to
+   * the default.
+   */
+  drainDelay?: number;
+  /**
+   * How often (ms) each BullMQ worker checks its queue for stalled jobs (BullMQ `stalledInterval`):
+   * one script per queue per interval. Raising it lowers idle Redis load and delays the recovery of a
+   * job whose worker died. Unset = BullMQ's default (30 s); a non-finite or non-positive value is
+   * ignored.
+   */
+  stalledInterval?: number;
 }
+
+/** Default {@link BullMQTransportOptions.drainDelay}, in seconds. */
+export const DEFAULT_DRAIN_DELAY_SECONDS = 30;
 
 /**
  * A queue-backed `Transport` over BullMQ/Redis — the path for true cross-process and
@@ -521,6 +541,8 @@ export class BullMQTransport implements Transport, ControlPlane {
   private readonly closeTimeoutMs: number;
   private readonly stepTimeoutMs: number | undefined;
   private readonly resultConcurrency: number;
+  /** BullMQ `drainDelay` (s) and `stalledInterval` (ms) for every worker; see the options. */
+  private readonly workerTiming: { drainDelay: number; stalledInterval?: number };
   // --- Reply routing (see `replyRouting`) ---
   private readonly replyRouting: boolean;
   private readonly replyAliveTtlMs: number;
@@ -567,6 +589,12 @@ export class BullMQTransport implements Transport, ControlPlane {
     this.replyAliveTtlMs = options.replyAliveTtlMs ?? 15_000;
     this.replySweepMs = options.replySweepMs ?? 5_000;
     this.replyDrainIdleMs = options.replyDrainIdleMs ?? 90_000;
+    const positive = (value: number | undefined): value is number =>
+      typeof value === 'number' && Number.isFinite(value) && value > 0;
+    this.workerTiming = {
+      drainDelay: positive(options.drainDelay) ? options.drainDelay : DEFAULT_DRAIN_DELAY_SECONDS,
+      ...(positive(options.stalledInterval) ? { stalledInterval: options.stalledInterval } : {}),
+    };
     const results = options.resultConcurrency;
     this.resultConcurrency = Math.max(
       RESULT_CONSUMER_CONCURRENCY,
@@ -668,6 +696,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     const build = (concurrency: number | undefined): Worker =>
       new Worker(name, processor, {
         connection: this.workerConnection(),
+        ...this.workerTiming,
         ...(concurrency !== undefined ? { concurrency } : {}),
       });
     if (!this.consumersDeferred) return build(opts.concurrency);

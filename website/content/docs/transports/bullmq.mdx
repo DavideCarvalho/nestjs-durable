@@ -219,6 +219,8 @@ lifecycle events and cancellation — and carries the tenant `start-run` / `run-
 | `instanceId` | Stable id for this worker process, stamped into its heartbeats/liveness keys. Defaults to `ts-<hostname>-<pid>`. |
 | `concurrency` | Fixed number, `'adaptive'`, or `{ mode: 'adaptive', ... }`. See [Concurrency](#concurrency) above. Defaults to `1`. |
 | `resultConcurrency` | The most step results this instance handles at once from the results queue, when above the built-in 512. One run's results still resume it in order. See [Result concurrency](#result-concurrency). |
+| `drainDelay` | Seconds each BullMQ worker blocks on an **empty** queue before polling it again. A new job wakes the worker at once (BullMQ's marker) and a delayed job's due time shortens the block, so this only sets how often idle queues are re-polled (a `BZPOPMIN` and a `moveToActive` script per queue). Closing is not held up by it. Defaults to `30` (BullMQ's own default is 5). |
+| `stalledInterval` | Milliseconds between each worker's stalled-job checks (one script per queue). Raising it lowers idle Redis load and delays recovering a job whose worker died. Defaults to BullMQ's 30 000. |
 
 The payload is the documented `RemoteTask` / `StepResult` JSON, so a non-Node worker on the same
 queues interoperates — that's exactly how the [Python worker](/docs/python) plugs in.

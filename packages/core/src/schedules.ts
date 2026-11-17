@@ -377,6 +377,22 @@ export class ScheduleClient {
     return started;
   }
 
+  /**
+   * When {@link tick} next has a schedule to fire, if one is due by `byMs`: the earliest `nextFireAt`
+   * of the unpaused schedules (of this engine's namespace) due by then, else `undefined`. One indexed
+   * read (the due-schedule scan `tick` makes, with a later bound and a limit of one). A store that
+   * does not persist schedules has none.
+   */
+  async nextFireAt(byMs: number): Promise<number | undefined> {
+    if (!this.supported) return undefined;
+    const [next] = await this.requireStore().listSchedules({
+      dueBy: byMs,
+      namespace: this.options.namespace,
+      limit: 1,
+    });
+    return next?.nextFireAt ?? undefined;
+  }
+
   /** Fire one due schedule and advance it. Returns the run id started, if any. */
   private async fire(record: ScheduleRecord, nowMs: number): Promise<string | undefined> {
     const store = this.requireStore();

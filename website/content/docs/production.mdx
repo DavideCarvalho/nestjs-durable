@@ -56,8 +56,11 @@ the last completed step on the next boot.
 
 Nothing extra has to tick: `DurableModule`'s `TimerPoller` runs inside the app whenever the instance
 drives (the default). It runs the pending-run pickup, `recoverIncomplete`, due timers, execution
-timeouts, schedules and persisted schedules every `timerPollMs` (default 1 000 ms). Remember
-`app.enableShutdownHooks()` so the drain in [Graceful shutdown](#5-graceful-shutdown) runs.
+timeouts, schedules and persisted schedules every `timerPollMs` (default 1 000 ms). While polls
+find nothing to do and the instance has a control plane or run queue, the wait backs off to
+`maxIdleIntervalMs` (default 5 000 ms), but never past the next due timer or schedule window, and
+any run event brings it back to `timerPollMs`. Remember `app.enableShutdownHooks()` so the drain in
+[Graceful shutdown](#5-graceful-shutdown) runs.
 
 ### (b) Several replicas, steps stay in-process
 

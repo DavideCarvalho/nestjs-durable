@@ -71,6 +71,7 @@ import {
   StepCheckpointEntity,
   WorkflowRunEntity,
 } from './entities';
+import { LIFECYCLE_PENDING_LIKE, LIFECYCLE_PENDING_TAG } from './lifecycle-index';
 import {
   type DurableSchemaLogger,
   durableColumnResolver,
@@ -828,7 +829,10 @@ export class TypeOrmStateStore implements StateStore {
     // tag-filtered scans (e.g. singleton admission) are sequential over `durable_runs_workflow_status_idx`'s
     // result set. The `statuses`/`workflow` predicates above bound that scan; if tag scans ever dominate,
     // promote tags to a normalized join table or a JSON/GIN index — a schema change, intentionally not done here.
-    if (query.tag) qb.andWhere('r.tags LIKE :tagPattern', { tagPattern: `%"${query.tag}"%` });
+    // The owed-lifecycle listing's tag goes in as a literal, so Postgres can match its partial index
+    // (`durable_runs_lifecycle_pending_idx`) whatever plan it picks; see `lifecycle-index.ts`.
+    if (query.tag === LIFECYCLE_PENDING_TAG) qb.andWhere(`r.tags LIKE '${LIFECYCLE_PENDING_LIKE}'`);
+    else if (query.tag) qb.andWhere('r.tags LIKE :tagPattern', { tagPattern: `%"${query.tag}"%` });
     if (query.tags) {
       const branches = query.tags.map((_, i) => `r.tags LIKE :tagPattern${i}`);
       qb.andWhere(
