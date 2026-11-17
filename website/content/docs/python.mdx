@@ -522,6 +522,15 @@ flight raises `NondeterminismError` rather than silently diverging.
 | `ctx.gather_calls_settled([{name, input}, …])` | The same for a step fan: `gather_calls` that returns every outcome instead of raising. |
 | `ctx.gather_settled([(name, body), …])` | The same for local steps: `gather` that runs and records every body, then returns every outcome instead of raising. |
 
+<Callout type="info" title="Not in the Python SDK yet">
+The TypeScript worker also emits step policies (`retries`/`backoff`/`timeoutMs` on a step call) and
+the negotiated `sleepUntil`, timed signal wait, `waitEvent`, fire-and-forget child and
+`continueAsNew` decisions (see [the TypeScript worker](/docs/cluster/js-worker#feature-negotiation)).
+The Python `ctx` does not have these ops yet. The control plane accepts them from any SDK, and a
+Python worker ignores the `features` list a task carries, so nothing changes for existing Python
+workflows.
+</Callout>
+
 The three `gather*` fan-outs default to `wait_all` — raising an aggregate `GatherFailed` if anything
 fails — with an opt-in `fail_fast`. A single step that fails raises `StepFailed` in the workflow;
 catch it to compensate, or let it propagate to fail the run.

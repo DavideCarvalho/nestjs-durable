@@ -53,6 +53,7 @@ import {
   eventMatches,
   eventNameOf,
   eventPrefix,
+  eventToken,
   isEventToken,
   readBufferedEvent,
   scopeBufferedEvent,
@@ -126,7 +127,13 @@ import type {
   WorkflowRun,
   WorkflowStepEvent,
 } from './interfaces';
-import type { BufferedSignalRow, HistoryEvent, RunScope } from './interfaces';
+import type {
+  BufferedSignalRow,
+  HistoryEvent,
+  RemoteCallPolicy,
+  RunScope,
+  StepOptions,
+} from './interfaces';
 import {
   PARENT_CLOSE_TAG_PREFIX,
   TERMINAL_RUN_STATUSES,
@@ -184,6 +191,7 @@ import {
 import { CORE_ORIGIN } from './origin';
 import { breakpointToken, stepId } from './protocol';
 import type { QueueConfig } from './queue';
+import { remoteCallMaxAttempts, remoteCallRetries } from './remote-call-policy';
 import { markRemoteEvent } from './remote-event';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor';
 import { RUN_DISPATCH_BATCH, RunDispatchBatcher } from './run-dispatch-batcher';
@@ -8519,7 +8527,10 @@ export class WorkflowEngine {
       wfPlan = await this.planRoute(wfToken, registered.requires, true);
     if (wfPlan?.status === 'blocked') return this.parkBlocked(run, wfPlan);
 
-    const checkpoints = await this.replayCheckpoints(run.id);
+    const checkpoints = await this.expireRemoteDeadlines(
+      run.id,
+      await this.replayCheckpoints(run.id),
+    );
     await this.deliverFinishedChildren(run.id, checkpoints);
     await this.deliverFinishedChildWaiters(run.id, checkpoints);
     const handoff = liveHandoff(run.id, checkpoints);
@@ -8665,6 +8676,10 @@ export class WorkflowEngine {
   private async applyDecision(run: WorkflowRun, decision: WorkflowDecision): Promise<RunResult> {
     // Zombie fence (as in settleRun): a decision applied under a lost lease must not write.
     if (this.isFenced(run.id)) return this.echoCurrentStatus(run.id);
+    const handoff = decision.commands.find((cmd) => cmd.kind === 'continueAsNew');
+    if (handoff !== undefined && decision.status !== 'cancelled') {
+      return this.applyRemoteContinueAsNew(run, decision.commands, handoff.input);
+    }
     if (decision.status === 'completed') {
       // Persist the local steps THIS turn ran before marking the run done. A workflow that runs
       // straight to completion in a single turn (every step inline, never suspending — e.g. a Python
@@ -8722,6 +8737,55 @@ export class WorkflowEngine {
   }
 
   /**
+   * A remote turn that ended in `ctx.continueAsNew(input)`: record what the turn ran, complete this
+   * run and start its continuation (`<runId>~N`) with `input` on a clean history — the in-process
+   * engine's handoff, with the run's partition and tenant carried over. A run cancelled while the
+   * turn replayed stays cancelled and starts nothing. Deferred and idempotent by the continuation id,
+   * so a re-applied decision converges on the same next run.
+   */
+  private async applyRemoteContinueAsNew(
+    run: WorkflowRun,
+    commands: WorkflowCommand[],
+    input: unknown,
+  ): Promise<RunResult> {
+    await this.applyCommands(
+      run,
+      commands.filter((cmd) => cmd.kind !== 'continueAsNew'),
+    );
+    const fresh = await this.store.getRun(run.id);
+    if (
+      fresh &&
+      (fresh.status === 'cancelled' ||
+        fresh.status === 'cancelling' ||
+        fresh.status === 'completed' ||
+        fresh.status === 'dead')
+    ) {
+      return { runId: run.id, status: fresh.status, output: fresh.output, error: fresh.error };
+    }
+    await this.store.updateRun(run.id, {
+      status: 'completed',
+      output: undefined,
+      error: undefined,
+      wakeAt: undefined,
+      updatedAt: new Date(),
+    });
+    this.emit(
+      { type: 'run.completed', runId: run.id, workflow: run.workflow, namespace: run.namespace },
+      { lifecycle: false },
+    );
+    void this.notifyParent(run.id, { ok: true, value: undefined });
+    const nextId = nextContinuationId(run.id);
+    queueMicrotask(
+      () =>
+        void this.start(run.workflow, input, nextId, {
+          namespace: run.namespace,
+          ...inheritTenant(run),
+        }).catch(() => undefined),
+    );
+    return { runId: run.id, status: 'completed' };
+  }
+
+  /**
    * Re-drive a run whose turn was computed from a history OLDER than the store's.
    *
    * A turn replays against a SNAPSHOT, and an op can settle while its decision is in flight. The
@@ -8743,12 +8807,21 @@ export class WorkflowEngine {
     commands: WorkflowCommand[],
   ): Promise<void> {
     const blocking = commands.filter(
-      (cmd) => cmd.kind === 'call' || cmd.kind === 'startChild' || cmd.kind === 'waitSignal',
+      (cmd) =>
+        cmd.kind === 'call' ||
+        cmd.kind === 'startChild' ||
+        cmd.kind === 'waitSignal' ||
+        cmd.kind === 'waitSignalTimeout' ||
+        cmd.kind === 'waitEvent',
     );
     if (blocking.length === 0) return;
     for (const cmd of blocking) {
       const checkpoint = await this.store.getCheckpoint(runId, cmd.seq);
-      if (checkpoint && checkpoint.status !== 'pending') {
+      // A failed `call` its policy retries waits out its backoff (`wakeAt`) — re-emitting it is the
+      // turn being up to date, not stale.
+      const backingOff =
+        cmd.kind === 'call' && checkpoint?.status === 'failed' && checkpoint.wakeAt != null;
+      if (checkpoint && checkpoint.status !== 'pending' && !backingOff) {
         setTimeout(() => {
           void this.resumeImplicit(runId).catch(() => undefined);
         }, 0).unref?.();
@@ -9016,6 +9089,9 @@ export class WorkflowEngine {
           name: cp.kind === 'signal' ? undefined : cp.name,
           output: cp.status === 'completed' ? cp.output : undefined,
           error: cp.status === 'failed' ? cp.error : undefined,
+          // How many times a dispatched step ran: a worker applying a `call` policy decides a retry
+          // from it (see `remoteCallRetries`), exactly as the in-process path reads the checkpoint.
+          ...(cp.kind === 'remote' ? { attempts: cp.attempts } : {}),
         });
       } else if (cp.kind === 'sleep' && cp.wakeAt != null && cp.wakeAt <= this.clock()) {
         // a still-`pending` sleep whose deadline has passed reads as a resolved timer on replay.
@@ -9092,7 +9168,19 @@ export class WorkflowEngine {
         // {@link redriveLostCall}, which owns that decision; a settled checkpoint always wins).
         const existing = await this.store.getCheckpoint(run.id, cmd.seq);
         if (existing) {
-          const leaseAt = redriveLost ? await this.redriveLostCall(run, existing) : undefined;
+          // A `call` that carries its step's policy is retried / timed out under it, exactly as the
+          // in-process `ctx.step` would be (see {@link applyCallPolicy}); without one (or for a
+          // pending step with no liveness window) the lost-dispatch self-heal decides, as before.
+          const policed =
+            redriveLost && cmd.policy !== undefined
+              ? await this.applyCallPolicy(run, cmd, existing)
+              : null;
+          const leaseAt =
+            policed !== null
+              ? policed
+              : redriveLost
+                ? await this.redriveLostCall(run, existing)
+                : undefined;
           if (leaseAt != null) wakeAt = wakeAt == null ? leaseAt : Math.min(wakeAt, leaseAt);
           continue;
         }
@@ -9100,8 +9188,7 @@ export class WorkflowEngine {
         // stamp the deadline by which a result (or a step heartbeat renewing it) must have landed, and
         // suspend the run ON it — so the re-drive lands when it's due instead of waiting for the
         // reconcile sweep. Unset (default) leaves `wakeAt` NULL exactly as before.
-        const lease =
-          this.remoteRedispatchMs == null ? undefined : this.clock() + this.remoteRedispatchMs;
+        const lease = this.callLease(cmd.policy);
         await this.store.saveCheckpoint(
           stepCheckpoint({
             runId: run.id,
@@ -9168,51 +9255,10 @@ export class WorkflowEngine {
         );
         wakeAt = wakeAt == null ? deadline : Math.min(wakeAt, deadline);
       } else if (cmd.kind === 'waitSignal') {
-        // Park on a signal: register a waiter at this seq so engine.signal(token) lands the resolving
-        // `signal` checkpoint here and resumes the run. The token is the signal name, so an external
-        // engine.signal(name, payload) delivers it. If the signal was already delivered (buffered
-        // before the workflow reached this point — e.g. signalWithStart), resolve it now and re-drive
-        // on a macrotask, AFTER this turn suspends and frees the run lock (a re-entrant resume bails).
-        //
-        // NOTE: `WorkflowCommand` has no `waitEvent` kind — a polyglot (remote-executor) workflow has
-        // no way to issue `ctx.waitForEvent(name, { match })` today; only in-process TS workflows
-        // (`workflow-ctx.ts`) can. So buffered EVENTS (`bufferEvent`/`listBufferedEvents`/
-        // `removeBufferedEvent`) are reachable only from `engine.publishEvent` and the in-process
-        // `waitForEvent`/reconcile paths — never from this remote command loop. Extending the
-        // polyglot protocol with an event-wait command is future work, not something to invent here.
-        const deliverBuffered = async (payload: unknown): Promise<void> => {
-          await this.store.saveCheckpoint(
-            instantCheckpoint({
-              runId: run.id,
-              seq: cmd.seq,
-              name: `signal:${cmd.signal}`,
-              kind: 'signal',
-              output: payload,
-            }),
-          );
-          setTimeout(() => void this.resumeImplicit(run.id).catch(() => undefined), 0);
-        };
-        const buffered = await this.store.takeBufferedSignal(cmd.signal);
-        if (buffered) {
-          await deliverBuffered(buffered.payload);
-        } else {
-          // Same reorder as the in-process ctx.waitForSignal (see there for why registering
-          // UNCONDITIONALLY before even the first check is unsafe — it would expose a "this turn is
-          // about to self-resolve" waiter row to a concurrent signal for a token a polyglot entity
-          // loop reuses, which could steal it and misdeliver): check first, and only on a miss
-          // register, then re-check once more before suspending — closing the lost-wake window where
-          // a signal races in between the miss above and the registration below (see the interleaving
-          // proof at engine.signal).
-          await this.store.putSignalWaiter({ token: cmd.signal, runId: run.id, seq: cmd.seq });
-          const lateBuffered = await this.store.takeBufferedSignal(cmd.signal);
-          if (lateBuffered) {
-            // Resolved it ourselves — remove OUR OWN row via the exact match (not
-            // takeSignalWaiter(cmd.signal), which deletes ANY row for this token and could steal a
-            // different run's waiter that has since claimed the same token).
-            await this.store.removeSignalWaiter({ token: cmd.signal, runId: run.id, seq: cmd.seq });
-            await deliverBuffered(lateBuffered.payload);
-          }
-        }
+        // Park on a signal: the token is the signal name, so an external engine.signal(name, payload)
+        // delivers it (see {@link parkRemoteOnSignal}). A named EVENT wait has its own `waitEvent`
+        // command below.
+        await this.parkRemoteOnSignal(run, cmd.seq, cmd.signal);
       } else if (cmd.kind === 'waitAny') {
         // `ctx.waitForAny` on a remote worker: resolved exactly as the in-process ctx resolves it (see
         // wait-any.ts). A wait a condition already settles is re-driven on a macrotask once this turn
@@ -9259,6 +9305,105 @@ export class WorkflowEngine {
           // Already finished before this waiter existed: its notification found none.
           this.redeliverFinishedChild(childId, existingChild);
         }
+      } else if (cmd.kind === 'sleepUntil') {
+        // `ctx.sleepUntil(when)`: a durable timer to an absolute deadline. Recorded once — a re-emitted
+        // command keeps the deadline already on the checkpoint, as the in-process timer does.
+        const existing = await this.store.getCheckpoint(run.id, cmd.seq);
+        const deadline = existing?.wakeAt ?? cmd.until;
+        if (!existing) {
+          await this.store.saveCheckpoint(
+            stepCheckpoint({
+              runId: run.id,
+              seq: cmd.seq,
+              name: `sleep:${cmd.seq}`,
+              kind: 'sleep',
+              status: 'pending',
+              attempts: 1,
+              wakeAt: deadline,
+              enqueuedAt: at,
+              startedAt: at,
+              finishedAt: at,
+            }),
+          );
+        }
+        wakeAt = wakeAt == null ? deadline : Math.min(wakeAt, deadline);
+      } else if (cmd.kind === 'waitSignalTimeout') {
+        // `ctx.waitForSignal(token, { timeoutMs })`: the deadline at `deadlineSeq` (stamped once), the
+        // wait at `seq`. A lapsed deadline is resolved before the next turn's history is read (see
+        // {@link expireRemoteDeadlines}), which drops the waiter so a late signal cannot land.
+        if (await this.store.getCheckpoint(run.id, cmd.seq)) continue;
+        const deadline = await this.stampRemoteDeadline(
+          run.id,
+          cmd.deadlineSeq,
+          cmd.signal,
+          cmd.timeoutMs,
+          { waitSeq: cmd.seq, token: cmd.signal },
+        );
+        if (deadline <= this.clock()) {
+          this.resumeSoon(run.id);
+          continue;
+        }
+        await this.parkRemoteOnSignal(run, cmd.seq, cmd.signal);
+        wakeAt = wakeAt == null ? deadline : Math.min(wakeAt, deadline);
+      } else if (cmd.kind === 'waitEvent') {
+        // `ctx.waitForEvent(name, { match, timeoutMs })`: the same waiter token as the in-process ctx
+        // (so `engine.publishEvent` fans out to it), then a match against what is already buffered.
+        if (await this.store.getCheckpoint(run.id, cmd.seq)) continue;
+        const token = eventToken(cmd.name, cmd.match, run.id, cmd.seq);
+        let deadline: number | undefined;
+        if (cmd.timeoutMs != null && cmd.deadlineSeq != null) {
+          deadline = await this.stampRemoteDeadline(
+            run.id,
+            cmd.deadlineSeq,
+            `event:${cmd.name}`,
+            cmd.timeoutMs,
+            { waitSeq: cmd.seq, token },
+          );
+          if (deadline <= this.clock()) {
+            this.resumeSoon(run.id);
+            continue;
+          }
+        }
+        await this.store.putSignalWaiter({ token, runId: run.id, seq: cmd.seq });
+        const hit = await this.claimBufferedEvent(run, cmd.name, cmd.match ?? {});
+        if (hit) {
+          await this.store.removeSignalWaiter({ token, runId: run.id, seq: cmd.seq });
+          await this.store.saveCheckpoint(
+            instantCheckpoint({
+              runId: run.id,
+              seq: cmd.seq,
+              name: `signal:${token}`,
+              kind: 'signal',
+              output: hit.payload,
+            }),
+          );
+          this.resumeSoon(run.id);
+        } else if (deadline != null) {
+          wakeAt = wakeAt == null ? deadline : Math.min(wakeAt, deadline);
+        }
+      } else if (cmd.kind === 'spawnChild') {
+        // `ctx.startChild` (fire-and-forget): start the child once, idempotent by its id, and journal
+        // `spawn:<childId>` at this position — the in-process checkpoint, so replay returns the id.
+        // The child inherits the parent's partition and tenant, like an awaited child.
+        if (await this.store.getCheckpoint(run.id, cmd.seq)) continue;
+        if (!(await this.store.getRun(cmd.childId))) {
+          this.startChildDeferred(cmd.workflow, cmd.input, cmd.childId, {
+            namespace: run.namespace,
+            ...inheritTenant(run),
+            ...(cmd.priority !== undefined ? { priority: cmd.priority } : {}),
+          });
+        }
+        await this.store.saveCheckpoint(
+          instantCheckpoint({
+            runId: run.id,
+            seq: cmd.seq,
+            name: `spawn:${cmd.childId}`,
+            kind: 'local',
+            output: cmd.childId,
+          }),
+        );
+      } else if (cmd.kind === 'continueAsNew') {
+        // Handled by {@link applyDecision} before the commands are applied; nothing to persist here.
       } else {
         throw new Error(
           `remote workflow command '${(cmd as { kind: string }).kind}' is not supported yet`,
@@ -9266,6 +9411,270 @@ export class WorkflowEngine {
       }
     }
     return wakeAt;
+  }
+
+  /**
+   * Park a remote turn on signal `token` at `seq`: register a waiter so `engine.signal(token)` lands
+   * the resolving `signal` checkpoint here and resumes the run. If the signal was already delivered
+   * (buffered before the workflow reached this point — e.g. signalWithStart), resolve it now and
+   * re-drive on a macrotask, AFTER this turn suspends and frees the run lock (a re-entrant resume
+   * bails).
+   */
+  private async parkRemoteOnSignal(run: WorkflowRun, seq: number, token: string): Promise<void> {
+    const deliverBuffered = async (payload: unknown): Promise<void> => {
+      await this.store.saveCheckpoint(
+        instantCheckpoint({
+          runId: run.id,
+          seq: seq,
+          name: `signal:${token}`,
+          kind: 'signal',
+          output: payload,
+        }),
+      );
+      this.resumeSoon(run.id);
+    };
+    const buffered = await this.store.takeBufferedSignal(token);
+    if (buffered) {
+      await deliverBuffered(buffered.payload);
+    } else {
+      // Same reorder as the in-process ctx.waitForSignal (see there for why registering
+      // UNCONDITIONALLY before even the first check is unsafe — it would expose a "this turn is
+      // about to self-resolve" waiter row to a concurrent signal for a token a polyglot entity
+      // loop reuses, which could steal it and misdeliver): check first, and only on a miss
+      // register, then re-check once more before suspending — closing the lost-wake window where
+      // a signal races in between the miss above and the registration below (see the interleaving
+      // proof at engine.signal).
+      await this.store.putSignalWaiter({ token: token, runId: run.id, seq: seq });
+      const lateBuffered = await this.store.takeBufferedSignal(token);
+      if (lateBuffered) {
+        // Resolved it ourselves — remove OUR OWN row via the exact match (not
+        // takeSignalWaiter(token), which deletes ANY row for this token and could steal a
+        // different run's waiter that has since claimed the same token).
+        await this.store.removeSignalWaiter({ token: token, runId: run.id, seq: seq });
+        await deliverBuffered(lateBuffered.payload);
+      }
+    }
+  }
+
+  /** Re-drive `runId` on a macrotask, after the current turn has suspended and freed its lease. */
+  private resumeSoon(runId: string): void {
+    setTimeout(() => void this.resumeImplicit(runId).catch(() => undefined), 0);
+  }
+
+  /**
+   * Stamp the deadline of a BOUNDED remote wait at `deadlineSeq`, once: the first apply records
+   * `now + timeoutMs` as a `timeout:<label>` timer, and every later one reads the recorded deadline
+   * back (the in-process `stampDeadline`). The checkpoint's `input` names the wait it bounds, so the
+   * deadline can drop that wait's waiter when it lapses — see {@link expireRemoteDeadlines}.
+   */
+  private async stampRemoteDeadline(
+    runId: string,
+    deadlineSeq: number,
+    label: string,
+    timeoutMs: number,
+    wait: { waitSeq: number; token: string },
+  ): Promise<number> {
+    const recorded = await this.store.getCheckpoint(runId, deadlineSeq);
+    if (recorded?.wakeAt != null) return recorded.wakeAt;
+    const deadline = this.clock() + timeoutMs;
+    const at = new Date();
+    await this.store.saveCheckpoint(
+      stepCheckpoint({
+        runId,
+        seq: deadlineSeq,
+        name: `timeout:${label}`,
+        kind: 'sleep',
+        status: 'pending',
+        attempts: 1,
+        input: wait,
+        wakeAt: deadline,
+        enqueuedAt: at,
+        startedAt: at,
+        finishedAt: at,
+      }),
+    );
+    return deadline;
+  }
+
+  /**
+   * Before a remote turn reads its history: a bounded wait whose deadline has lapsed drops its waiter
+   * (exact row only), so a signal or event arriving later cannot resolve a wait the turn already saw
+   * time out — the in-process wait removes its waiter the same way when it finds the deadline past.
+   * A delivery that took the waiter first wins: its checkpoint is read back into `checkpoints`, and the
+   * worker's replay checks the wait before the deadline. Returns the (possibly extended) list.
+   */
+  private async expireRemoteDeadlines(
+    runId: string,
+    checkpoints: StepCheckpoint[],
+  ): Promise<StepCheckpoint[]> {
+    const now = this.clock();
+    const settled = new Set(
+      checkpoints.filter((cp) => cp.status === 'completed').map((cp) => cp.seq),
+    );
+    let out = checkpoints;
+    for (const cp of checkpoints) {
+      if (cp.kind !== 'sleep' || cp.status !== 'pending' || !cp.name.startsWith('timeout:'))
+        continue;
+      if (cp.wakeAt == null || cp.wakeAt > now) continue;
+      const wait = cp.input as { waitSeq?: unknown; token?: unknown } | undefined;
+      if (typeof wait?.waitSeq !== 'number' || typeof wait.token !== 'string') continue;
+      if (settled.has(wait.waitSeq)) continue;
+      await this.store.removeSignalWaiter({ token: wait.token, runId, seq: wait.waitSeq });
+      const landed = await this.store.getCheckpoint(runId, wait.waitSeq);
+      if (landed && landed.status === 'completed') {
+        out = [...out.filter((c) => c.seq !== landed.seq), landed].sort((a, b) => a.seq - b.seq);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Claim one buffered event `name` whose payload satisfies `match` and that this run's tenant may
+   * see — the remote twin of the in-process `waitForEvent`'s buffered consumption (oldest first; a
+   * candidate claimed elsewhere first is skipped, not waited on). Expired candidates are pruned when
+   * {@link eventBufferTtlMs} is set, like the reconcile sweep.
+   */
+  private async claimBufferedEvent(
+    run: WorkflowRun,
+    name: string,
+    match: Record<string, unknown>,
+  ): Promise<{ payload: unknown } | undefined> {
+    const candidates = await this.store.listBufferedEvents(name, EVENT_BUFFER_SCAN_LIMIT);
+    const nowMs = this.clock();
+    for (const candidate of candidates) {
+      if (this.eventBufferTtlMs != null && nowMs - candidate.publishedAt > this.eventBufferTtlMs) {
+        await this.store.removeBufferedEvent(candidate.id);
+        continue;
+      }
+      const { payload, tenantIds } = readBufferedEvent(candidate.payload);
+      if (!bufferedEventReaches(tenantIds, run.tenantId)) continue;
+      if (!eventMatches(payload, match)) continue;
+      if (!(await this.store.removeBufferedEvent(candidate.id))) continue;
+      return { payload };
+    }
+    return undefined;
+  }
+
+  /** The lease a freshly dispatched remote `call` parks on: its liveness `timeoutMs` when its policy
+   *  sets one, else the lost-dispatch window (`remoteRedispatchMs`), else none. */
+  private callLease(policy: RemoteCallPolicy | undefined): number | undefined {
+    if (policy?.timeoutMs) return this.clock() + policy.timeoutMs;
+    return this.remoteRedispatchMs == null ? undefined : this.clock() + this.remoteRedispatchMs;
+  }
+
+  /**
+   * A re-emitted remote `call` that carries its step's policy: apply the policy to the step's
+   * checkpoint exactly as the in-process `ctx.step` path ({@link callRemote} / {@link
+   * callRemoteInMemory}) applies it, so a step declared with retries, backoff or a timeout on a tenant
+   * behaves as it does on a standalone engine. Returns the time to park the run on (`undefined`: no
+   * timer, the step's result or the next turn moves it), or `null` when the policy has nothing to say
+   * and the lost-dispatch self-heal ({@link redriveLostCall}) decides.
+   *
+   *  - FAILED and retried (see `remoteCallRetries`): the first sight stamps the backoff deadline on
+   *    the failed checkpoint (`wakeAt`, durable and stable across replays); once due, the step is
+   *    dispatched again under the same `stepId` with `attempts + 1`.
+   *  - PENDING with a `timeoutMs`: the step's lease is `timeoutMs` from its dispatch. A lapsed lease
+   *    re-dispatches while attempts remain, then fails the step with a `remote_step_timeout` error the
+   *    workflow can catch, as `RemoteStepTimeout` would surface in-process.
+   */
+  private async applyCallPolicy(
+    run: WorkflowRun,
+    cmd: Extract<WorkflowCommand, { kind: 'call' }>,
+    cp: StepCheckpoint,
+  ): Promise<number | undefined | null> {
+    const policy = cmd.policy as RemoteCallPolicy;
+    if (cp.kind !== 'remote') return null;
+    if (cp.status === 'failed') {
+      if (!remoteCallRetries(policy, cp.attempts, cp.error)) return undefined;
+      let due = cp.wakeAt;
+      if (due == null) {
+        due = this.clock() + backoffDelay(cp.attempts, policy as StepOptions);
+        if (due > this.clock()) {
+          await this.store.saveCheckpoint({ ...cp, wakeAt: due });
+          return due;
+        }
+      }
+      if (this.clock() < due) return due;
+      return this.redispatchCall(run, cmd, cp, cp.attempts + 1, policy, 'retry');
+    }
+    if (cp.status !== 'pending' || !policy.timeoutMs) return null;
+    if (cp.wakeAt == null) {
+      const lease = this.clock() + policy.timeoutMs;
+      await this.store.saveCheckpoint({ ...cp, wakeAt: lease });
+      return this.stepLeaseWakeAt(lease);
+    }
+    if (this.clock() < cp.wakeAt) return this.stepLeaseWakeAt(cp.wakeAt);
+    if (cp.attempts < remoteCallMaxAttempts(policy)) {
+      return this.redispatchCall(run, cmd, cp, cp.attempts + 1, policy, 'timeout');
+    }
+    const id = cp.stepId ?? stepId(run.id, cp.seq);
+    const error = {
+      message: new RemoteStepTimeout(id, policy.timeoutMs).message,
+      code: 'remote_step_timeout',
+    };
+    await this.store.saveCheckpoint({
+      ...cp,
+      status: 'failed',
+      error,
+      wakeAt: undefined,
+      finishedAt: new Date(),
+    });
+    this.emit({
+      type: 'step.failed',
+      runId: run.id,
+      seq: cp.seq,
+      name: cp.name,
+      kind: 'remote',
+      error,
+    });
+    // The failure is in the run's history now; `redriveIfTurnSawStaleHistory` re-drives the run.
+    return undefined;
+  }
+
+  /** Dispatch a policed remote `call` again as attempt `attempt` (a retry, or a timed-out attempt). */
+  private async redispatchCall(
+    run: WorkflowRun,
+    cmd: Extract<WorkflowCommand, { kind: 'call' }>,
+    cp: StepCheckpoint,
+    attempt: number,
+    policy: RemoteCallPolicy,
+    why: 'retry' | 'timeout',
+  ): Promise<number | undefined> {
+    const lease = this.callLease(policy);
+    const at = new Date();
+    await this.store.saveCheckpoint({
+      ...cp,
+      status: 'pending',
+      output: undefined,
+      error: undefined,
+      attempts: attempt,
+      wakeAt: lease,
+      enqueuedAt: at,
+      startedAt: at,
+      finishedAt: at,
+      events:
+        why === 'timeout'
+          ? [...(cp.events ?? []), lostStepEvent(this.clock(), attempt, 'redispatched')]
+          : cp.events,
+    });
+    await this.dispatchRemoteTask({
+      runId: run.id,
+      seq: cp.seq,
+      name: cmd.name,
+      stepId: cp.stepId ?? stepId(run.id, cp.seq),
+      group: cp.workerGroup ?? tenantGroup(sanitizeQueueToken(cmd.name), cmd.group),
+      input: cp.input,
+      attempt,
+    });
+    this.emit({
+      type: 'step.started',
+      runId: run.id,
+      seq: cp.seq,
+      name: cmd.name,
+      kind: 'remote',
+      ...(why === 'timeout' ? { redispatched: true } : {}),
+    });
+    return lease == null ? undefined : this.stepLeaseWakeAt(lease);
   }
 
   /**

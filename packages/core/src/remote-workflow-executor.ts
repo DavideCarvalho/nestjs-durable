@@ -1,9 +1,10 @@
-import type {
-  HistoryEvent,
-  Transport,
-  WorkflowExecutor,
-  WorkflowRun,
-  WorkflowTask,
+import {
+  type HistoryEvent,
+  REMOTE_WORKFLOW_FEATURES,
+  type Transport,
+  type WorkflowExecutor,
+  type WorkflowRun,
+  type WorkflowTask,
 } from './interfaces';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group';
 
@@ -66,6 +67,9 @@ export class RemoteWorkflowExecutor implements WorkflowExecutor {
       group: tenantGroup(sanitizeQueueToken(this.name), this.partition),
       priority: run.priority,
       attempt: 1,
+      // What this control plane applies beyond the original command kinds, so a worker fails a turn
+      // that needs more instead of emitting a command this engine would not understand.
+      features: [...REMOTE_WORKFLOW_FEATURES],
     };
     await this.transport.dispatchWorkflowTask(task);
   }

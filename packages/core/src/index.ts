@@ -48,6 +48,11 @@ export {
 } from './copy-guard';
 export * from './scheduler';
 export * from './schedules';
+export {
+  remoteCallMaxAttempts,
+  remoteCallPolicyOf,
+  remoteCallRetries,
+} from './remote-call-policy';
 export { createStepLogger } from './step-logger';
 export {
   DURABLE_STEP_CONFIG,

@@ -182,27 +182,6 @@ describe('WorkflowContext.waitForSignal', () => {
     expect(ctx.commands).toEqual([{ kind: 'waitSignal', seq: 0, signal: 'approve' }]);
   });
 
-  it('throws UnsupportedOnThinWorker and consumes no seq when timeoutMs is set', async () => {
-    const ctx = new WorkflowContext('r1', []);
-    await expect(ctx.waitForSignal('approve', { timeoutMs: 5_000 })).rejects.toBeInstanceOf(
-      UnsupportedOnThinWorker,
-    );
-    // No seq consumed, no command emitted — the bounded path is rejected before next() is called.
-    expect(ctx.commands).toEqual([]);
-  });
-
-  it('seq is unchanged after bounded throw — next op lands at seq 0', async () => {
-    const ctx = new WorkflowContext('r1', []);
-    try {
-      await ctx.waitForSignal('approve', { timeoutMs: 1 });
-    } catch (e) {
-      if (!(e instanceof UnsupportedOnThinWorker)) throw e;
-    }
-    // Unbounded waitForSignal is now the first real op — it must land at seq 0.
-    await expect(ctx.waitForSignal('approve')).rejects.toBeInstanceOf(Suspend);
-    expect(ctx.commands).toEqual([{ kind: 'waitSignal', seq: 0, signal: 'approve' }]);
-  });
-
   it('consumes a pending signal at this seq', async () => {
     const ctx = new WorkflowContext('r1', [], {
       pendingSignals: [{ seq: 0, signal: 'approve', payload: { by: 'davi' } }],
@@ -300,22 +279,10 @@ describe('WorkflowContext unsupported ops throw UnsupportedOnThinWorker', () => 
       UnsupportedOnThinWorker,
     );
   });
-  it('continueAsNew', async () => {
-    await expect(ctx().continueAsNew({})).rejects.toBeInstanceOf(UnsupportedOnThinWorker);
-  });
-  it('sleepUntil', async () => {
-    await expect(ctx().sleepUntil(Date.now())).rejects.toBeInstanceOf(UnsupportedOnThinWorker);
-  });
-  it('waitForEvent', async () => {
-    await expect(ctx().waitForEvent('e')).rejects.toBeInstanceOf(UnsupportedOnThinWorker);
-  });
   it('task', async () => {
     await expect(ctx().task('t', async () => undefined)).rejects.toBeInstanceOf(
       UnsupportedOnThinWorker,
     );
-  });
-  it('startChild (fire-and-forget)', async () => {
-    await expect(ctx().startChild('wf', {})).rejects.toBeInstanceOf(UnsupportedOnThinWorker);
   });
   it('breakpoint', async () => {
     await expect(ctx().breakpoint('b')).rejects.toBeInstanceOf(UnsupportedOnThinWorker);
@@ -323,14 +290,16 @@ describe('WorkflowContext unsupported ops throw UnsupportedOnThinWorker', () => 
   it('webhook', () => {
     expect(() => ctx().webhook()).toThrow(UnsupportedOnThinWorker);
   });
-  it('setEvent', async () => {
-    await expect(ctx().setEvent('k', 1)).rejects.toBeInstanceOf(UnsupportedOnThinWorker);
-  });
   it('onUpdate', async () => {
     await expect(ctx().onUpdate('u')).rejects.toBeInstanceOf(UnsupportedOnThinWorker);
   });
   it('patched', async () => {
     await expect(ctx().patched('p')).rejects.toBeInstanceOf(UnsupportedOnThinWorker);
+  });
+  it('upsertSearchAttributes', async () => {
+    await expect(ctx().upsertSearchAttributes({ a: 1 })).rejects.toBeInstanceOf(
+      UnsupportedOnThinWorker,
+    );
   });
 
   it('carries the op name on the error', async () => {
