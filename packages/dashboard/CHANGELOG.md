@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.68.0
+
+### Minor Changes
+
+- [#476](https://github.com/DavideCarvalho/nestjs-durable/pull/476) [`a462be3`](https://github.com/DavideCarvalho/nestjs-durable/commit/a462be30c0f81e99fe42f2e786891c6c03be5248) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The Runs board's filters now live in the URL, so a filtered view can be shared, bookmarked and reloaded, and Back/Forward step through it: status, tag, namespace, attribute predicates and origin sit in the hash's query (`#?status=failed&tag=vip`, `#/run/<id>?status=failed`), read and written with nuqs through the console kit's hash adapter. A value at its default is left out, so existing `#/run/<id>` links open as before, and the filters still survive a trip to Workers and back.
+
 ## 0.67.0
 
 ### Minor Changes
