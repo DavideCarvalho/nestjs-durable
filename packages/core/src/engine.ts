@@ -9345,11 +9345,12 @@ export class WorkflowEngine {
 
   /** The live descriptors for `token`, reused for {@link workerDescriptorCacheMs}; one read in flight. */
   private liveWorkerDescriptors(token: string, fresh = false): Promise<WorkerDescriptor[]> {
-    if (this.workerDescriptorCacheMs <= 0) return this.pool.readWorkerDescriptors(token);
+    const opts = fresh ? { fresh: true } : undefined;
+    if (this.workerDescriptorCacheMs <= 0) return this.pool.readWorkerDescriptors(token, opts);
     const now = Date.now();
     const cached = this.descriptorCache.get(token);
     if (!fresh && cached && now - cached.at < this.workerDescriptorCacheMs) return cached.read;
-    const read = this.pool.readWorkerDescriptors(token);
+    const read = this.pool.readWorkerDescriptors(token, opts);
     const entry = { at: now, read };
     this.descriptorCache.set(token, entry);
     // A failed read is not reused: the next dispatch asks again.

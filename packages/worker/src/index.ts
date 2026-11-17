@@ -30,6 +30,13 @@ export type {
   StartRunOptions,
 } from './redis-runner';
 export { runRedisWorker, startRun } from './redis-runner';
+export {
+  encodeInstanceRecord,
+  type RegistryFieldEntry,
+  RegistryWriter,
+  type WorkerRegistryWriteOptions,
+  workerInstancesKey,
+} from './worker-registry';
 export { normalizeRedisConnection, redisUrlToOptions } from './redis-url';
 export type { HandleTaskOptions, HandledTask } from './runner-core';
 export {

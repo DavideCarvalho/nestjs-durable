@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import {
   AdaptiveController,
@@ -40,6 +41,15 @@ import {
 } from '@dudousxd/nestjs-durable-core';
 import { type ConnectionOptions, type Job, Queue, Worker } from 'bullmq';
 import { Redis, type RedisOptions } from 'ioredis';
+import {
+  REGISTRY_READ_MAX_AGE_MS,
+  type RegistryEntry,
+  type RegistryRedis,
+  WorkerRegistry,
+  type WorkerRegistryOptions,
+} from './worker-registry';
+
+export type { WorkerRegistryOptions } from './worker-registry';
 
 // Worker liveness heartbeat: a worker stamps a TTL'd key while it's consuming; the key expiring is
 // the "this worker is gone/stalled" signal a monitor watches. TTL comfortably exceeds the interval
@@ -264,6 +274,20 @@ export function parseHeartbeatValue(raw: string | null): {
   }
 }
 
+/** The most distinct descriptor values kept parsed before the cache starts over. */
+const PARSED_DESCRIPTORS_MAX = 256;
+
+/** A registry heartbeat entry as a {@link WorkerHeartbeat} of `group`. */
+function toWorkerHeartbeat(entry: RegistryEntry, group: string): WorkerHeartbeat {
+  const parsed = parseHeartbeatValue(entry.raw);
+  return {
+    group,
+    instanceId: entry.instance,
+    lastBeatAt: parsed.lastBeatAt,
+    ...(parsed.status !== undefined ? { status: parsed.status } : {}),
+  };
+}
+
 /** SDK identity stamped into every descriptor this transport advertises (observability only). */
 const SDK_NAME = '@dudousxd/nestjs-durable-transport-bullmq';
 
@@ -439,6 +463,17 @@ export interface BullMQTransportOptions {
    * ignored.
    */
   stalledInterval?: number;
+  /**
+   * Where and how the worker registry (worker liveness, handshake descriptors, run-queue consumers)
+   * is kept. It lives in ONE hash per prefix, `<prefix>-workers:instances`, one field per instance,
+   * read with one `HGETALL` reused for 30 s by every reader of the process — the same layout as the
+   * AdonisJS durable lib, so both fleets on one Redis see each other. The per-instance keys older
+   * readers and writers use (`<prefix>-worker-heartbeat:*`, `<prefix>-worker-descriptor:*`) are
+   * still written (`legacyWrites`) and read with a throttled SCAN (`legacyScan`) until turned off.
+   * `connection` keeps the hashes on another connection (e.g. another db); every process of the
+   * fleet must use the same one. The per-instance keys stay on `connection` of the transport.
+   */
+  workerRegistry?: WorkerRegistryOptions & { connection?: ConnectionOptions | string };
 }
 
 /** Default {@link BullMQTransportOptions.drainDelay}, in seconds. */
@@ -523,6 +558,11 @@ export class BullMQTransport implements Transport, ControlPlane {
   private workerController?: AdaptiveController;
   private workerHeartbeatTimer?: ReturnType<typeof setInterval>;
   private workerHeartbeatRedis?: Redis;
+  /** The client of `workerRegistry.connection`, when set. */
+  private registryRedis?: Redis;
+  private readonly registryConnection: ConnectionOptions | undefined;
+  /** See {@link BullMQTransportOptions.workerRegistry}. */
+  private readonly registry: WorkerRegistry;
   // Per-handler heartbeat tokens beaten on the single shared `workerHeartbeatTimer` — one entry per
   // `handle()`d name (its `tenantGroup(sanitizeQueueToken(name), partition)` queue token).
   private readonly heartbeatTokens = new Set<string>();
@@ -595,6 +635,22 @@ export class BullMQTransport implements Transport, ControlPlane {
       drainDelay: positive(options.drainDelay) ? options.drainDelay : DEFAULT_DRAIN_DELAY_SECONDS,
       ...(positive(options.stalledInterval) ? { stalledInterval: options.stalledInterval } : {}),
     };
+    const registryConnection = options.workerRegistry?.connection;
+    this.registryConnection =
+      registryConnection === undefined
+        ? undefined
+        : (normalizeRedisConnection(registryConnection) as ConnectionOptions);
+    this.registry = new WorkerRegistry({
+      effPrefix: this.#effectivePrefix(),
+      keys: () => this.workerRedis() as unknown as RegistryRedis,
+      hashes: () => this.registryClient() as unknown as RegistryRedis,
+      nonce: randomUUID().slice(0, 8),
+      beatAt: (raw) => parseHeartbeatValue(raw).lastBeatAt,
+      beatTtlMs: WORKER_HEARTBEAT_TTL_SECONDS * 1000,
+      // Best-effort like every registry write: a failed walk keeps the previous one.
+      onError: () => undefined,
+      options: options.workerRegistry,
+    });
     const results = options.resultConcurrency;
     this.resultConcurrency = Math.max(
       RESULT_CONSUMER_CONCURRENCY,
@@ -969,17 +1025,6 @@ export class BullMQTransport implements Transport, ControlPlane {
     });
   }
 
-  private workerHeartbeatKey(routingToken: string, instanceId: string): string {
-    return `${this.#effectivePrefix()}-worker-heartbeat:${routingToken}:${instanceId}`;
-  }
-
-  /** Full worker-descriptor key (handshake design §7.2): the expensive value re-read only when the
-   *  compact heartbeat's ETag changes. CROSS-SDK CONTRACT — MUST match the key the adonis + python
-   *  SDKs advertise to: `<prefix>-worker-descriptor:<routingToken>:<instanceId>`. */
-  private workerDescriptorKey(routingToken: string, instanceId: string): string {
-    return `${this.#effectivePrefix()}-worker-descriptor:${routingToken}:${instanceId}`;
-  }
-
   /** This instance's live handshake descriptor: its `handle()`d step names + the v1 capability
    *  baseline. Rebuilt each beat so a handler registered after the timer started is advertised. */
   private buildDescriptor(): WorkerDescriptor {
@@ -992,217 +1037,178 @@ export class BullMQTransport implements Transport, ControlPlane {
     });
   }
 
-  /** Lazily-created standalone client for the worker-heartbeat keys (writes + scans), reused so a
-   *  worker doesn't open a fresh connection per beat/read. */
+  /** Lazily-created standalone client for the per-instance worker keys (writes + the compatibility
+   *  walk), reused so a worker doesn't open a fresh connection per beat/read. */
   private workerRedis(): Redis {
     if (!this.workerHeartbeatRedis) this.workerHeartbeatRedis = this.redis();
     return this.workerHeartbeatRedis;
   }
 
-  /** Refresh EVERY `handle()`d name's TTL'd liveness key on ONE shared interval until `close()` —
-   *  each handler name keeps its own key (`workerHeartbeatKey(routingToken, instanceId)`) so
-   *  `groupHealth`/`listWorkerGroups` still resolve liveness per per-handler queue. Best-effort: a
-   *  failed refresh is swallowed (the key then expires, and that gap is itself the signal). A newly
-   *  added token beats immediately so a freshly-registered handler is visible without waiting a full
-   *  interval. */
+  /** The client the registry hashes live on: `workerRegistry.connection`, else {@link workerRedis}. */
+  private registryClient(): Redis {
+    if (!this.registryConnection) return this.workerRedis();
+    if (!this.registryRedis) {
+      const c = this.registryConnection;
+      this.registryRedis =
+        c instanceof Redis
+          ? c.duplicate()
+          : new Redis({
+              keepAlive: DEFAULT_KEEPALIVE_MS,
+              ...(c as Omit<RedisOptions, 'replyMapping'>),
+            });
+    }
+    return this.registryRedis;
+  }
+
+  /**
+   * Advertise EVERY `handle()`d name's liveness and descriptor on ONE shared interval until
+   * `close()`: one write of this instance's field in the registry hash per beat, whatever the number
+   * of handlers, plus the per-instance keys older readers read when those are due (see
+   * {@link BullMQTransportOptions.workerRegistry}). Each handler name keeps its own token, so
+   * `groupHealth`/`listWorkerGroups` still resolve liveness per per-handler queue. Best-effort: a
+   * failed refresh is swallowed (the entry then expires, and that gap is itself the signal). A newly
+   * added token beats immediately so a freshly-registered handler is visible without waiting a full
+   * interval, and this process's own reads see it at once.
+   */
   private startWorkerHeartbeat(routingToken: string): void {
-    const client = this.workerRedis();
     const controller = this.controller();
-    const beatOne = (token: string) => {
+    const beat = (forced: readonly string[]) => {
       // Two-tier handshake advertisement (design §7.2): the cheap compact beat carries the descriptor
-      // ETag, and the full descriptor is published to its own key — the control-plane re-reads the
-      // latter only when the ETag changes. Both share the heartbeat TTL, so a dead worker's descriptor
-      // expires alongside its liveness key.
+      // ETag, and the full descriptor is published next to it. Both share the heartbeat TTL, so a
+      // dead worker's descriptor expires alongside its liveness.
       const descriptor = this.buildDescriptor();
-      const hash = descriptorHash(descriptor);
-      const key = this.workerHeartbeatKey(token, this.instanceId);
+      const tokens = [...this.heartbeatTokens];
       // Value is `{ts,status,descriptorHash}` JSON (was a bare ms timestamp); readers accept all forms.
       const value = JSON.stringify({
         ts: Date.now(),
         status: controller.snapshot(),
-        descriptorHash: hash,
+        descriptorHash: descriptorHash(descriptor),
       });
-      void client.set(key, value, 'EX', WORKER_HEARTBEAT_TTL_SECONDS).catch(() => {});
-      const descKey = this.workerDescriptorKey(token, this.instanceId);
-      void client
-        .set(descKey, JSON.stringify(descriptor), 'EX', WORKER_HEARTBEAT_TTL_SECONDS)
-        .catch(() => {});
+      const write = (kind: 'heartbeats' | 'descriptors', v: string, force: readonly string[]) =>
+        Promise.all([
+          this.registry.advertise({
+            instance: this.instanceId,
+            kind,
+            tokens: tokens.filter((t) => !force.includes(t)),
+            value: v,
+            ttlSeconds: WORKER_HEARTBEAT_TTL_SECONDS,
+          }),
+          force.length > 0
+            ? this.registry.advertise({
+                instance: this.instanceId,
+                kind,
+                tokens: force,
+                value: v,
+                ttlSeconds: WORKER_HEARTBEAT_TTL_SECONDS,
+                force: true,
+              })
+            : undefined,
+        ]);
+      // A changed descriptor (a new step) is rewritten for every token at once, not on the next
+      // interval: a reader keeps whichever copy it meets first.
+      void Promise.all([
+        write('heartbeats', value, forced),
+        write('descriptors', JSON.stringify(descriptor), []),
+      ]).catch(() => {});
     };
-    const isNewToken = !this.heartbeatTokens.has(routingToken);
-    this.heartbeatTokens.add(routingToken);
-    // A new token means a new step in the descriptor, so EVERY token's copy is rewritten now, not on
-    // the next interval: readers keep whichever copy their SCAN meets first, and a stale one would
-    // leave the new step's heartbeat undeclared and listed as a callable workflow.
-    if (isNewToken) for (const token of this.heartbeatTokens) beatOne(token);
+    if (!this.heartbeatTokens.has(routingToken)) {
+      this.heartbeatTokens.add(routingToken);
+      beat([routingToken]);
+    }
     if (this.workerHeartbeatTimer) return;
-    this.workerHeartbeatTimer = setInterval(() => {
-      for (const token of this.heartbeatTokens) beatOne(token);
-    }, WORKER_HEARTBEAT_INTERVAL_MS);
+    this.workerHeartbeatTimer = setInterval(() => beat([]), WORKER_HEARTBEAT_INTERVAL_MS);
     // Don't keep the event loop alive just for the heartbeat (a worker should exit when idle-closing).
     this.workerHeartbeatTimer.unref?.();
   }
 
-  /** Distinct routing tokens with a live worker heartbeat, discovered by scanning the heartbeat
-   *  keyspace. A key is `<prefix>-worker-heartbeat:<routingToken>:<instanceId>` and neither segment
-   *  carries a `:`, so the token is the segment between the fixed prefix and the next `:`. */
+  /** Distinct routing tokens with a live worker heartbeat, from the shared registry read. */
   async listWorkerGroups(): Promise<string[]> {
-    const client = this.workerRedis();
-    const prefix = `${this.#effectivePrefix()}-worker-heartbeat:`;
+    const { heartbeats } = await this.registry.entries(REGISTRY_READ_MAX_AGE_MS);
     const groups = new Set<string>();
-    let cursor = '0';
-    do {
-      const [next, keys] = await client.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 100);
-      cursor = next;
-      for (const key of keys) {
-        const rest = key.slice(prefix.length);
-        const sep = rest.indexOf(':');
-        const group = sep === -1 ? rest : rest.slice(0, sep);
-        if (group) groups.add(group);
-      }
-    } while (cursor !== '0');
+    for (const { token } of heartbeats) if (token) groups.add(token);
     return [...groups];
   }
 
   async groupHealth(group: string): Promise<GroupHealth> {
-    const counts = await this.queue(this.tasksName(group)).getJobCounts(
-      'waiting',
-      'active',
-      'delayed',
-      'prioritized',
-    );
+    const [counts, liveWorkers] = await Promise.all([
+      this.queue(this.tasksName(group)).getJobCounts('waiting', 'active', 'delayed', 'prioritized'),
+      this.listLiveWorkers(group),
+    ]);
     const depth = Object.values(counts).reduce((sum, n) => sum + (n ?? 0), 0);
-    return { group, depth, liveWorkers: await this.listLiveWorkers(group) };
+    return { group, depth, liveWorkers };
   }
 
-  /** Live workers for `group`: SCAN the heartbeat keys (never KEYS — it blocks Redis) and read each.
-   *  A returned key is live by definition (the TTL hasn't expired). Tolerates BOTH heartbeat value
-   *  forms: the new `{ts,status}` JSON (newer SDKs — populates `status` + `lastBeatAt`) and an older
-   *  bare timestamp (this SDK's ms / the Python SDK's seconds — `lastBeatAt` only, `status` undefined). */
+  /** Live workers for `group`, from the shared registry read. Tolerates BOTH heartbeat value forms:
+   *  the `{ts,status}` JSON (newer SDKs — `status` + `lastBeatAt`) and an older bare timestamp (this
+   *  SDK's ms / the Python SDK's seconds — `lastBeatAt` only). */
   private async listLiveWorkers(group: string): Promise<WorkerHeartbeat[]> {
-    const client = this.workerRedis();
-    const match = this.workerHeartbeatKey(group, '*');
-    const prefix = this.workerHeartbeatKey(group, '');
-    const workers: WorkerHeartbeat[] = [];
-    let cursor = '0';
-    do {
-      const [next, keys] = await client.scan(cursor, 'MATCH', match, 'COUNT', 100);
-      cursor = next;
-      for (const key of keys) {
-        const raw = await client.get(key);
-        const parsed = parseHeartbeatValue(raw);
-        workers.push({
-          group,
-          instanceId: key.slice(prefix.length),
-          lastBeatAt: parsed.lastBeatAt,
-          ...(parsed.status !== undefined ? { status: parsed.status } : {}),
-        });
+    const { heartbeats } = await this.registry.entries(REGISTRY_READ_MAX_AGE_MS);
+    return heartbeats.filter((e) => e.token === group).map((e) => toWorkerHeartbeat(e, group));
+  }
+
+  /** Parsed descriptors by raw value: the same few values are read before every dispatch. */
+  private readonly parsedDescriptors = new Map<string, WorkerDescriptor | null>();
+
+  private parseDescriptors(entries: RegistryEntry[]): WorkerDescriptor[] {
+    if (this.parsedDescriptors.size > PARSED_DESCRIPTORS_MAX) this.parsedDescriptors.clear();
+    const out: WorkerDescriptor[] = [];
+    for (const { raw } of entries) {
+      let parsed = this.parsedDescriptors.get(raw);
+      if (parsed === undefined) {
+        try {
+          parsed = JSON.parse(raw) as WorkerDescriptor;
+        } catch {
+          parsed = null; // a garbled descriptor is skipped — the next beat rewrites it
+        }
+        this.parsedDescriptors.set(raw, parsed);
       }
-    } while (cursor !== '0');
-    return workers;
+      if (parsed) out.push(parsed);
+    }
+    return out;
   }
 
   /**
-   * Control-plane READ side of the handshake (design §7.2/§7.3): SCAN the full worker-descriptor keys
-   * advertised for `group` and parse each into a {@link WorkerDescriptor}. A key present is live (the
-   * TTL hasn't expired). This is the expensive read the compact-heartbeat ETag lets a caller skip when
-   * nothing changed. Cross-SDK: reads descriptors published by node, python or adonis workers alike.
+   * Control-plane READ side of the handshake (design §7.2/§7.3): the live descriptors advertised for
+   * `group`, from the shared registry read (at most 30 s old). `fresh` re-reads the registry hash:
+   * the engine does so before it parks a run `blocked`, so a capable worker that joined inside the
+   * reuse window is never missed. Cross-SDK: reads descriptors published by node, python or adonis
+   * workers alike.
    */
-  async readWorkerDescriptors(group: string): Promise<WorkerDescriptor[]> {
-    const client = this.workerRedis();
-    const match = this.workerDescriptorKey(group, '*');
-    const descriptors: WorkerDescriptor[] = [];
-    let cursor = '0';
-    do {
-      // MATCH filters after the scan, so the whole keyspace is walked either way: big pages keep that
-      // to a few round trips, and one MGET per page reads the matches.
-      const [next, keys] = await client.scan(cursor, 'MATCH', match, 'COUNT', 1000);
-      cursor = next;
-      if (keys.length === 0) continue;
-      const values = await client.mget(...keys);
-      for (const raw of values) {
-        if (raw == null) continue;
-        try {
-          descriptors.push(JSON.parse(raw) as WorkerDescriptor);
-        } catch {
-          // A partially-written/garbled descriptor is skipped — the next beat rewrites it.
-        }
-      }
-    } while (cursor !== '0');
-    return descriptors;
+  async readWorkerDescriptors(
+    group: string,
+    opts?: { fresh?: boolean | undefined },
+  ): Promise<WorkerDescriptor[]> {
+    const { descriptors } = await this.registry.entries(opts?.fresh ? 0 : REGISTRY_READ_MAX_AGE_MS);
+    return this.parseDescriptors(descriptors.filter((e) => e.token === group));
   }
 
   /**
    * Every live descriptor in this deployment, across all groups — the read behind the announced
-   * workflow registry (design §7.9). ONE `SCAN` of the advertisement keyspace
-   * (`<prefix>-worker-descriptor:*`), de-duplicated by `instanceId` because a worker publishes the
-   * same descriptor under every routing token it consumes. A key present is live by definition (the
-   * heartbeat TTL has not expired), so a dead worker's announcements are gone without any expiry
-   * bookkeeping here.
-   *
-   * Scoped by `#effectivePrefix()` like every other key this transport touches, so a namespaced
-   * deployment never sees another one's workers.
+   * workflow registry (design §7.9), de-duplicated by `instanceId` because a worker publishes the
+   * same descriptor under every routing token it consumes. Scoped by `#effectivePrefix()` like every
+   * other key this transport touches, so a namespaced deployment never sees another one's workers.
    */
   async readAllWorkerDescriptors(): Promise<WorkerDescriptor[]> {
-    const client = this.workerRedis();
-    const match = `${this.#effectivePrefix()}-worker-descriptor:*`;
+    const { descriptors } = await this.registry.entries(REGISTRY_READ_MAX_AGE_MS);
     const byInstance = new Map<string, WorkerDescriptor>();
-    let cursor = '0';
-    do {
-      const [next, keys] = await client.scan(cursor, 'MATCH', match, 'COUNT', 100);
-      cursor = next;
-      for (const key of keys) {
-        const raw = await client.get(key);
-        if (raw == null) continue;
-        try {
-          const descriptor = JSON.parse(raw) as WorkerDescriptor;
-          if (typeof descriptor?.instanceId !== 'string') continue;
-          if (!byInstance.has(descriptor.instanceId))
-            byInstance.set(descriptor.instanceId, descriptor);
-        } catch {
-          // A partially-written/garbled descriptor is skipped — the next beat rewrites it.
-        }
-      }
-    } while (cursor !== '0');
+    for (const descriptor of this.parseDescriptors(descriptors)) {
+      if (typeof descriptor?.instanceId !== 'string') continue;
+      if (!byInstance.has(descriptor.instanceId)) byInstance.set(descriptor.instanceId, descriptor);
+    }
     return [...byInstance.values()];
   }
 
   /**
    * Every live worker heartbeat in this deployment, across all groups — the liveness floor under the
-   * workflow directory. ONE `SCAN` of `<prefix>-worker-heartbeat:*`, the same keyspace
-   * {@link listWorkerGroups} walks, but keeping the instance behind each token instead of collapsing
-   * to distinct group names.
-   *
-   * This is what makes a worker from a pre-handshake SDK visible: it beats these keys and publishes
-   * no `<prefix>-worker-descriptor:` value at all, so a descriptor-only read reports it as absent
-   * while `resolveRemoteByConvention` is happily routing calls to it off these very keys. A key
-   * present is live by definition (the TTL has not expired).
-   *
-   * The key is `<prefix>-worker-heartbeat:<routingToken>:<instanceId>` and a routing token never
-   * contains `:` (`sanitizeQueueToken` rewrites it), so the FIRST `:` after the prefix splits the
-   * two — the same parse `listWorkerGroups` and `listLiveWorkers` already agree on.
+   * workflow directory: the same read {@link listWorkerGroups} uses, keeping the instance behind each
+   * token. This is what makes a worker from a pre-handshake SDK visible: it beats and publishes no
+   * descriptor at all, while `resolveRemoteByConvention` routes calls to it off these very beats.
    */
   async readAllWorkerHeartbeats(): Promise<WorkerHeartbeat[]> {
-    const client = this.workerRedis();
-    const prefix = `${this.#effectivePrefix()}-worker-heartbeat:`;
-    const beats: WorkerHeartbeat[] = [];
-    let cursor = '0';
-    do {
-      const [next, keys] = await client.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 100);
-      cursor = next;
-      for (const key of keys) {
-        const rest = key.slice(prefix.length);
-        const sep = rest.indexOf(':');
-        if (sep <= 0) continue; // no token, or no instance segment — not a beat this can attribute
-        const parsed = parseHeartbeatValue(await client.get(key));
-        beats.push({
-          group: rest.slice(0, sep),
-          instanceId: rest.slice(sep + 1),
-          lastBeatAt: parsed.lastBeatAt,
-          ...(parsed.status !== undefined ? { status: parsed.status } : {}),
-        });
-      }
-    } while (cursor !== '0');
-    return beats;
+    const { heartbeats } = await this.registry.entries(REGISTRY_READ_MAX_AGE_MS);
+    return heartbeats
+      .filter((e) => e.token !== '' && e.instance !== '')
+      .map((e) => toWorkerHeartbeat(e, e.token));
   }
 
   /**
@@ -1950,7 +1956,7 @@ export class BullMQTransport implements Transport, ControlPlane {
       { concurrency: limit },
     );
     this.runWorkers.add(worker);
-    const key = this.runConsumerKey(opts.namespace, this.instanceId);
+    const queue = this.#runsName(opts.namespace);
     let timer: ReturnType<typeof setInterval> | undefined;
     let stopped = false;
     const beat = () => {
@@ -1958,8 +1964,14 @@ export class BullMQTransport implements Transport, ControlPlane {
         ts: Date.now(),
         status: { runtime: 'node', concurrency: { mode: 'fixed', limit }, inFlight },
       } satisfies { ts: number; status: WorkerStatus });
-      void this.workerRedis()
-        .set(key, value, 'EX', WORKER_HEARTBEAT_TTL_SECONDS)
+      void this.registry
+        .advertise({
+          instance: this.instanceId,
+          kind: 'runConsumers',
+          tokens: [queue],
+          value,
+          ttlSeconds: WORKER_HEARTBEAT_TTL_SECONDS,
+        })
         .catch(() => {});
     };
     // Not while parked (`deferConsumers`): a process that takes no run is not a worker.
@@ -1976,8 +1988,8 @@ export class BullMQTransport implements Transport, ControlPlane {
         clearInterval(timer);
         this.runConsumerTimers.delete(timer);
         // Gone at once rather than after the TTL: a drained instance stops counting as a worker.
-        await this.workerRedis()
-          .del(key)
+        await this.registry
+          .withdraw(this.instanceId, 'runConsumers', [queue])
           .catch(() => undefined);
       }
       await worker.close();
@@ -1985,41 +1997,20 @@ export class BullMQTransport implements Transport, ControlPlane {
     };
   }
 
-  /** The run-queue consumer liveness key: `<runs queue name>-consumer:<instanceId>`. Its own keyspace,
-   *  NOT `-worker-heartbeat:` — a worker heartbeat marks a task queue someone consumes, and convention
-   *  routing would then dispatch workflow tasks to a queue nothing reads. */
-  private runConsumerKey(namespace: string | undefined, instanceId: string): string {
-    return `${this.#runsName(namespace)}-consumer:${instanceId}`;
-  }
-
   /**
-   * The instances consuming the run queue `opts` names, read off their TTL'd liveness keys (SCAN,
-   * never KEYS). A key present is live by definition. `group` is left empty: the engine reports each
-   * consumer under the workflows it executes in-process.
+   * The instances consuming the run queue `opts` names, from the shared registry read: their entries
+   * under the queue in the registry hash, plus the per-instance `<runs queue>-consumer:<instance>`
+   * keys of older writers (the throttled compatibility walk). That key is its own keyspace, NOT
+   * `-worker-heartbeat:`: a worker heartbeat marks a task queue someone consumes, and convention
+   * routing would then dispatch workflow tasks to a queue nothing reads. `group` is left empty: the
+   * engine reports each consumer under the workflows it executes in-process.
    */
   async liveRunConsumers(opts?: RunQueueOptions): Promise<WorkerHeartbeat[]> {
-    const client = this.workerRedis();
-    const prefix = this.runConsumerKey(opts?.namespace, '');
-    const consumers: WorkerHeartbeat[] = [];
-    let cursor = '0';
-    do {
-      const [next, keys] = await client.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 100);
-      cursor = next;
-      if (keys.length === 0) continue;
-      const values = await client.mget(...keys);
-      keys.forEach((key, i) => {
-        const raw = values[i];
-        if (raw == null) return;
-        const parsed = parseHeartbeatValue(raw);
-        consumers.push({
-          group: '',
-          instanceId: key.slice(prefix.length),
-          lastBeatAt: parsed.lastBeatAt,
-          ...(parsed.status !== undefined ? { status: parsed.status } : {}),
-        });
-      });
-    } while (cursor !== '0');
-    return consumers;
+    const queue = this.#runsName(opts?.namespace);
+    const { runConsumers } = await this.registry.entries(REGISTRY_READ_MAX_AGE_MS, [queue]);
+    return runConsumers
+      .filter((e) => e.token === queue && e.instance !== '')
+      .map((e) => toWorkerHeartbeat(e, ''));
   }
 
   /** Control plane: consume run requests. Starts the consumer on first call (idempotent — a second
@@ -2122,6 +2113,10 @@ export class BullMQTransport implements Transport, ControlPlane {
     if (this.replyBeatTimer) clearInterval(this.replyBeatTimer);
     if (this.replySweepTimer) clearInterval(this.replySweepTimer);
     const deadline = Date.now() + this.closeTimeoutMs;
+    // Leave the worker registry now rather than at expiry: readers stop routing to this instance.
+    if (this.workerHeartbeatRedis) {
+      await withTimeout(this.registry.removeAll(), this.closeTimeoutMs);
+    }
     // A sweep in flight may be about to open a drain worker: let it see `closed` and stop, so every
     // drain it opened is in `replyDrains` when the workers are collected below.
     if (this.replySweep) {
@@ -2181,5 +2176,6 @@ export class BullMQTransport implements Transport, ControlPlane {
     for (const sub of this.tenantEventSubs) sub.disconnect();
     this.tenantEventSubs.clear();
     this.workerHeartbeatRedis?.disconnect();
+    this.registryRedis?.disconnect();
   }
 }

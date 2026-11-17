@@ -189,6 +189,14 @@ ships results back:
 
   This is wired end-to-end in [`scripts/py-e2e.sh`](../../scripts/py-e2e.sh): a TypeScript
   workflow's `ctx.step` runs this Python handler over Redis and gets the result back.
+
+  The worker advertises itself with one TTL'd key per handler
+  (`<prefix>-worker-heartbeat:<token>:<instance>` and `-worker-descriptor:`). The Node and Adonis
+  transports keep the worker registry in one hash (`<prefix>-workers:instances`) and read these
+  per-instance keys with a throttled `SCAN` walk (at most once a minute). Leave their
+  `workerRegistry.legacyScan` on (the default) while Python workers share the Redis, and expect a
+  freshly started Python worker to take up to a minute to appear in the dashboard and in convention
+  routing.
 - **AWS SQS** (`pip install durable-worker[sqs]`) — `durable_worker.sqs_runner.run_sqs_worker`
   long-polls the same SQS queues the TS `SqsTransport` uses. Blocking loop; pass a
   `threading.Event` as `stop` to stop it.

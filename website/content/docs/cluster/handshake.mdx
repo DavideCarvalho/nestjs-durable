@@ -35,9 +35,9 @@ interface WorkerDescriptor {
 It is advertised in **two tiers** to stay cheap at steady state and rich on change (ETag-style):
 
 - **Heartbeat** (every ~10s, `EX 35`): a compact `{ ts, status, descriptorHash }`.
-- **Full descriptor**: published on startup and whenever it changes, to `${P}-worker-descriptor:<token>:<instance>`. The control plane re-reads the full descriptor only when the `descriptorHash` changes.
+- **Full descriptor**: published on startup and whenever it changes, next to the heartbeat in the [worker registry](/docs/transports/bullmq#worker-registry) (`${P}-workers:instances`; the per-instance form `${P}-worker-descriptor:<token>:<instance>` for older readers and the Python worker).
 
-The control plane reads the descriptors for a queue token before each dispatch, and on BullMQ that read is a `SCAN` of the Redis keyspace. So it reuses what it read for `workerDescriptorCacheMs` (default 2000 ms; `0` reads on every dispatch), and concurrent reads of one token share one request. Before it parks a run `blocked` it always reads again, so a worker that registered within those 2 s is never missed.
+The control plane reads the descriptors for a queue token before each dispatch. On BullMQ that read is the registry hash, read once and reused for 30 s by every reader of the process; on top of it the engine reuses what it read for `workerDescriptorCacheMs` (default 2000 ms; `0` reads on every dispatch), and concurrent reads of one token share one request. Before it parks a run `blocked` it always reads the hash again, so a worker that registered in the meantime is never missed.
 
 ## Negotiation — three outcomes
 

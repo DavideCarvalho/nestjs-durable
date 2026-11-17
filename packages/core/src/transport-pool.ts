@@ -229,11 +229,14 @@ export class TransportPool {
    * but none is published — both are the "guard disengaged / legacy assume-compatible" case, so the
    * engine's routing guard treats an empty result identically (design §7.7).
    */
-  async readWorkerDescriptors(group: string): Promise<WorkerDescriptor[]> {
+  async readWorkerDescriptors(
+    group: string,
+    opts?: { fresh?: boolean | undefined },
+  ): Promise<WorkerDescriptor[]> {
     const descriptors: WorkerDescriptor[] = [];
     for (const { transport } of this.transports) {
       if (transport.readWorkerDescriptors) {
-        descriptors.push(...(await transport.readWorkerDescriptors(group)));
+        descriptors.push(...(await transport.readWorkerDescriptors(group, opts)));
       }
     }
     return descriptors;

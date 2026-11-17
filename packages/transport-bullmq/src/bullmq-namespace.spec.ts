@@ -129,7 +129,7 @@ describe('BullMQTransport namespace → name partitioning', () => {
     expect(
       names.setKeys.some((k) => k.startsWith('durable-worker-heartbeat:payments.charge-card:')),
     ).toBe(true);
-    expect(names.scanMatches).toContain('durable-worker-heartbeat:*'); // listWorkerGroups
+    expect(names.scanMatches).toContain('durable-worker-*'); // listWorkerGroups (the per-instance-key walk)
   });
 
   it('"default" namespace → identical to no namespace (production must not change)', async () => {
@@ -163,7 +163,7 @@ describe('BullMQTransport namespace → name partitioning', () => {
         k.startsWith('durable-dev-alice-worker-heartbeat:payments.charge-card:'),
       ),
     ).toBe(true);
-    expect(names.scanMatches).toContain('durable-dev-alice-worker-heartbeat:*');
+    expect(names.scanMatches).toContain('durable-dev-alice-worker-*');
     // A default-namespace engine's names never collide with these.
     expect(names.queueNames).not.toContain('durable-tasks-payments.charge-card');
   });
