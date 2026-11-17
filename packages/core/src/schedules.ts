@@ -209,6 +209,8 @@ interface AnnounceDoc {
   withdrawnAt?: number | undefined;
   /** It was already paused (by an operator) when it was withdrawn: a re-announce keeps it paused. */
   pausedBeforeWithdrawal?: boolean | undefined;
+  /** The schedule's note when it was withdrawn (an operator's pause reason), put back on restore. */
+  noteBeforeWithdrawal?: string | undefined;
 }
 
 /** What {@link ScheduleClient.syncAnnounced} did to a namespace's adopted schedules. */
@@ -614,6 +616,15 @@ export class ScheduleClient {
         const spec = specOf(existing);
         const window = resume ? nextWindowAfter(spec, now) : undefined;
         await store.updateSchedule(id, {
+          // The withdrawal note goes; the note it replaced comes back.
+          ...(doc.withdrawnAt !== undefined
+            ? {
+                spec: stripUndefined({
+                  ...spec,
+                  note: doc.noteBeforeWithdrawal,
+                }) as unknown as Record<string, unknown>,
+              }
+            : {}),
           ...(resume
             ? {
                 paused: false,
@@ -656,6 +667,14 @@ export class ScheduleClient {
             namespace,
             tags: [ANNOUNCED_SCHEDULE_TAG],
             paused,
+            // A note (an operator's pause reason) is kept; a withdrawal note is replaced by the one
+            // it had replaced.
+            note:
+              doc?.withdrawnAt !== undefined
+                ? doc.noteBeforeWithdrawal
+                : existing
+                  ? specOf(existing).note
+                  : undefined,
             // Fires belong to the app, never to whichever request context reached the sync.
             ...(existing ? {} : { tenantId: null }),
           },
@@ -688,7 +707,12 @@ export class ScheduleClient {
         spec: spec as unknown as Record<string, unknown>,
         state: {
           ...state,
-          announce: { ...doc, withdrawnAt: now, pausedBeforeWithdrawal: record.paused },
+          announce: stripUndefined({
+            ...doc,
+            withdrawnAt: now,
+            pausedBeforeWithdrawal: record.paused,
+            noteBeforeWithdrawal: specOf(record).note,
+          }),
         } as Record<string, unknown>,
         updatedAt: new Date(now),
       });

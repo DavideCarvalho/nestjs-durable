@@ -192,6 +192,51 @@ describe('adopting the schedules a tenant app announces', () => {
     expect(restored?.unannouncedSince).toBeUndefined();
   });
 
+  it("keeps an operator's note across a withdrawal and a changed definition", async () => {
+    let now = 1_000_000;
+    const { engine, fleet } = controlPlane({ clock: () => now });
+    fleet.descriptors = [worker('a-1', 'acme', [digest])];
+    await engine.syncAnnouncedSchedules({ graceMs: 1_000 });
+    await engine.schedules.pause('app:acme:daily', 'paused by ops: ledger migration');
+
+    fleet.descriptors = [worker('a-2', 'acme', [])];
+    await engine.syncAnnouncedSchedules({ graceMs: 1_000 });
+    now += 2_000;
+    await engine.syncAnnouncedSchedules({ graceMs: 1_000 });
+    expect((await engine.schedules.get('app:acme:daily'))?.note).toMatch(/no longer announces/);
+
+    // Announced again: the withdrawal note goes, the operator's comes back (and so does its pause).
+    fleet.descriptors = [worker('a-3', 'acme', [digest])];
+    await engine.syncAnnouncedSchedules({ graceMs: 1_000 });
+    expect(await engine.schedules.get('app:acme:daily')).toMatchObject({
+      paused: true,
+      note: 'paused by ops: ledger migration',
+    });
+
+    // A changed definition keeps the note too.
+    fleet.descriptors = [worker('a-3', 'acme', [{ ...digest, everyMs: 30_000 }])];
+    await engine.syncAnnouncedSchedules({ graceMs: 1_000 });
+    expect((await engine.schedules.get('app:acme:daily'))?.note).toBe(
+      'paused by ops: ledger migration',
+    );
+  });
+
+  it('a withdrawal note does not outlive a rollback that changed the definition', async () => {
+    let now = 1_000_000;
+    const { engine, fleet } = controlPlane({ clock: () => now });
+    fleet.descriptors = [worker('a-1', 'acme', [digest])];
+    await engine.syncAnnouncedSchedules({ graceMs: 1_000 });
+    fleet.descriptors = [worker('a-2', 'acme', [])];
+    await engine.syncAnnouncedSchedules({ graceMs: 1_000 });
+    now += 2_000;
+    await engine.syncAnnouncedSchedules({ graceMs: 1_000 });
+    fleet.descriptors = [worker('a-3', 'acme', [{ ...digest, everyMs: 30_000 }])];
+    await engine.syncAnnouncedSchedules({ graceMs: 1_000 });
+    const back = await engine.schedules.get('app:acme:daily');
+    expect(back).toMatchObject({ paused: false, everyMs: 30_000 });
+    expect(back?.note).toBeUndefined();
+  });
+
   it('withdraws nothing while the app has no live worker, or only workers that do not state schedules', async () => {
     let now = 1_000_000;
     const { engine, fleet } = controlPlane({ clock: () => now });
