@@ -283,6 +283,8 @@ const DEFAULT_DRAIN_CHECK_INTERVAL_MS = 60_000;
 const DRAIN_EXISTS_CHUNK = 1_000;
 /** How long a grouped-queue job for a handler this process lacks waits before it is offered again. */
 const FOREIGN_HANDBACK_MS = 10_000;
+/** How often a token nothing here serves is logged again (with how many of its jobs bounced). */
+const FOREIGN_LOG_MS = 5 * 60_000;
 /** Bounds of the delay a job of a handler at its limit is handed back with (see `overflowDelay`). */
 const OVERFLOW_MIN_DELAY_MS = 250;
 const OVERFLOW_DEFAULT_DELAY_MS = 1_000;
@@ -547,8 +549,9 @@ export interface BullMQTransportOptions {
    * serves, as long as they hold jobs: in `'grouped'` mode the per-handler `<prefix>-tasks-<token>`
    * queues (jobs dispatched by processes not yet switched, and delayed or stalled ones); in
    * `'per-handler'` mode the grouped queue (a rollback). A drain worker starts only for a queue that
-   * has waiting, active, delayed, prioritized or paused jobs, and stops once it is empty. Checking
-   * every queue is ONE `EXISTS` per interval. Default `true` with `'grouped'`, `false` with
+   * has waiting, active, delayed, prioritized or paused jobs, and stops once it is empty. Each
+   * interval costs one batched `EXISTS` over every such queue while they are all empty, plus one
+   * `EXISTS` per queue once any holds jobs (to find which, and to watch each drained one). Default `true` with `'grouped'`, `false` with
    * `'per-handler'`. `{ intervalMs }` sets the check interval (default `60_000`).
    */
   taskQueueDrain?: boolean | { intervalMs?: number };
@@ -579,7 +582,8 @@ export class BullMQTransport implements Transport, ControlPlane {
   readonly #namespace: string | undefined;
   private readonly handlers = new Map<string, StepHandler>();
   private readonly queues = new Map<string, Queue>();
-  // One BullMQ `Worker` per registered handler name (see `handle()`) — never a single shared queue.
+  // One BullMQ `Worker` per registered handler name (see `handle()`) with `taskQueues: 'per-handler'`;
+  // the grouped layout's shared workers are in `groupedWorkers`.
   private readonly taskWorkers = new Map<string, ConsumerLike>();
   // --- Task queue layout (see `taskQueues` / `taskQueueDrain`) ---
   private readonly taskQueues: 'per-handler' | 'grouped';
@@ -602,8 +606,9 @@ export class BullMQTransport implements Transport, ControlPlane {
   private drainChecking = false;
   /** How many times each job id was handed back for its handler being at its limit. */
   private readonly overflowBounces = new Map<string, number>();
-  /** Tokens already reported as dispatched to a process that does not serve them. */
-  private readonly foreignReported = new Set<string>();
+  /** Per token dispatched to a process that does not serve it: when it was last logged, and how many
+   *  of its jobs were handed back since. */
+  private readonly foreignReported = new Map<string, { at: number; since: number }>();
   /** Jobs waiting in-process for a handler slot, handed back at once by `close()`. */
   private readonly parkedJobs = new Map<Job, { lock: string | undefined; release: () => void }>();
   /** The last per-token depth read of each grouped queue (see `groupedSnapshot`). */
@@ -1112,10 +1117,12 @@ export class BullMQTransport implements Transport, ControlPlane {
   }
 
   /**
-   * Register a step handler (worker side). Starts a DEDICATED task consumer for `name` on first
-   * registration — one BullMQ `Worker` per handler name, each on its own `tasksName` queue (via
-   * {@link tenantGroup}/{@link sanitizeQueueToken}), never a single queue shared across handlers.
-   * Re-registering an already-`handle()`d name just swaps the handler fn; its worker is untouched.
+   * Register a step handler (worker side). With `taskQueues: 'per-handler'` (the default) it starts a
+   * DEDICATED task consumer for `name` on first registration — one BullMQ `Worker` per handler name,
+   * each on its own `tasksName` queue (via {@link tenantGroup}/{@link sanitizeQueueToken}). With
+   * `'grouped'` the handler joins its partition's shared queue and worker instead (see
+   * `ensureGroupedWorker`). Re-registering an already-`handle()`d name just swaps the handler fn; its
+   * worker is untouched.
    */
   handle(name: string, fn: StepHandler, partition?: string | undefined): void {
     this.handlers.set(name, fn);
@@ -1236,12 +1243,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     const group = (job.data as { group?: unknown } | null | undefined)?.group;
     if (typeof group !== 'string') return this.runTask(job.data);
     if (!this.servesTask(job.data)) {
-      if (!this.foreignReported.has(group)) {
-        this.foreignReported.add(group);
-        console.warn(
-          `[nestjs-durable] a '${group}' task reached a process that does not serve it on the grouped task queue; handing it back for another process. Every process consuming a partition's grouped queue must register the same handlers.`,
-        );
-      }
+      this.reportForeign(group);
       return this.handBack(job, lock, FOREIGN_HANDBACK_MS);
     }
     const limiter = this.handlerLimiter();
@@ -1272,6 +1274,25 @@ export class BullMQTransport implements Transport, ControlPlane {
     } finally {
       limiter.release(group, performance.now() - startedAt);
     }
+  }
+
+  /**
+   * Log a job for a token this process does not serve, at most once per {@link FOREIGN_LOG_MS} per
+   * token with the count handed back since: a token nothing serves (a typo'd handler name) bounces
+   * forever, and must keep showing up rather than go quiet after one line.
+   */
+  private reportForeign(group: string): void {
+    const now = Date.now();
+    const last = this.foreignReported.get(group);
+    if (last && now - last.at < FOREIGN_LOG_MS) {
+      last.since += 1;
+      return;
+    }
+    const again = last ? ` (${last.since + 1} handed back since the last report)` : '';
+    this.foreignReported.set(group, { at: now, since: 0 });
+    console.warn(
+      `[nestjs-durable] a '${group}' task reached a process that does not serve it on the grouped task queue; handing it back for another process${again}. Every process consuming a partition's grouped queue must register the same handlers.`,
+    );
   }
 
   /** Put an active job back on its queue, delayed `delayMs`, without counting an attempt. */

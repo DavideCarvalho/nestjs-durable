@@ -215,11 +215,16 @@ new BullMQTransport({ connection, taskQueues: 'grouped' })
 - Each handler keeps its own `concurrency` limit (fixed or adaptive) through an in-process limiter.
   The shared worker runs two limits' worth of slots per handler; a job of a handler at its limit
   waits in-process (its lock keeps renewing), and past one limit's worth of waiters it goes back to
-  the queue with a growing delay, so one handler's backlog never starves the others. Priority,
-  `stepTimeoutMs`, stalled-job recovery and the terminal-failure bridge apply as before.
+  the queue with a growing delay, so one handler's backlog never starves the others.
+  `stepTimeoutMs`, stalled-job recovery and the terminal-failure bridge apply as before. Priority
+  still orders the shared queue, but under contention it is weaker than per-handler: jobs waiting
+  in-process for a handler slot are served first in, first out, and a job handed back re-enters by
+  its due time, so a high-priority job can wait behind earlier lower-priority jobs of the same
+  handler.
 - Every process consuming a partition's grouped queue must register the handlers dispatched to it.
-  A job for a handler the process lacks goes back to the queue (delayed 10 s) for another process,
-  and the first one per handler is logged.
+  A job for a handler the process lacks goes back to the queue (delayed 10 s) for another process.
+  It is logged, and logged again every 5 minutes with how many bounced since, so a handler nothing
+  serves keeps showing up.
 - **Workflow tasks** (`dispatchWorkflowTask`) stay on `<P>-tasks-<token>`: their consumers here
   (`@dudousxd/durable-worker` and the Python worker) read per-handler queues.
 - `groupHealth()` reports the handler's share of the shared queue (from a sample of up to 500 jobs,
@@ -238,9 +243,10 @@ Dispatchers and step workers of a fleet must agree on the layout, which a rollin
 guarantee. `taskQueueDrain` covers the gap: a process also consumes the OTHER layout's queues of the
 handlers it serves while they hold jobs (waiting, delayed, prioritized, paused, or active under a
 worker that died). In `'grouped'` mode that is the per-handler queues (on by default); in
-`'per-handler'` mode it is the grouped queue (off by default, turn it on for a rollback). Checking
-every queue is one `EXISTS` per interval (60 s); a drain worker starts only on a queue that holds
-jobs and stops once it is empty.
+`'per-handler'` mode it is the grouped queue (off by default, turn it on for a rollback). Each
+interval (60 s) costs one batched `EXISTS` while those queues are all empty, plus one `EXISTS` per
+queue while any holds jobs; a drain worker starts only on a queue that holds jobs and stops once it
+is empty.
 
 1. Deploy `taskQueues: 'grouped'` to the workers and the engines. Jobs already on per-handler queues,
    and jobs older engines still dispatch there, are drained by the grouped workers.

@@ -89,7 +89,7 @@ describe('groupByPartition', () => {
       group({ group: 'charge', depth: 9, ...shared, drainingDepth: 5 }),
       group({ group: 'refund', depth: 6, ...shared }),
     ]);
-    expect(view.totalDepth).toBe(15);
+    expect(view?.totalDepth).toBe(15);
   });
 
   it('empty input returns an empty array', () => {
