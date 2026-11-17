@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-dashboard
 
+## 0.66.0
+
+### Minor Changes
+
+- [#471](https://github.com/DavideCarvalho/nestjs-durable/pull/471) [`1382dff`](https://github.com/DavideCarvalho/nestjs-durable/commit/1382dffc37594a913d42a03a2b666d74d194a03c) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console `apps` grant: `authorize` may return `{ allowed: true, apps: '*' | string[] }`. A list confines the console to those tenant apps (partitions): run listings, counts, facets and filter pickers, run reads and the live tail (another app's run answers 404), every action including bulk ones, worker health (`<name>@<app>` groups) and schedules (by namespace). `/metrics` answers 403 for such a viewer and a workflow's lifecycle page lists only those apps' subscriptions, without its process-wide trigger counts. `'*'` or no `apps` is every app plus the control plane's own runs, as before. `@UseConsoleAuthorize()` now also applies the `ConsoleAppScopeInterceptor` that enforces it.
+
 ## 0.65.0
 
 ### Minor Changes
