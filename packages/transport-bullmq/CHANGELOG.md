@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable-transport-bullmq
 
+## 0.28.0
+
+### Minor Changes
+
+- [#474](https://github.com/DavideCarvalho/nestjs-durable/pull/474) [`cc1c332`](https://github.com/DavideCarvalho/nestjs-durable/commit/cc1c332b69e680a96bec171b73d2c30cd179da84) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The BullMQ worker registry (worker liveness, handshake descriptors, run-queue consumers) now lives in one Redis hash per prefix, `<prefix>-workers:instances`, one field per instance, the same layout as the AdonisJS durable lib so both fleets on one Redis see each other. Readers do one `HGETALL`, reused for 30 s by every reader of the process (`readWorkerDescriptors(group, { fresh: true })` reads again, which the engine does before parking a run `blocked`), instead of a `SCAN` of the whole keyspace per read. `runRedisWorker` writes the same hash. The per-instance `-worker-heartbeat:` / `-worker-descriptor:` keys are still written for older readers (`workerRegistry.legacyWrites`, every 30 s) and read from older writers and the Python worker by one throttled `SCAN` walk (`workerRegistry.legacyScan`, at most once per 60 s); `workerRegistry.connection` keeps the hash on another connection. A clean `close()` removes the instance from the registry at once.
+
 ## 0.27.0
 
 ### Minor Changes
