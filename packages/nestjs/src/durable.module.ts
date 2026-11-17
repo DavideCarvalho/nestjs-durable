@@ -64,7 +64,7 @@ import {
 } from './tenant-contracts';
 import { TenantEventRepublisher } from './tenant-event-republisher';
 import { TimerPoller } from './timer-poller';
-import { CONTEXT_ACCESSOR } from './tokens';
+import { CONTEXT_ACCESSOR, TENANT_AUTH } from './tokens';
 import { WorkflowRegistrar } from './workflow.registrar';
 import { WorkflowService } from './workflow.service';
 
@@ -459,6 +459,18 @@ export interface DurableModuleSharedOptions {
    */
   persistedSchedules?: boolean;
   /**
+   * Adopt the `schedules` that TENANT apps declare and fire them here (a tenant has no store to fire
+   * them from). Each tenant worker announces its app's schedules on its descriptor; every `syncMs`
+   * (default 15 s) a driving instance turns them into persisted schedules (id
+   * `app:<partition>:<key>`, tagged `schedule:announced`), applies a changed definition, and pauses
+   * one that no live worker of its app has announced for `graceMs` (default 10 minutes). It then
+   * fires them on every tick, through the tenant start path: with no live worker of the app, a run
+   * waits `blocked` (`no_live_worker`) for one. On by default for a driving instance with a store
+   * that persists schedules and a transport that reads worker descriptors (BullMQ); `false` turns it
+   * off. Operator only.
+   */
+  announcedSchedules?: boolean | { syncMs?: number; graceMs?: number };
+  /**
    * Hard-prune terminal run history on an interval so `durable_workflow_runs` (and its child tables)
    * stays bounded — without it, completed/failed/cancelled runs accumulate forever and the timer
    * poller's per-tick status scans get linearly slower. Driving instances only. Omit to keep all
@@ -835,11 +847,10 @@ function resolveTopologyPreset(options: DurableModuleOptions): DurableModuleOpti
 }
 
 /** The `verifyTenant` / `tenantToken` options, resolved to the plain functions the wire layer calls. */
-interface ResolvedTenantAuth {
+export interface ResolvedTenantAuth {
   verifyTenant: TenantVerifier | undefined;
   tenantToken: TenantTokenSource | undefined;
 }
-const TENANT_AUTH = Symbol('nestjs-durable:tenant-auth');
 
 /**
  * Boot-time wiring for the tenant run gateway's OPERATOR side, gated by {@link isDrivingOperator} (an

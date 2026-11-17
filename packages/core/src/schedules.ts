@@ -1,6 +1,7 @@
 import type { ConcurrencyQuota } from './concurrency';
 import { parseDuration } from './duration';
 import type { StartOptions } from './engine';
+import { type AnnouncedSchedule, stableJson } from './handshake/descriptor';
 import type {
   RunResult,
   RunStatus,
@@ -122,9 +123,29 @@ export interface ScheduleDescription {
   /** The customer the schedule and its runs belong to, when it has one. */
   tenantId?: string | undefined;
   tenantKind?: string | undefined;
+  /**
+   * Set on a schedule a tenant app ANNOUNCED (its `schedules` module option) and the control plane
+   * adopted: the key the app declares it under. Its `namespace` is the app (partition).
+   */
+  announcedKey?: string | undefined;
+  /** An announced schedule that no live worker of its app announces any more: since when. */
+  unannouncedSince?: Date | undefined;
+  /** When the control plane paused it for staying unannounced past the grace period. */
+  withdrawnAt?: Date | undefined;
   createdAt: Date;
   updatedAt: Date;
 }
+
+/** The tag on every schedule adopted from a tenant's announcement (and on the runs it starts). */
+export const ANNOUNCED_SCHEDULE_TAG = 'schedule:announced';
+
+/** The control plane's schedule id for the schedule `key` announced by the app on `namespace`. */
+export function announcedScheduleId(namespace: string, key: string): string {
+  return `app:${namespace}:${key}`;
+}
+
+/** The `error.code` of a run parked until a worker is live (engine's `NO_LIVE_WORKER`). */
+const PARKED_FOR_WORKER = 'no_live_worker';
 
 /** Filter for `engine.schedules.list`. */
 export type ScheduleListQuery = Omit<ScheduleQuery, 'dueBy'>;
@@ -170,11 +191,53 @@ interface StateDoc {
   lastRunId?: string | undefined;
   fires?: number | undefined;
   lastError?: string | undefined;
+  /** Present on a schedule adopted from a tenant's announcement — see {@link AnnounceDoc}. */
+  announce?: AnnounceDoc | undefined;
+}
+
+/** The announcement bookkeeping of an adopted schedule (see {@link ScheduleClient.syncAnnounced}). */
+interface AnnounceDoc {
+  /** The key the app declares it under. */
+  key: string;
+  /** The announced definition, as stable JSON: a change re-applies it, an equal one writes nothing. */
+  fingerprint: string;
+  /** The app declared it `paused`. */
+  declaredPaused?: boolean | undefined;
+  /** First sync at which no live worker of the app announced it any more. */
+  missingSince?: number | undefined;
+  /** When it was paused for staying unannounced past the grace period. */
+  withdrawnAt?: number | undefined;
+  /** It was already paused (by an operator) when it was withdrawn: a re-announce keeps it paused. */
+  pausedBeforeWithdrawal?: boolean | undefined;
+}
+
+/** What {@link ScheduleClient.syncAnnounced} did to a namespace's adopted schedules. */
+export interface AnnouncedScheduleSync {
+  /** Created, or re-applied because the announced definition changed. */
+  adopted: string[];
+  /** Announced again after missing (and resumed, when it had been withdrawn). */
+  restored: string[];
+  /** Missing from the announcement for the first time: the grace period starts. */
+  missing: string[];
+  /** Paused because it stayed unannounced past the grace period. */
+  withdrawn: string[];
+  /** Announced, but the definition does not evaluate (bad cron, both or neither cadence). */
+  invalid: { key: string; error: string }[];
 }
 
 /** The engine surface the schedule client drives. */
 export interface ScheduleHost {
   start(workflow: string, input: unknown, runId: string, opts?: StartOptions): Promise<RunResult>;
+  /**
+   * The tenant start path, used to fire an announced schedule: a workflow no live worker serves yet
+   * is parked `blocked` (`no_live_worker`) until one is, instead of throwing. Absent = `start`.
+   */
+  startParked?(
+    workflow: string,
+    input: unknown,
+    runId: string,
+    opts?: StartOptions,
+  ): Promise<RunResult>;
   getRun(runId: string): Promise<WorkflowRun | null>;
   /** True once the engine has begun shutting down; `tick` fires nothing more after that. */
   isDraining?(): boolean;
@@ -348,16 +411,30 @@ export class ScheduleClient {
   async trigger(id: string): Promise<RunResult> {
     const record = await this.mustGet(id);
     const runId = `sched:${id}:manual:${this.now()}`;
-    return this.host.start(record.workflow, specOf(record).input, runId, startOptions(record));
+    return this.startFor(record, runId);
   }
 
   /**
-   * Fire every due schedule (in this engine's namespace; all namespaces for an operator engine):
+   * Start one run of `record`: through the tenant start path for an announced schedule (its run waits
+   * `blocked` for a live worker of its app instead of failing), else a plain `start`.
+   */
+  private startFor(record: ScheduleRecord, runId: string): Promise<RunResult> {
+    const input = specOf(record).input;
+    const opts = startOptions(record);
+    if (isAnnounced(record) && this.host.startParked) {
+      return this.host.startParked(record.workflow, input, runId, opts);
+    }
+    return this.host.start(record.workflow, input, runId, opts);
+  }
+
+  /**
+   * Fire every due schedule (in this engine's namespace; all namespaces for an operator engine; only
+   * those carrying `opts.tag` when given):
    * start its window's run and advance it to the next window. Called by the NestJS timer poller on
    * each tick when `persistedSchedules` is on; call it yourself from any other driver. Returns the
    * run ids started (or re-found, for an idempotent re-fire).
    */
-  async tick(nowMs: number = this.now()): Promise<string[]> {
+  async tick(nowMs: number = this.now(), opts: { tag?: string } = {}): Promise<string[]> {
     const store = this.requireStore();
     const started: string[] = [];
     for (let round = 0; round < 50; round++) {
@@ -365,6 +442,7 @@ export class ScheduleClient {
       const due = await store.listSchedules({
         dueBy: nowMs,
         namespace: this.options.namespace,
+        ...(opts.tag !== undefined ? { tag: opts.tag } : {}),
         limit: TICK_BATCH,
       });
       for (const record of due) {
@@ -379,15 +457,17 @@ export class ScheduleClient {
 
   /**
    * When {@link tick} next has a schedule to fire, if one is due by `byMs`: the earliest `nextFireAt`
-   * of the unpaused schedules (of this engine's namespace) due by then, else `undefined`. One indexed
+   * of the unpaused schedules (of this engine's namespace, carrying `opts.tag` when given) due by
+   * then, else `undefined`. One indexed
    * read (the due-schedule scan `tick` makes, with a later bound and a limit of one). A store that
    * does not persist schedules has none.
    */
-  async nextFireAt(byMs: number): Promise<number | undefined> {
+  async nextFireAt(byMs: number, opts: { tag?: string } = {}): Promise<number | undefined> {
     if (!this.supported) return undefined;
     const [next] = await this.requireStore().listSchedules({
       dueBy: byMs,
       namespace: this.options.namespace,
+      ...(opts.tag !== undefined ? { tag: opts.tag } : {}),
       limit: 1,
     });
     return next?.nextFireAt ?? undefined;
@@ -427,10 +507,15 @@ export class ScheduleClient {
     let fired = false;
     const skipMissed = spec.catchup === 'skip' && !onTime;
     const beforeWindow = latest < window; // clock skew: not actually due yet
-    if (!skipMissed && !beforeWindow && !(await this.overlapping(spec, state))) {
+    if (
+      !skipMissed &&
+      !beforeWindow &&
+      !(await this.overlapping(spec, state)) &&
+      !(await this.waitingForWorker(record, state))
+    ) {
       runId = `sched:${record.id}:${latest}`;
       try {
-        await this.host.start(record.workflow, spec.input, runId, startOptions(record));
+        await this.startFor(record, runId);
         fired = true;
       } catch (error) {
         // A racing poller may have created the same (deterministic) run first: that's a success.
@@ -454,6 +539,162 @@ export class ScheduleClient {
       record.nextFireAt,
     );
     return fired ? runId : undefined;
+  }
+
+  /**
+   * An announced schedule whose previous run is still parked waiting for a live worker of its app
+   * (the app is down): this window is folded into that run instead of parking one more. However long
+   * the app is down, it finds at most one run per schedule waiting when it comes back, the same
+   * bound `catchup: 'latest'` puts on windows missed while no scheduler polled.
+   */
+  private async waitingForWorker(record: ScheduleRecord, state: StateDoc): Promise<boolean> {
+    if (!isAnnounced(record) || !state.lastRunId) return false;
+    const prev = await this.host.getRun(state.lastRunId);
+    return prev?.status === 'blocked' && prev.error?.code === PARKED_FOR_WORKER;
+  }
+
+  /**
+   * Reconcile the schedules adopted from one app (`namespace`) with what its LIVE workers announce
+   * now (`items`, one per key; the caller resolved disagreeing workers). The rule:
+   *  - an announced key with no schedule yet is created (id {@link announcedScheduleId}, tagged
+   *    {@link ANNOUNCED_SCHEDULE_TAG}, `catchup: 'latest'`); one whose definition changed is
+   *    re-applied like `upsert` (its history kept, its next fire recomputed from now). An equal
+   *    definition writes nothing, so any number of replicas announcing the same set is a no-op;
+   *  - a pause or resume made from the console survives: a re-applied definition keeps the current
+   *    paused state, unless the app's own declared `paused` changed;
+   *  - an adopted schedule the app no longer announces is marked missing, and paused ("withdrawn")
+   *    once it has stayed missing for `graceMs`. It is never deleted: its history stays, and an app
+   *    that announces it again (a rollback) gets it back, resumed unless an operator had paused it.
+   *
+   * Call it only for an app that has at least one live worker stating its schedules: with none (the
+   * app is down, or runs an SDK that does not announce schedules), nothing is withdrawn, and its
+   * schedules keep firing into runs that wait for a worker.
+   */
+  async syncAnnounced(
+    namespace: string,
+    items: readonly AnnouncedSchedule[],
+    opts: { nowMs?: number; graceMs: number },
+  ): Promise<AnnouncedScheduleSync> {
+    const store = this.requireStore();
+    const now = opts.nowMs ?? this.now();
+    const out: AnnouncedScheduleSync = {
+      adopted: [],
+      restored: [],
+      missing: [],
+      withdrawn: [],
+      invalid: [],
+    };
+    const adopted = new Map<string, ScheduleRecord>();
+    for (let offset = 0; ; offset += TICK_BATCH) {
+      const page = await store.listSchedules({
+        namespace,
+        tag: ANNOUNCED_SCHEDULE_TAG,
+        limit: TICK_BATCH,
+        offset,
+      });
+      for (const record of page) if (isAnnounced(record)) adopted.set(record.id, record);
+      if (page.length < TICK_BATCH) break;
+    }
+    for (const item of items) {
+      const id = announcedScheduleId(namespace, item.key);
+      const existing = adopted.get(id) ?? (await store.getSchedule(id));
+      adopted.delete(id);
+      const doc = existing ? (existing.state as StateDoc).announce : undefined;
+      if (existing && !doc) {
+        // A schedule someone created by hand under this id: never taken over.
+        out.invalid.push({ key: item.key, error: `schedule id "${id}" is taken` });
+        continue;
+      }
+      const fingerprint = stableJson(item);
+      if (existing && doc && doc.fingerprint === fingerprint) {
+        if (doc.missingSince === undefined && doc.withdrawnAt === undefined) continue;
+        // Announced again after missing: the grace period ends, and a withdrawal is undone.
+        const resume =
+          doc.withdrawnAt !== undefined && !doc.pausedBeforeWithdrawal && existing.paused;
+        const spec = specOf(existing);
+        const window = resume ? nextWindowAfter(spec, now) : undefined;
+        await store.updateSchedule(id, {
+          ...(resume
+            ? {
+                paused: false,
+                nextFireAt: window == null ? null : window + jitterFor(id, window, spec),
+              }
+            : {}),
+          state: stripUndefined({
+            ...(existing.state as StateDoc),
+            ...(resume ? { window } : {}),
+            announce: { key: doc.key, fingerprint, declaredPaused: doc.declaredPaused },
+          }) as Record<string, unknown>,
+          updatedAt: new Date(now),
+        });
+        out.restored.push(id);
+        continue;
+      }
+      // New, or the definition changed. The paused state the console set is kept, unless the app's
+      // declared `paused` changed or the schedule was only paused because it had been withdrawn.
+      const declaredPaused = item.paused === true;
+      const paused =
+        existing === null || existing === undefined
+          ? declaredPaused
+          : declaredPaused !== (doc?.declaredPaused === true)
+            ? declaredPaused
+            : doc?.withdrawnAt !== undefined && !doc.pausedBeforeWithdrawal
+              ? declaredPaused
+              : undefined;
+      try {
+        await this.write(
+          {
+            id,
+            workflow: item.workflow,
+            input: item.input,
+            cron: item.cron,
+            every: item.everyMs,
+            timezone: item.timezone,
+            jitter: item.jitterMs,
+            overlap: item.overlap,
+            catchup: 'latest',
+            namespace,
+            tags: [ANNOUNCED_SCHEDULE_TAG],
+            paused,
+            // Fires belong to the app, never to whichever request context reached the sync.
+            ...(existing ? {} : { tenantId: null }),
+          },
+          existing ?? null,
+          { announce: { key: item.key, fingerprint, declaredPaused } },
+        );
+        out.adopted.push(id);
+      } catch (error) {
+        out.invalid.push({ key: item.key, error: errorMessage(error) });
+      }
+    }
+    // Adopted, but announced by no live worker of the app any more.
+    for (const record of adopted.values()) {
+      const state = record.state as StateDoc;
+      const doc = state.announce as AnnounceDoc;
+      if (doc.withdrawnAt !== undefined) continue;
+      if (doc.missingSince === undefined) {
+        await store.updateSchedule(record.id, {
+          state: { ...state, announce: { ...doc, missingSince: now } } as Record<string, unknown>,
+          updatedAt: new Date(now),
+        });
+        out.missing.push(record.id);
+        continue;
+      }
+      if (now - doc.missingSince < opts.graceMs) continue;
+      const spec = { ...specOf(record) };
+      spec.note = `withdrawn: app "${namespace}" no longer announces schedule "${doc.key}"`;
+      await store.updateSchedule(record.id, {
+        paused: true,
+        spec: spec as unknown as Record<string, unknown>,
+        state: {
+          ...state,
+          announce: { ...doc, withdrawnAt: now, pausedBeforeWithdrawal: record.paused },
+        } as Record<string, unknown>,
+        updatedAt: new Date(now),
+      });
+      out.withdrawn.push(record.id);
+    }
+    return out;
   }
 
   /** `overlap: 'skip'` and the previous run of this schedule is still in flight. */
@@ -494,6 +735,7 @@ export class ScheduleClient {
   private async write(
     opts: ScheduleOptions,
     existing: ScheduleRecord | null,
+    extraState: Partial<StateDoc> = {},
   ): Promise<ScheduleDescription> {
     const store = this.requireStore();
     const spec = toSpec(opts);
@@ -512,6 +754,7 @@ export class ScheduleClient {
       state: stripUndefined({
         ...((existing?.state as StateDoc | undefined) ?? {}),
         window,
+        ...extraState,
       }) as Record<string, unknown>,
       ...this.scheduleTenant(opts, existing),
       createdAt: existing?.createdAt ?? new Date(now),
@@ -552,6 +795,11 @@ function toSpec(opts: ScheduleOptions): SpecDoc {
 
 function specOf(record: ScheduleRecord): SpecDoc {
   return record.spec as unknown as SpecDoc;
+}
+
+/** Adopted from a tenant's announcement (see {@link ScheduleClient.syncAnnounced}). */
+function isAnnounced(record: ScheduleRecord): boolean {
+  return (record.state as StateDoc | undefined)?.announce !== undefined;
 }
 
 /** The latest window at or before `atMs`. */
@@ -631,6 +879,11 @@ function describe(record: ScheduleRecord): ScheduleDescription {
     lastError: state.lastError,
     tenantId: record.tenantId ?? undefined,
     tenantKind: record.tenantKind ?? undefined,
+    announcedKey: state.announce?.key,
+    unannouncedSince:
+      state.announce?.missingSince != null ? new Date(state.announce.missingSince) : undefined,
+    withdrawnAt:
+      state.announce?.withdrawnAt != null ? new Date(state.announce.withdrawnAt) : undefined,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   }) as ScheduleDescription;

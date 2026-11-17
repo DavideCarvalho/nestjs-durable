@@ -68,6 +68,7 @@ import {
   stepFanGroup,
 } from './fan-join';
 import {
+  type AnnouncedSchedule,
   type AnnouncedWorkflow,
   type BlockedDispatch,
   type DispatchPlan,
@@ -197,7 +198,7 @@ import {
   parseWebhookToken,
   readRunsByIds,
 } from './run-waiting';
-import { ScheduleClient } from './schedules';
+import { ANNOUNCED_SCHEDULE_TAG, type AnnouncedScheduleSync, ScheduleClient } from './schedules';
 import {
   SINGLETON_ADMITTED_TAG,
   SINGLETON_RESERVED_TAGS,
@@ -535,6 +536,13 @@ export const VERSION_UNDECLARED_TAG = 'version:undeclared';
  * consumer boots. Cancel it to drop it.
  */
 export const NO_LIVE_WORKER = 'no_live_worker';
+
+/**
+ * How long an adopted tenant schedule may go unannounced by every live worker of its app before the
+ * control plane pauses it (see `WorkflowEngine.syncAnnouncedSchedules`). Long enough to ride out a
+ * rolling deploy; a schedule is never deleted for missing.
+ */
+export const DEFAULT_ANNOUNCED_SCHEDULE_GRACE_MS = 10 * 60_000;
 
 /** A tenant start whose input the control plane's registration rejected (see `startForTenant`). */
 class TenantStartInvalid extends Error {
@@ -1225,6 +1233,10 @@ export class WorkflowEngine {
   private readonly remoteRedispatchMax: number;
   /** How long a `blocked` run waits before the recovery poll re-checks the live fleet (design §7.5). */
   private readonly blockedPollMs: number;
+  /** Verifies the wire tenant of a start-run, and of a worker's schedule announcement. */
+  private readonly verifyTenant: TenantVerifier | undefined;
+  /** Wire tenants whose schedule announcement failed verification, warned about once. */
+  private readonly rejectedScheduleTenants = new Set<string>();
   private readonly workerDescriptorCacheMs: number;
   private readonly descriptorCache = new Map<
     string,
@@ -1464,6 +1476,7 @@ export class WorkflowEngine {
     this.remoteRedispatchMs = deps.remoteRedispatchMs || undefined;
     this.remoteRedispatchMax = Math.max(1, deps.remoteRedispatchMax ?? 10);
     this.blockedPollMs = deps.blockedPollMs ?? 5000;
+    this.verifyTenant = deps.verifyTenant;
     this.workerDescriptorCacheMs = deps.workerDescriptorCacheMs ?? 2000;
     // The control-plane descriptor this engine negotiates against each worker's advertised descriptor
     // (design §7.3): it speaks the current protocol band and is scoped to this engine's namespace so a
@@ -1519,6 +1532,10 @@ export class WorkflowEngine {
       this.store,
       {
         start: (workflow, input, runId, opts) => this.start(workflow, input, runId, opts),
+        // An announced (tenant) schedule fires through the tenant start path: with no live worker
+        // of its app, the run waits `blocked` instead of the window being lost.
+        startParked: (workflow, input, runId, opts) =>
+          this.startWith(workflow, input, runId, opts, true),
         getRun: (runId) => this.store.getRun(runId),
         isDraining: () => this.draining,
         tenant: () => this.tenancy?.current(),
@@ -1717,17 +1734,22 @@ export class WorkflowEngine {
    * The earliest known time (epoch ms) the poll has work, if it is at or before `byMs`: this
    * namespace's next due timer (`listDueTimers` up to `byMs`, limit one: it returns the most overdue
    * first), the next `blocked` run's recovery poll, and with `persistedSchedules` the next persisted
-   * schedule to fire (see {@link ScheduleClient.nextFireAt}). `undefined` when nothing is due by
+   * schedule to fire (see {@link ScheduleClient.nextFireAt}; with `announcedSchedules` alone, the next
+   * schedule adopted from a tenant). `undefined` when nothing is due by
    * then. A poller reads it before waiting longer than its tick, so the wait never outlasts a timer.
    */
   async nextDueAt(
     byMs: number,
-    opts: { persistedSchedules?: boolean } = {},
+    opts: { persistedSchedules?: boolean; announcedSchedules?: boolean } = {},
   ): Promise<number | undefined> {
     const [timers, blocked, schedule] = await Promise.all([
       this.store.listDueTimers(byMs, this.namespace, 1),
       this.dueBlockedRuns(byMs),
-      opts.persistedSchedules ? this.schedules.nextFireAt(byMs) : undefined,
+      opts.persistedSchedules
+        ? this.schedules.nextFireAt(byMs)
+        : opts.announcedSchedules && this.schedules.supported
+          ? this.schedules.nextFireAt(byMs, { tag: ANNOUNCED_SCHEDULE_TAG })
+          : undefined,
     ]);
     let next: number | undefined;
     for (const at of [
@@ -7111,6 +7133,76 @@ export class WorkflowEngine {
    *
    * Workflows only, and deliberately: see the "steps are out of scope" note in `handshake/announced`.
    */
+  /**
+   * Adopt the schedules tenant apps announce (their `schedules` module option, carried on their live
+   * workers' descriptors) as persisted schedules, and withdraw the ones an app stopped announcing.
+   * The control plane's timer poll calls it; {@link ScheduleClient.tick} fires them.
+   *
+   * Per app (the namespace its announcement's verified `tenant` maps to, as for a start-run): the
+   * schedules announced by its live workers, where two workers disagree on a key the one that
+   * started last (its deploy is the newer one) wins. An app with no live worker that states its
+   * schedules is left alone, so its schedules keep firing into runs that wait for a worker. See
+   * {@link ScheduleClient.syncAnnounced} for the reconciliation rule and `graceMs` (default 10
+   * minutes). A namespaced engine adopts only its own namespace's. Nothing without a store that
+   * persists schedules or a transport that reads worker descriptors.
+   */
+  async syncAnnouncedSchedules(
+    opts: { graceMs?: number; nowMs?: number } = {},
+  ): Promise<Map<string, AnnouncedScheduleSync>> {
+    const out = new Map<string, AnnouncedScheduleSync>();
+    if (!this.schedules.supported) return out;
+    const byNamespace = new Map<string, { startedAt: number; items: AnnouncedSchedule[] }[]>();
+    for (const descriptor of await this.pool.readAllWorkerDescriptors()) {
+      const announced = descriptor.schedules;
+      if (!announced || typeof announced.tenant !== 'string' || !Array.isArray(announced.items)) {
+        continue;
+      }
+      let verified: VerifiedTenant | null;
+      try {
+        verified = await verifyWireTenant(announced.tenant, this.verifyTenant);
+      } catch {
+        verified = null;
+      }
+      const tenant = verified?.tenant ?? null;
+      if (tenant === null) {
+        if (!this.rejectedScheduleTenants.has(descriptor.instanceId)) {
+          this.rejectedScheduleTenants.add(descriptor.instanceId);
+          console.warn(
+            `[nestjs-durable] ignored the schedules worker ${descriptor.instanceId} announces: invalid or unauthorized tenant token`,
+          );
+        }
+        continue;
+      }
+      const namespace = poolNamespace(tenant) ?? 'default';
+      if (this.namespace !== undefined && namespace !== this.namespace) continue;
+      const list = byNamespace.get(namespace) ?? [];
+      list.push({ startedAt: Number(descriptor.startedAt) || 0, items: announced.items });
+      byNamespace.set(namespace, list);
+    }
+    for (const [namespace, announcers] of byNamespace) {
+      const items = new Map<string, AnnouncedSchedule>();
+      // Newest process first: on a key two deploys disagree on, the newer deploy's definition wins.
+      for (const { items: list } of announcers.sort((a, b) => b.startedAt - a.startedAt)) {
+        for (const item of list) {
+          if (item && typeof item.key === 'string' && !items.has(item.key)) {
+            items.set(item.key, item);
+          }
+        }
+      }
+      const result = await this.schedules.syncAnnounced(namespace, [...items.values()], {
+        graceMs: opts.graceMs ?? DEFAULT_ANNOUNCED_SCHEDULE_GRACE_MS,
+        ...(opts.nowMs !== undefined ? { nowMs: opts.nowMs } : {}),
+      });
+      for (const { key, error } of result.invalid) {
+        console.warn(
+          `[nestjs-durable] app "${namespace}" announces schedule "${key}", which cannot be adopted: ${error}`,
+        );
+      }
+      out.set(namespace, result);
+    }
+    return out;
+  }
+
   async announcedWorkflows(): Promise<AnnouncedWorkflow[]> {
     return (await this.workflowDirectory()).workflows;
   }

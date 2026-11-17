@@ -1,5 +1,6 @@
 import * as durableCore from '@dudousxd/nestjs-durable-core';
 import {
+  ANNOUNCED_SCHEDULE_TAG,
   DURABLE_OPTIONS_CANONICAL,
   type ScheduledWorkflow,
   WorkflowEngine,
@@ -67,6 +68,8 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
   private endWait: (() => void) | undefined;
   /** When the owed-lifecycle listing last succeeded (see {@link owedSweepDue}). */
   private owedSweptAt: number | undefined;
+  /** When the tenant schedule announcements were last reconciled (see {@link announcedSchedules}). */
+  private announcedSyncedAt: number | undefined;
 
   constructor(
     private readonly engine: WorkflowEngine,
@@ -187,6 +190,7 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
       const now = Date.now();
       const stored = await this.engine.nextDueAt(now + wait, {
         persistedSchedules: this.options.persistedSchedules === true,
+        announcedSchedules: this.announcedSchedules() !== undefined,
       });
       const schedules = this.options.schedules;
       const scheduled =
@@ -201,6 +205,20 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
     } catch {
       return intervalMs;
     }
+  }
+
+  /**
+   * The tenant schedule adoption settings when it is on (see
+   * {@link DurableModuleOptions.announcedSchedules}), else undefined: off by option, on a core
+   * without it, or on a store that does not persist schedules.
+   */
+  private announcedSchedules(): { syncMs: number; graceMs: number | undefined } | undefined {
+    const option = this.options.announcedSchedules;
+    if (option === false) return undefined;
+    if (typeof this.engine.syncAnnouncedSchedules !== 'function') return undefined;
+    if (this.engine.schedules?.supported !== true) return undefined;
+    const settings = typeof option === 'object' ? option : {};
+    return { syncMs: settings.syncMs ?? 15_000, graceMs: settings.graceMs };
   }
 
   /**
@@ -331,8 +349,32 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
     if (schedules && schedules.length > 0) {
       note(await this.sweep('schedules', () => runSchedules(this.engine, schedules, Date.now())));
     }
+    const announced = this.announcedSchedules();
+    if (announced) {
+      // Reconcile what tenant apps announce, once per `syncMs` and on one pod at a time when
+      // `@nestjs/locks` is present. Only a sync that got through starts the interval.
+      const at = Date.now();
+      const last = this.announcedSyncedAt;
+      if (last === undefined || at < last || at - last >= announced.syncMs) {
+        await this.sweep('announcedSchedules', () =>
+          this.leases.run('announced-schedules', async () => {
+            await this.engine.syncAnnouncedSchedules({
+              ...(announced.graceMs !== undefined ? { graceMs: announced.graceMs } : {}),
+            });
+            this.announcedSyncedAt = at;
+          }),
+        );
+      }
+    }
     if (this.options.persistedSchedules) {
+      // Every persisted schedule, the adopted tenant ones included.
       note(await this.sweep('persistedSchedules', () => this.engine.schedules.tick()));
+    } else if (announced) {
+      note(
+        await this.sweep('announcedScheduleFires', () =>
+          this.engine.schedules.tick(Date.now(), { tag: ANNOUNCED_SCHEDULE_TAG }),
+        ),
+      );
     }
     return worked;
   }

@@ -4,6 +4,7 @@ import type {
   RunningWorker,
 } from '@dudousxd/durable-worker';
 import {
+  type AnnouncedSchedule,
   DURABLE_OPTIONS_CANONICAL,
   type DurableTopology,
   type EngineEvent,
@@ -19,9 +20,14 @@ import {
   type RunValueFacetOptions,
   type RunValueFacetRow,
   type RunWaiting,
+  type ScheduleAnnouncement,
+  type ScheduledWorkflow,
+  type TenantTokenSource,
   WorkflowEngine,
   type WorkflowStartClient,
   bindWorkflowClass,
+  resolveTenantToken,
+  workflowName,
 } from '@dudousxd/nestjs-durable-core';
 import {
   Inject,
@@ -33,8 +39,9 @@ import {
 } from '@nestjs/common';
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { scanSteps, scanWorkflows } from './discovery-helpers';
-import type { DurableModuleOptions } from './durable.module';
+import type { DurableModuleOptions, ResolvedTenantAuth } from './durable.module';
 import { registerOnRuntime } from './runtime-registration';
+import { TENANT_AUTH } from './tokens';
 import { createWorkerRuntime, runRedisWorker as defaultRunRedisWorker } from './worker-sdk';
 
 /**
@@ -147,6 +154,7 @@ export class ThinWorkerBootstrap implements OnApplicationBootstrap, OnApplicatio
     @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
     @Inject(RUN_REDIS_WORKER) private readonly runRedisWorker: RunRedisWorkerFn,
     @Inject(DURABLE_WORKER_RUNNERS) private readonly runnersSink: RunningWorker[],
+    @Inject(TENANT_AUTH) private readonly auth: ResolvedTenantAuth,
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
@@ -154,7 +162,14 @@ export class ThinWorkerBootstrap implements OnApplicationBootstrap, OnApplicatio
     const runtime = this.runtime;
     if (runtime === null || !isPureThinWorker(options) || options.connection === undefined) return;
     // `consumers: false`: a producer-only process (CLI, REPL, script) starts no consumer.
-    if (options.consumers === false) return;
+    if (options.consumers === false) {
+      if ((options.schedules?.length ?? 0) > 0) {
+        console.warn(
+          '[nestjs-durable] `schedules` on a tenant with `consumers: false` are not announced: a tenant announces its schedules on its worker descriptor, so declare them on the processes that run its workers.',
+        );
+      }
+      return;
+    }
     // ONE call: the runner subscribes one queue per name registered on `runtime` — populated by
     // `ThinWorkflowRegistrar`/`ThinStepRegistrar`'s `onModuleInit`, which Nest's lifecycle guarantees
     // run (across the whole app) before any `onApplicationBootstrap` hook.
@@ -165,6 +180,9 @@ export class ThinWorkerBootstrap implements OnApplicationBootstrap, OnApplicatio
       ...(options.prefix !== undefined ? { prefix: options.prefix } : {}),
       ...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
       ...(options.concurrency !== undefined ? { concurrency: options.concurrency } : {}),
+      // Announce the app's schedules (an empty list too) so the control plane adopts, updates and
+      // withdraws them: a tenant has no store to fire them from.
+      ...(await tenantScheduleAnnouncement(options, this.auth.tenantToken)),
     });
     this.runners.push(handle);
     this.runnersSink.push(handle);
@@ -173,6 +191,45 @@ export class ThinWorkerBootstrap implements OnApplicationBootstrap, OnApplicatio
   async onApplicationShutdown(): Promise<void> {
     await Promise.allSettled(this.runners.map((h) => h.close()));
   }
+}
+
+/**
+ * The tenant's `schedules`, as its worker announces them: under the wire tenant its starts carry (the
+ * signed token when the app has one, else the partition), one {@link AnnouncedSchedule} per schedule.
+ * A schedule's `namespace` is dropped (a tenant's runs always belong to its own namespace), and
+ * `backfill` becomes the control plane's `catchup: 'latest'` (at most one late window).
+ */
+export async function tenantScheduleAnnouncement(
+  options: DurableModuleOptions,
+  tenantToken: TenantTokenSource | undefined,
+): Promise<{ schedules?: ScheduleAnnouncement }> {
+  let tenant: string;
+  try {
+    tenant =
+      tenantToken !== undefined
+        ? await resolveTenantToken(tenantToken)
+        : (options.partition ?? 'default');
+  } catch (error) {
+    // A token source that fails at boot must not keep the worker from starting: it announces no
+    // schedules (the control plane then neither adopts nor withdraws any for it) and says so.
+    console.warn(
+      `[nestjs-durable] this worker announces no schedules: its tenantToken failed (${error instanceof Error ? error.message : String(error)})`,
+    );
+    return {};
+  }
+  return { schedules: { tenant, items: (options.schedules ?? []).map(announcedSchedule) } };
+}
+
+function announcedSchedule(s: ScheduledWorkflow): AnnouncedSchedule {
+  const item: AnnouncedSchedule = { key: s.key, workflow: workflowName(s.workflow) };
+  if (s.input !== undefined) item.input = s.input;
+  if (s.everyMs !== undefined) item.everyMs = s.everyMs;
+  if (s.cron !== undefined) item.cron = s.cron;
+  if (s.timezone !== undefined) item.timezone = s.timezone;
+  if (s.paused === true) item.paused = true;
+  if (s.overlap !== undefined) item.overlap = s.overlap;
+  if (s.jitter !== undefined && s.jitter > 0) item.jitterMs = s.jitter;
+  return item;
 }
 
 /**

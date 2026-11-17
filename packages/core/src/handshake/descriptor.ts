@@ -50,6 +50,43 @@ export interface WorkflowRegistration {
 }
 
 /**
+ * One recurring start a tenant app declares (its `schedules` module option), as its worker
+ * ANNOUNCES it to the control plane, which adopts it as a persisted schedule and fires it (see
+ * `WorkflowEngine.syncAnnouncedSchedules`). JSON-safe: a workflow class is announced by its name.
+ */
+export interface AnnouncedSchedule {
+  /** The schedule's key in the app. The control plane's schedule id is `app:<namespace>:<key>`. */
+  key: string;
+  /** Registered workflow name. */
+  workflow: string;
+  /** The input every run starts with. */
+  input?: unknown;
+  /** Fixed interval in ms. Exactly one of `everyMs` and `cron`. */
+  everyMs?: number;
+  /** Cron expression (5 fields, or 6 with leading seconds). */
+  cron?: string;
+  /** IANA timezone the cron is evaluated in. Default UTC. */
+  timezone?: string;
+  /** Declared paused. */
+  paused?: boolean;
+  /** `'skip'`: no new window while the previous run is still in flight. Default `'allow'`. */
+  overlap?: 'allow' | 'skip';
+  /** Delay each fire by a stable offset of up to this many ms. */
+  jitterMs?: number;
+}
+
+/**
+ * The schedules a tenant worker announces, and the wire tenant they belong to: the partition, or
+ * the signed tenant token when the app has one (verified by the control plane exactly like a
+ * start-run's `tenant`). `items: []` is a statement too ("this app declares no schedules"), which is
+ * what lets the control plane withdraw a schedule the app stopped declaring.
+ */
+export interface ScheduleAnnouncement {
+  tenant: string;
+  items: AnnouncedSchedule[];
+}
+
+/**
  * A worker's (or control-plane's) advertised identity, wire-protocol support, feature capabilities
  * and registered handlers. Published on startup + on change (design §7.2) and consumed by
  * {@link negotiate} (compat) and the capability-aware router (design §7.5). Exactly the §7.1 shape.
@@ -88,6 +125,13 @@ export interface WorkerDescriptor {
    * that fails at run time.
    */
   registrations?: WorkflowRegistration[];
+  /**
+   * The recurring starts this app declares (see {@link ScheduleAnnouncement}). OPTIONAL and additive:
+   * absent = this SDK does not announce schedules (a control plane then neither adopts nor withdraws
+   * any for it); a control plane that predates the field ignores it. Rides the descriptor so it
+   * inherits its liveness: the control plane only reconciles against what LIVE workers announce.
+   */
+  schedules?: ScheduleAnnouncement;
   /** Optional routing partition (queue/group sharding). */
   partition?: string;
   /** Optional tenant namespace this instance serves. */
@@ -178,6 +222,7 @@ export function normalizeDescriptor(raw: RawWorkerDescriptor | WorkerDescriptor)
     workflows: raw.workflows ?? [],
     steps: raw.steps ?? [],
     ...(raw.registrations !== undefined ? { registrations: raw.registrations } : {}),
+    ...(raw.schedules !== undefined ? { schedules: raw.schedules } : {}),
     ...(raw.partition !== undefined ? { partition: raw.partition } : {}),
     ...(raw.namespace !== undefined ? { namespace: raw.namespace } : {}),
     startedAt: raw.startedAt ?? 0,
@@ -265,10 +310,31 @@ function canonicalizeForHash(d: WorkerDescriptor): unknown {
     ...(d.registrations !== undefined
       ? { registrations: canonicalizeRegistrations(d.registrations) }
       : {}),
+    // Conditional like `registrations`: a descriptor without schedules keeps its published hash.
+    ...(d.schedules !== undefined ? { schedules: canonicalSchedules(d.schedules) } : {}),
     partition: d.partition ?? null,
     namespace: d.namespace ?? null,
     startedAt: d.startedAt,
   };
+}
+
+/** The schedule announcement with its items sorted by key, so declaration order never changes the hash. */
+function canonicalSchedules(a: ScheduleAnnouncement): unknown {
+  const items = [...(a.items ?? [])].sort((x, y) => x.key.localeCompare(y.key));
+  return { tenant: a.tenant, items: items.map((i) => stableJson(i)) };
+}
+
+/** JSON with object keys sorted at every depth: equal values give equal strings. */
+export function stableJson(value: unknown): string {
+  return JSON.stringify(value, (_key, v: unknown) =>
+    v !== null && typeof v === 'object' && !Array.isArray(v)
+      ? Object.fromEntries(
+          Object.entries(v as Record<string, unknown>).sort(([a], [b]) =>
+            a < b ? -1 : a > b ? 1 : 0,
+          ),
+        )
+      : v,
+  );
 }
 
 /**
@@ -341,6 +407,8 @@ export function describeWorker(opts: {
    *  the descriptor entirely when absent or empty, so a worker with nothing to announce keeps the
    *  pre-registrations bytes (and therefore the pre-registrations hash). */
   registrations?: readonly WorkflowRegistration[] | undefined;
+  /** The schedules this app announces. Omitted from the descriptor when absent; `items: []` is kept. */
+  schedules?: ScheduleAnnouncement | undefined;
   startedAt: number;
   partition?: string | undefined;
   namespace?: string | undefined;
@@ -358,6 +426,14 @@ export function describeWorker(opts: {
     workflows: [...(opts.workflows ?? [])].sort(),
     steps: [...opts.steps].sort(),
     ...(registrations.length > 0 ? { registrations } : {}),
+    ...(opts.schedules !== undefined
+      ? {
+          schedules: {
+            tenant: opts.schedules.tenant,
+            items: [...opts.schedules.items].sort((a, b) => a.key.localeCompare(b.key)),
+          },
+        }
+      : {}),
     ...(opts.partition ? { partition: opts.partition } : {}),
     ...(opts.namespace && opts.namespace !== 'default' ? { namespace: opts.namespace } : {}),
     startedAt: opts.startedAt,

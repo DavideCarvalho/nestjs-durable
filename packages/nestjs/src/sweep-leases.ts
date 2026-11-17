@@ -18,7 +18,12 @@ interface LocksLike {
 }
 
 /** The fleet-wide sweeps gated by a lease when `@nestjs/locks` is present. */
-export type FleetSweep = 'retention' | 'stalled-pager' | 'buffered-signals' | 'signal-ids';
+export type FleetSweep =
+  | 'retention'
+  | 'stalled-pager'
+  | 'buffered-signals'
+  | 'signal-ids'
+  | 'announced-schedules';
 
 /**
  * Runs durable's FLEET-WIDE sweeps (retention pruning, the stalled-run pager, the orphaned

@@ -256,6 +256,57 @@ basics behave as on a standalone app:
   worker on the partition. `reconcileMs: 0` with `remoteAdvanceSilenceMs` unset keeps the old
   unbounded wait.
 
+### Schedules on a tenant
+
+A tenant has no store, so it cannot fire the `schedules` you declare on it. Its workers announce them
+instead, and the control plane adopts them as persisted schedules and fires them:
+
+```ts title="tenant: app.module.ts"
+DurableModule.forRoot({
+  connection: process.env.REDIS_URL,
+  partition: 'acme',
+  schedules: [{ key: 'daily-digest', workflow: DigestWorkflow, cron: '0 8 * * *' }],
+});
+```
+
+- **Announced on the worker descriptor.** Each tenant worker publishes its app's schedules on the
+  descriptor it already beats into the worker registry, under the same wire tenant its starts carry
+  (the partition, or its `tenantToken`, which a control plane with `verifyTenant` verifies; an
+  announcement that fails verification is ignored). A producer-only process (`consumers: false`)
+  publishes no descriptor, so declare schedules on the processes that run the app's workers. It warns
+  if you don't.
+- **Adopted per app.** Every 15 seconds a driving control-plane instance (one at a time with
+  `@nestjs/locks`) reads the live descriptors and keeps one persisted schedule per announced key, with
+  id `app:<partition>:<key>`, namespace `<partition>` and the tag `schedule:announced`. Two apps with
+  the same key never collide. Any number of replicas announcing the same set write nothing after the
+  first sync, and each window still starts one run (its run id is `sched:app:<partition>:<key>:<window>`).
+- **The newest deploy wins.** When live workers of one app disagree on a key (a rolling deploy changed
+  its cron), the worker that started last wins. A changed definition is re-applied like `upsert`: its
+  history is kept and its next fire is recomputed from now.
+- **Removed means paused, not deleted.** A schedule that no live worker of its app announces any more
+  is marked unannounced, and paused ("withdrawn") once it has stayed that way for the grace period, 10
+  minutes by default. The grace period starts only once the old pods are out of the registry: a pod
+  that shut down cleanly leaves at once, a pod that died expires within about a minute. The
+  history stays, and announcing it again (a rollback) resumes it. Nothing is withdrawn while the app
+  has no live worker, or only workers on an SDK that does not announce schedules, so an outage never
+  pauses your schedules.
+- **Fired through the tenant start path.** A window starts its run exactly like a tenant start. With no
+  live worker of the app (the tenant is down, or mid-deploy), the run waits `blocked` with
+  `error.code: 'no_live_worker'` and starts once a worker is live, instead of the window being lost.
+  Windows that come due while that run still waits are folded into it, so an app that comes back
+  after an outage finds one run per schedule waiting, the bound `catchup: 'latest'` gives. `overlap:
+  'skip'` holds as on any schedule (a waiting run is in flight). `backfill` is not carried over: an
+  announced schedule catches up one window at most.
+- **Owned by the control plane.** Announced schedules show on the console's Schedules page with their
+  app, and **pause**, **resume** and **run now** work on them. A pause made there survives the next
+  deploys. A change of the app's own `paused` flag does apply. Deleting one is undone by the next sync
+  while the app still announces it: pause it, or remove it from the app.
+- **Configuration.** `announcedSchedules` on the control plane's `DurableModule`: on by default with a
+  store that persists schedules and a transport that reads worker descriptors (BullMQ);
+  `{ syncMs, graceMs }` tunes it and `false` turns it off. It does not need `persistedSchedules`: with
+  that off, the poll fires only the adopted schedules. A schedule's `namespace` is ignored on a
+  tenant, whose runs always belong to its own partition.
+
 A remote **step** that a dead worker took with it is a separate case. `remoteRedispatchMs` re-sends
 it, and stays off by default because it re-runs a step that was only slow. See
 [Retries](/docs/reliability/retries#a-third-case-the-dispatch-itself-gets-lost).
@@ -283,6 +334,13 @@ Starts follow the same rule: a field one side does not know is ignored.
 | --- | --- | --- |
 | this release | older | The old control plane ignores `version`, `priority`, `startAt` and `concurrency` and starts the newest version at once. A start with no live worker is dropped, as before. `MyWorkflow.start()` works on the tenant either way. |
 | older | this release | The start carries no options and runs as before. A start with no live worker now waits `blocked` instead of being dropped, and a turn whose worker dies is re-driven after `reconcileMs`. |
+
+Schedules follow it too. The announcement is an optional descriptor field.
+
+| Tenant | Control plane | What happens to the tenant's `schedules` |
+| --- | --- | --- |
+| this release | older | The old control plane ignores the field: the schedules do not fire, as before. Nothing breaks. |
+| older | this release | The old worker announces nothing, so nothing is adopted for it and nothing is withdrawn. While a rolling deploy runs old and new workers of one app side by side, the new workers' announcement is the one applied. |
 
 After a control plane answers that it does not know `getFanMembers` (or `getRun`), the proxy pages fans locally
 for the next minute before it asks again. The control plane can be several pods behind one queue,

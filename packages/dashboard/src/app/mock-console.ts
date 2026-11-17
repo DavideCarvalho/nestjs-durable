@@ -418,6 +418,24 @@ const schedules: ScheduleSummary[] = [
     nextFireAt: null,
     lastFireAt: iso(-2 * 86_400_000),
   },
+  {
+    id: 'app:acme:daily-digest',
+    announcedKey: 'daily-digest',
+    workflow: 'digest',
+    namespace: 'acme',
+    cron: '0 8 * * *',
+    timezone: 'UTC',
+    input: {},
+    tags: ['schedule:announced'],
+    createdAt: iso(-7 * 86_400_000),
+    updatedAt: iso(-86_400_000),
+    fires: 7,
+    overlap: 'allow',
+    catchup: 'latest',
+    paused: false,
+    nextFireAt: iso(9 * 3_600_000),
+    lastFireAt: iso(-15 * 3_600_000),
+  },
 ];
 
 /** The other Aviary consoles, as `GET <api>/consoles` lists them. */

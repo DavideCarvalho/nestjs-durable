@@ -1,4 +1,10 @@
-import { InMemoryStateStore, type RunGateway, WorkflowEngine } from '@dudousxd/nestjs-durable-core';
+import {
+  InMemoryStateStore,
+  type RunGateway,
+  type Transport,
+  type WorkerDescriptor,
+  WorkflowEngine,
+} from '@dudousxd/nestjs-durable-core';
 import { describe, expect, it } from 'vitest';
 import { withConsoleApps } from './app-scope.js';
 import { DashboardService } from './dashboard.service.js';
@@ -18,6 +24,48 @@ describe('DashboardService schedules', () => {
     expect((await svc.resumeSchedule('nightly')).paused).toBe(false);
     const { runId } = await svc.triggerSchedule('nightly');
     expect(await store.getRun(runId)).not.toBeNull();
+  });
+
+  it('lists the schedules a tenant app announces with their app, and acts on them', async () => {
+    const store = new InMemoryStateStore();
+    const tenant: WorkerDescriptor = {
+      instanceId: 'acme-1',
+      runtime: 'node',
+      sdk: { name: 'durable-worker', version: '0' },
+      protocol: { version: 1, range: [1, 1] },
+      capabilities: [],
+      workflows: ['digest'],
+      steps: [],
+      partition: 'acme',
+      startedAt: 0,
+      schedules: { tenant: 'acme', items: [{ key: 'daily', workflow: 'digest', everyMs: 60_000 }] },
+    };
+    const transport: Transport = {
+      dispatch: async () => {},
+      onResult: () => {},
+      onHeartbeat: () => {},
+      listWorkerGroups: async () => [],
+      readAllWorkerDescriptors: async () => [tenant],
+    };
+    const engine = new WorkflowEngine({ store, transport, namespace: undefined });
+    await engine.syncAnnouncedSchedules();
+    const svc = new DashboardService(gateway, store, engine);
+
+    const [listed] = await svc.listSchedules({});
+    expect(listed).toMatchObject({
+      id: 'app:acme:daily',
+      namespace: 'acme',
+      announcedKey: 'daily',
+    });
+    expect((await svc.pauseSchedule('app:acme:daily')).paused).toBe(true);
+    // The pause survives the next sync of the unchanged announcement.
+    await engine.syncAnnouncedSchedules();
+    expect((await engine.schedules.get('app:acme:daily'))?.paused).toBe(true);
+    expect((await svc.resumeSchedule('app:acme:daily')).paused).toBe(false);
+    // "Run now" with no live tenant worker: the run waits for one.
+    const run = await svc.triggerSchedule('app:acme:daily');
+    expect(run.status).toBe('blocked');
+    expect((await store.getRun(run.runId))?.namespace).toBe('acme');
   });
 
   it('lists nothing on a tenant (no store)', async () => {
