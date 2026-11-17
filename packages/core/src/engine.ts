@@ -112,6 +112,7 @@ import type {
   Transport,
   UpdateResult,
   UpdateValidator,
+  WorkerHeartbeat,
   WorkflowCommand,
   WorkflowCtx,
   WorkflowDecision,
@@ -6686,13 +6687,16 @@ export class WorkflowEngine {
   /** Per-group worker health (queue backlog + live worker heartbeats). Covers {@link knownGroups}
    *  (so a registered group with backlog and ZERO workers still reports — the alert case) UNION the
    *  groups discovered from live heartbeats (so a local-step group like `pipeline`, not derivable
-   *  from registrations, shows once its workers beat). Empty when no transport can introspect health
-   *  (only the BullMQ transport implements `groupHealth`). */
+   *  from registrations, shows once its workers beat) UNION this engine's in-process workflows while
+   *  the run queue has a live consumer (see {@link inProcessWorkflowHealth}). Empty when no transport
+   *  can introspect health (only the BullMQ transport implements `groupHealth`). */
   async workerHealth(extra: string[] = []): Promise<GroupHealth[]> {
+    const inProcess = await this.inProcessWorkflowHealth();
     const groups = new Set([
       ...this.knownGroups(extra),
       ...(await this.pool.listWorkerGroups()),
       ...(await this.inflightStepGroups()),
+      ...inProcess.groups,
     ]);
     // Classify each group workflow-vs-step from the registry (authoritative — no name heuristic): a
     // group whose base token is a registered workflow serves a `@Workflow` body; anything else (an
@@ -6710,9 +6714,50 @@ export class WorkflowEngine {
       if (!health) continue;
       const at = group.lastIndexOf('@');
       const baseToken = at === -1 ? group : group.slice(0, at);
-      out.push({ ...health, kind: workflowTokens.has(baseToken) ? 'workflow' : 'step' });
+      const consumers = inProcess.groups.has(group)
+        ? inProcess.consumers
+            .filter((c) => !health.liveWorkers.some((w) => w.instanceId === c.instanceId))
+            .map((c) => ({ ...c, group }))
+        : [];
+      out.push({
+        ...health,
+        liveWorkers: [...health.liveWorkers, ...consumers],
+        kind: workflowTokens.has(baseToken) ? 'workflow' : 'step',
+      });
     }
     return out;
+  }
+
+  /**
+   * The workflows this deployment executes IN-PROCESS — registered here with a body, so a run of one
+   * is driven by whichever engine instance takes it off the run queue — and the instances consuming
+   * that queue right now. Those instances ARE the workers of these workflows, yet they consume no task
+   * queue and so never wrote a worker heartbeat: a control plane running its own workflows showed
+   * "0 live workers" while it completed runs. Each workflow is reported under the token a worker
+   * serving it would use (`tenantGroup(name, namespace)`), with the run-queue consumers as its live
+   * workers. The engine's internal `__` workflows are left out.
+   *
+   * Nothing when no run-queue consumer is live (a transport that cannot report one, or no driving
+   * instance): the workflows are not served by anything the transport can see, and claiming a worker
+   * for them would hide a starved queue.
+   */
+  private async inProcessWorkflowHealth(): Promise<{
+    groups: Set<string>;
+    consumers: WorkerHeartbeat[];
+  }> {
+    const groups = new Set<string>();
+    for (const def of this.workflows.values()) {
+      // `__`-prefixed: the engine's own machinery (event accumulators, entities), not user workflows.
+      if (def.remote || def.hasBody === false || def.name.startsWith('__')) continue;
+      groups.add(tenantGroup(sanitizeQueueToken(def.name), this.namespace));
+    }
+    // Nothing to report them under (a pure step worker, a remote-only plane): skip the Redis read.
+    if (groups.size === 0) return { groups, consumers: [] };
+    const consumers = await this.pool
+      .liveRunConsumers({ namespace: this.namespace })
+      .catch(() => [] as WorkerHeartbeat[]);
+    if (consumers.length === 0) groups.clear();
+    return { groups, consumers };
   }
 
   /**

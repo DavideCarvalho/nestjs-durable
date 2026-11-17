@@ -472,6 +472,8 @@ export class BullMQTransport implements Transport, ControlPlane {
   private readonly deferredStarts: Array<() => void> = [];
   // Consumers of the run queue (`onDispatchedRun`), one per call, each closed by its stop function.
   private readonly runWorkers = new Set<ConsumerLike>();
+  // Liveness beats of those consumers (`onDispatchedRun`), cleared by their stop or by `close()`.
+  private readonly runConsumerTimers = new Set<ReturnType<typeof setInterval>>();
   // Control plane runs over Redis pub/sub (not a queue): every instance gets every message, which
   // is what live-tail + cancellation need. Subscribe needs its own connection (it blocks the client).
   private controlPub?: Redis;
@@ -1895,21 +1897,100 @@ export class BullMQTransport implements Transport, ControlPlane {
    * like every point-to-point consumer while consumption is deferred (see `deferConsumers`). The
    * returned stop closes that worker: it takes no more jobs and resolves once the ones it holds
    * settled. A job left by a crashed instance is redelivered by BullMQ's stalled check.
+   *
+   * While consuming, the instance also stamps a TTL'd liveness key for the queue (see
+   * {@link liveRunConsumers}): it runs workflow bodies, so it is a worker, but it takes no task queue
+   * and would otherwise never appear in the worker-heartbeat keyspace.
    */
   onDispatchedRun(
     handler: (run: RunDispatch) => Promise<void>,
     opts: RunConsumerOptions,
   ): () => Promise<void> {
+    const limit = Math.max(1, Math.floor(opts.concurrency));
+    let inFlight = 0;
     const worker = this.makeWorker(
       this.#runsName(opts.namespace),
-      (job) => handler(job.data as RunDispatch),
-      { concurrency: Math.max(1, Math.floor(opts.concurrency)) },
+      async (job) => {
+        inFlight++;
+        try {
+          await handler(job.data as RunDispatch);
+        } finally {
+          inFlight--;
+        }
+      },
+      { concurrency: limit },
     );
     this.runWorkers.add(worker);
+    const key = this.runConsumerKey(opts.namespace, this.instanceId);
+    let timer: ReturnType<typeof setInterval> | undefined;
+    let stopped = false;
+    const beat = () => {
+      const value = JSON.stringify({
+        ts: Date.now(),
+        status: { runtime: 'node', concurrency: { mode: 'fixed', limit }, inFlight },
+      } satisfies { ts: number; status: WorkerStatus });
+      void this.workerRedis()
+        .set(key, value, 'EX', WORKER_HEARTBEAT_TTL_SECONDS)
+        .catch(() => {});
+    };
+    // Not while parked (`deferConsumers`): a process that takes no run is not a worker.
+    this.whenConsuming(() => {
+      if (stopped || this.closed) return;
+      beat();
+      timer = setInterval(beat, WORKER_HEARTBEAT_INTERVAL_MS);
+      timer.unref?.();
+      this.runConsumerTimers.add(timer);
+    });
     return async () => {
+      stopped = true;
+      if (timer) {
+        clearInterval(timer);
+        this.runConsumerTimers.delete(timer);
+        // Gone at once rather than after the TTL: a drained instance stops counting as a worker.
+        await this.workerRedis()
+          .del(key)
+          .catch(() => undefined);
+      }
       await worker.close();
       this.runWorkers.delete(worker);
     };
+  }
+
+  /** The run-queue consumer liveness key: `<runs queue name>-consumer:<instanceId>`. Its own keyspace,
+   *  NOT `-worker-heartbeat:` — a worker heartbeat marks a task queue someone consumes, and convention
+   *  routing would then dispatch workflow tasks to a queue nothing reads. */
+  private runConsumerKey(namespace: string | undefined, instanceId: string): string {
+    return `${this.#runsName(namespace)}-consumer:${instanceId}`;
+  }
+
+  /**
+   * The instances consuming the run queue `opts` names, read off their TTL'd liveness keys (SCAN,
+   * never KEYS). A key present is live by definition. `group` is left empty: the engine reports each
+   * consumer under the workflows it executes in-process.
+   */
+  async liveRunConsumers(opts?: RunQueueOptions): Promise<WorkerHeartbeat[]> {
+    const client = this.workerRedis();
+    const prefix = this.runConsumerKey(opts?.namespace, '');
+    const consumers: WorkerHeartbeat[] = [];
+    let cursor = '0';
+    do {
+      const [next, keys] = await client.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 100);
+      cursor = next;
+      if (keys.length === 0) continue;
+      const values = await client.mget(...keys);
+      keys.forEach((key, i) => {
+        const raw = values[i];
+        if (raw == null) return;
+        const parsed = parseHeartbeatValue(raw);
+        consumers.push({
+          group: '',
+          instanceId: key.slice(prefix.length),
+          lastBeatAt: parsed.lastBeatAt,
+          ...(parsed.status !== undefined ? { status: parsed.status } : {}),
+        });
+      });
+    } while (cursor !== '0');
+    return consumers;
   }
 
   /** Control plane: consume run requests. Starts the consumer on first call (idempotent — a second
@@ -2006,6 +2087,8 @@ export class BullMQTransport implements Transport, ControlPlane {
     // A consumer parked by `deferConsumers()` must not start during (or after) shutdown.
     this.deferredStarts.splice(0);
     if (this.workerHeartbeatTimer) clearInterval(this.workerHeartbeatTimer);
+    for (const timer of this.runConsumerTimers) clearInterval(timer);
+    this.runConsumerTimers.clear();
     if (this.pingWatchdogTimer) clearInterval(this.pingWatchdogTimer);
     if (this.replyBeatTimer) clearInterval(this.replyBeatTimer);
     if (this.replySweepTimer) clearInterval(this.replySweepTimer);
