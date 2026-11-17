@@ -224,6 +224,12 @@ describe('BullMQTransport (real Redis) [testcontainers]', () => {
       'EX',
       35,
     );
+    await admin.set(
+      `${prefix}-worker-heartbeat:pipeline:py-1`,
+      JSON.stringify({ ts: Date.now() / 1000 }),
+      'EX',
+      35,
+    );
 
     const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport: local });
     // Wait for the in-app worker's first beat to land, then assert BOTH sides are visible from one
@@ -240,7 +246,10 @@ describe('BullMQTransport (real Redis) [testcontainers]', () => {
 
     // Liveness IS the key's TTL: drop the key and the announcement is gone once the next walk ran,
     // with no expiry bookkeeping anywhere in the engine.
-    await admin.del(`${prefix}-worker-descriptor:pipeline:py-1`);
+    await admin.del(
+      `${prefix}-worker-descriptor:pipeline:py-1`,
+      `${prefix}-worker-heartbeat:pipeline:py-1`,
+    );
     await waitUntil(async () => (await engine.announcedWorkflows()).length === 0);
     expect(await engine.announcedWorkflows()).toEqual([]);
 

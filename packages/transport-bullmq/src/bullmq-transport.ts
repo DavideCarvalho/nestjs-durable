@@ -2118,7 +2118,7 @@ export class BullMQTransport implements Transport, ControlPlane {
     // Leave the worker registry now rather than at expiry: readers stop routing to this instance.
     // Only over a live connection and briefly: an unreachable Redis must not hold the shutdown, and
     // the entries expire on their own anyway.
-    if (this.workerHeartbeatRedis?.status === 'ready') {
+    if (this.workerHeartbeatRedis?.status === 'ready' || this.registryRedis?.status === 'ready') {
       await withTimeout(
         this.registry.removeAll(),
         Math.min(REGISTRY_REMOVE_WAIT_MS, this.closeTimeoutMs),

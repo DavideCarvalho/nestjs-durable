@@ -412,19 +412,21 @@ export class WorkerRegistry {
     tokens: readonly string[],
   ): Promise<void> {
     const prefix = this.#deps.effPrefix;
-    const keys: string[] = [];
+    // Only what this writer wrote for older readers is deleted (the per-instance key and the
+    // per-token hash field are written together), so a writer with `legacyWrites` off never touches
+    // the keys connection.
+    const written: { key: string; token: string }[] = [];
     for (const token of tokens) {
       this.#own.delete(ownKey(instance, kind, token));
       const key = perInstanceKey(prefix, kind, token, instance);
-      keys.push(key);
-      this.#legacyWrittenAt.delete(key);
+      if (this.#legacyWrittenAt.delete(key)) written.push({ key, token });
       this.#forgetWalked(kind, token, instance);
     }
     const removals: Promise<unknown>[] = [this.#scheduleFlush()];
-    if (keys.length > 0) removals.push(this.#deps.keys().del(...keys));
-    if (this.hashesSupported() && kind !== 'runConsumers') {
+    if (written.length > 0) removals.push(this.#deps.keys().del(...written.map((w) => w.key)));
+    if (written.length > 0 && kind !== 'runConsumers' && this.hashesSupported()) {
       const client = this.#deps.hashes() as HashRedis;
-      for (const token of tokens) {
+      for (const { token } of written) {
         removals.push(client.hdel(workerRegistryHashKey(prefix, kind, token), instance));
       }
     }
@@ -634,25 +636,37 @@ export class WorkerRegistry {
     return out;
   }
 
-  /** ONE `HGETALL` of the instances hash, reused while younger than `maxAgeMs` (concurrent callers
-   *  join the read in flight). This writer's own fields are skipped. A failed read is not kept. */
-  #instancesSnapshot(maxAgeMs: number): Promise<RegistrySnapshot> {
+  /**
+   * ONE `HGETALL` of the instances hash, reused while younger than `maxAgeMs` (concurrent callers
+   * join the read in flight). This writer's own fields are skipped. A failed read is not kept: it is
+   * reported, and a non-`fresh` reader gets the previous read (entries carry their own expiry, so a
+   * Redis blip reads as slightly stale rather than failing); a `fresh` reader, or one with no
+   * previous read, gets the error.
+   */
+  async #instancesSnapshot(maxAgeMs: number): Promise<RegistrySnapshot> {
     const last = this.#snapshot;
-    if (last && Date.now() - last.at < maxAgeMs) return Promise.resolve(last.entries);
-    if (this.#snapshotRead) return this.#snapshotRead;
-    const client = this.#deps.hashes() as HashRedis;
-    const startedAt = Date.now();
-    const read = client.hgetall(workerInstancesKey(this.#deps.effPrefix)).then((fields) => {
-      const entries = decodeInstancesHash(fields ?? {}, `#${this.#deps.nonce}`);
-      this.#snapshot = { at: startedAt, entries };
-      return entries;
-    });
-    this.#snapshotRead = read;
-    const clear = () => {
-      if (this.#snapshotRead === read) this.#snapshotRead = undefined;
-    };
-    read.then(clear, clear);
-    return read;
+    if (last && Date.now() - last.at < maxAgeMs) return last.entries;
+    if (!this.#snapshotRead) {
+      const client = this.#deps.hashes() as HashRedis;
+      const startedAt = Date.now();
+      const read = client.hgetall(workerInstancesKey(this.#deps.effPrefix)).then((fields) => {
+        const entries = decodeInstancesHash(fields ?? {}, `#${this.#deps.nonce}`);
+        this.#snapshot = { at: startedAt, entries };
+        return entries;
+      });
+      this.#snapshotRead = read;
+      const clear = () => {
+        if (this.#snapshotRead === read) this.#snapshotRead = undefined;
+      };
+      read.then(clear, clear);
+    }
+    try {
+      return await this.#snapshotRead;
+    } catch (err) {
+      if (maxAgeMs === 0 || !last) throw err;
+      this.#deps.onError(err);
+      return last.entries;
+    }
   }
 
   /**
@@ -680,13 +694,21 @@ export class WorkerRegistry {
       return at === 0 || now - at < window;
     };
     const out = emptySnapshot();
-    for (const kind of KINDS) {
+    for (const kind of ['heartbeats', 'runConsumers'] as const) {
       out[kind] = mergeEntries(
         mergeEntries(own[kind], hashed[kind].filter(live)),
         legacy[kind],
-        kind === 'descriptors' ? undefined : keepWalked,
+        keepWalked,
       );
     }
+    // A walked descriptor carries no beat time: keep it only while its writer has a live heartbeat
+    // for the same token, so a dead writer's descriptor never outlives its liveness.
+    const beating = new Set(out.heartbeats.map((e) => `${e.token}\n${e.instance}`));
+    out.descriptors = mergeEntries(
+      mergeEntries(own.descriptors, hashed.descriptors.filter(live)),
+      legacy.descriptors,
+      (e) => beating.has(`${e.token}\n${e.instance}`),
+    );
     return out;
   }
 

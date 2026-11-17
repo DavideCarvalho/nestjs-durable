@@ -156,13 +156,27 @@ describe('BullMQ worker registry (real Redis)', () => {
         { instance: 'gone-1', kind: 'heartbeats', token: 'gone', value: '1', expiresAt: now - 1 },
       ]),
     );
-    // A Python worker: only its per-instance key.
+    // A Python worker: only its per-instance keys.
     await admin.set(`${prefix}-worker-heartbeat:py.step:py-1`, String(now / 1000), 'EX', 35);
+    await admin.set(
+      `${prefix}-worker-descriptor:py.step:py-1`,
+      JSON.stringify({ instanceId: 'py-1' }),
+      'EX',
+      35,
+    );
+    // A descriptor whose writer stopped beating is not read.
+    await admin.set(
+      `${prefix}-worker-descriptor:gone.step:py-dead`,
+      JSON.stringify({ instanceId: 'py-dead' }),
+      'EX',
+      35,
+    );
 
     const withWalk = new BullMQTransport({ connection, prefix, instanceId: 'ts-a' });
     expect((await withWalk.listWorkerGroups()).sort()).toEqual(['ad.render', 'py.step']);
-    expect((await withWalk.readAllWorkerDescriptors()).map((d) => d.instanceId)).toEqual([
+    expect((await withWalk.readAllWorkerDescriptors()).map((d) => d.instanceId).sort()).toEqual([
       'adonis-1',
+      'py-1',
     ]);
 
     const noWalk = new BullMQTransport({
