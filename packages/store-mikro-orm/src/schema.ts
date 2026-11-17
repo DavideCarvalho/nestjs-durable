@@ -1,6 +1,11 @@
 import { createHash } from 'node:crypto';
 import type { MikroORM } from '@mikro-orm/core';
 import { WorkflowRunEntity, durableSchemaName } from './entities';
+import {
+  LIFECYCLE_PENDING_INDEX,
+  LIFECYCLE_PENDING_LIKE,
+  ensurePgLifecyclePendingIndex,
+} from './lifecycle-index';
 
 /**
  * The tables this store owns. Kept in sync with the `tableName`s in `./entities`. Used to scope
@@ -54,7 +59,7 @@ const SCHEMA_LOCK_NAME = 'durable_schema';
  * computed fingerprint, which forces a one-time re-heal on the next boot of every pod against every
  * database (the stored marker no longer matches), then settles back to the cheap steady-state path.
  */
-const SCHEMA_REVISION = 1;
+const SCHEMA_REVISION = 2; // 2: the Postgres owed-lifecycle partial index (see healLifecycleIndex)
 
 /**
  * Where {@link ensureMikroOrmDurableSchema} reports a schema repair it actually applied. `console`
@@ -550,13 +555,64 @@ export async function ensureMikroOrmDurableSchema(
     }
     const limit = options.blockingAlterRowLimit ?? DEFAULT_BLOCKING_ALTER_ROW_LIMIT;
     const { repairs, freshInstall, deferred } = await healDurableSchema(orm, dialect, limit, where);
-    // A deferred statement leaves the schema behind the metadata: keep the marker stale so the next
-    // boot re-checks (and applies it, once the table is small enough or the operator ran it).
-    if (deferred.length === 0) await writeFingerprint(orm, dialect, expected, where);
+    const indexed = await healLifecycleIndex(orm, dialect, where, logger);
+    if (indexed.built && !freshInstall) repairs.push(...indexed.repairs);
+    // A deferred statement (or an index that could not be built) leaves the schema behind: keep the
+    // marker stale so the next boot re-checks (and applies it, once the table is small enough or the
+    // operator ran it).
+    if (deferred.length === 0 && indexed.ok) await writeFingerprint(orm, dialect, expected, where);
     if (repairs.length > 0 && !freshInstall) logger.warn(mikroOrmSchemaRepairWarning(repairs));
     if (deferred.length > 0) logger.warn(mikroOrmDeferredAlterWarning(deferred, limit));
   } finally {
     await releaseSchemaLock(orm, dialect, where);
+  }
+}
+
+/**
+ * Postgres: the partial index the owed-lifecycle listing (`tags::text LIKE '%"durable:lifecycle:pending"%'`
+ * over settled runs, newest first) reads instead of scanning the whole runs table; see
+ * `lifecycle-index.ts`. Built concurrently, after the additive heal. `ok: false` when it could not be
+ * built (warned), so the fingerprint is not recorded and the next boot tries again. MySQL has no
+ * partial index and SQLite's would serve only an exact copy of the predicate in every query; both keep
+ * the scan, bounded by the poller's 10 s interval.
+ */
+async function healLifecycleIndex(
+  orm: MikroORM,
+  dialect: SqlDialect,
+  where: DurableLocation,
+  logger: { warn: (message: string) => void },
+): Promise<{ ok: boolean; built: boolean; repairs: string[] }> {
+  if (dialect !== 'postgres') return { ok: true, built: false, repairs: [] };
+  const meta = [...orm.getMetadata().getAll().values()].find(
+    (m) => m.class === WorkflowRunEntity || m.tableName === 'durable_workflow_runs',
+  );
+  if (!meta) return { ok: true, built: false, repairs: [] };
+  const column = (prop: 'tags' | 'createdAt') =>
+    where.quote(meta.properties?.[prop]?.fieldNames?.[0] ?? prop);
+  const table =
+    where.schema === undefined
+      ? where.quote(meta.tableName)
+      : `${where.quote(where.schema)}.${where.quote(meta.tableName)}`;
+  try {
+    const built = await ensurePgLifecyclePendingIndex(
+      (sql) => orm.em.getConnection().execute(sql),
+      {
+        schema: where.schema,
+        table,
+        createdAt: column('createdAt'),
+        predicate: `${column('tags')}::text LIKE '${LIFECYCLE_PENDING_LIKE}'`,
+      },
+    );
+    return {
+      ok: true,
+      built,
+      repairs: built ? [`created index ${LIFECYCLE_PENDING_INDEX} on ${meta.tableName}`] : [],
+    };
+  } catch (error) {
+    logger.warn(
+      `[nestjs-durable] store-mikro-orm could not create the partial index ${LIFECYCLE_PENDING_INDEX} (the owed-lifecycle listing scans the runs table until it exists); retrying on the next boot: ${(error as Error).message}`,
+    );
+    return { ok: false, built: false, repairs: [] };
   }
 }
 

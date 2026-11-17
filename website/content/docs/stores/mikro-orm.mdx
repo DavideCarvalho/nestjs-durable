@@ -211,6 +211,23 @@ schema-revision constant triggers the full heal — done under a best-effort adv
 `GET_LOCK` / Postgres `pg_advisory_lock`) so concurrent pods don't race the same DDL, with a re-check
 after acquiring in case a sibling pod already healed while this one waited.
 
+### Postgres: the owed-lifecycle index
+
+The timer poller lists the settled runs that still owe a lifecycle event (tag
+`durable:lifecycle:pending`) every 10 s. A tag filter is a leading-wildcard `LIKE`, which no B-tree
+serves, so on Postgres the schema helper adds a partial index over just those rows:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "durable_runs_lifecycle_pending_idx"
+  ON "durable_workflow_runs" ("created_at") WHERE "tags"::text LIKE '%"durable:lifecycle:pending"%';
+```
+
+Its predicate there is `"tags"::text LIKE …`, matching the listing. It is built `CONCURRENTLY` (writes go on during the build), or plainly when the connection is inside
+a transaction block. An invalid leftover of a build that died is rebuilt on the next boot, and a
+build that fails is warned and keeps the schema fingerprint unrecorded, so the next boot tries again. The listing sends that predicate as a
+literal, so every plan can use the index. MySQL has no partial indexes and SQLite's would only match
+the exact predicate text, so both keep the scan, once per 10 s per instance.
+
 ### Collation auto-convergence (MySQL/MariaDB)
 
 MikroORM's auto-schema creates tables with the server's *default* collation (`utf8mb4_0900_ai_ci` on

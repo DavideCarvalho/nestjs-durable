@@ -253,6 +253,27 @@ export interface DurableModuleSharedOptions {
   /** Interval (ms) for the durable-timer poller. `0` disables it. Defaults to 1000. Operator only. */
   timerPollMs?: number;
   /**
+   * The longest wait (ms) between two timer polls while there is nothing to do. After a poll that
+   * found no work the wait doubles from `timerPollMs` up to this, and goes back to `timerPollMs` as
+   * soon as there is work or any run event (here, or from another instance over the control plane).
+   * It never outlasts a known due time: before each longer wait the poller reads when the next timer,
+   * blocked-run recovery poll, persisted schedule or in-process `schedules` window is due. What it
+   * delays is recovery only: a crashed instance's runs, execution timeouts and the stalled/
+   * buffered-signal sweeps are picked up at most this late. A value at or below `timerPollMs` keeps
+   * the fixed tick, and so does an engine with neither a control plane nor a run queue (a run another
+   * instance starts reaches it only through the pending-run poll). Defaults to 5000. Operator only.
+   */
+  maxIdleIntervalMs?: number;
+  /**
+   * How often (ms) the timer poller lists the settled runs that still owe a lifecycle event, and
+   * heals the ones that missed a newly announced subscriber. That listing is the recovery path for a
+   * publish that never happened (the live publish gets a 30 s grace first) and filters runs by tag,
+   * so running it on every tick cost a scan of the runs table each second for nothing. The run-wait
+   * delivery and registry heartbeat still run every tick. A failed sweep is retried on the next tick.
+   * `0` sweeps on every tick (the old behavior). Defaults to 10000. Operator only.
+   */
+  owedLifecycleSweepMs?: number;
+  /**
    * Auto-create the durable tables on boot via `store.ensureSchema()`. Defaults to true. Turn
    * off in production and call the store adapter's `ensure*DurableSchema()` from a migration.
    * Operator only.

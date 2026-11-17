@@ -1,5 +1,7 @@
+import * as durableCore from '@dudousxd/nestjs-durable-core';
 import {
   DURABLE_OPTIONS_CANONICAL,
+  type ScheduledWorkflow,
   WorkflowEngine,
   runSchedules,
   workflowName,
@@ -16,6 +18,24 @@ import { isDrivingOperator } from './role';
 import { settleWithin } from './settle-within';
 import { SweepLeases } from './sweep-leases';
 
+/** What {@link TimerPoller.sweep} resolves when the sweep threw. */
+const SWEEP_FAILED = Symbol('sweep failed');
+
+/**
+ * The in-process schedules' next window (core `nextScheduleFireAt`), read off the module namespace
+ * because an older core (the peer range is wide) does not export it; the poller then keeps the fixed
+ * tick when `schedules` are configured.
+ */
+const nextScheduleFireAt = (
+  durableCore as {
+    nextScheduleFireAt?: (
+      engine: object,
+      schedules: readonly ScheduledWorkflow[],
+      nowMs: number,
+    ) => number | undefined;
+  }
+).nextScheduleFireAt;
+
 /**
  * Resumes suspended runs whose durable timer (`ctx.sleep`) is due, and fires any configured
  * recurring `schedules` (plus the persisted `engine.schedules` when `persistedSchedules` is on) —
@@ -25,14 +45,28 @@ import { SweepLeases } from './sweep-leases';
  * The boot poll is started, not awaited: `onApplicationBootstrap` runs before the host's HTTP server
  * listens, so a first poll held up by a large backlog would keep the pod from ever passing its
  * readiness probe. Shutdown still waits for whichever poll is in flight.
+ *
+ * While polls find nothing to do the wait between them backs off to `maxIdleIntervalMs` (default
+ * 5 s), never past the next known due time and back to `timerPollMs` on any run event — see
+ * {@link DurableModuleOptions.maxIdleIntervalMs}. The owed-lifecycle listing runs once per
+ * `owedLifecycleSweepMs` (default 10 s) instead of on every poll.
  */
 @Injectable()
 export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
   private timer?: ReturnType<typeof setInterval>;
   private polling = false;
   /** The sweep in flight, so shutdown can wait for it instead of racing the store's close. */
-  private current: Promise<void> | undefined;
+  private current: Promise<boolean> | undefined;
   private unsubscribeEnqueued?: () => void;
+  private unsubscribeEvents?: () => void;
+  /** Set by shutdown: the backoff loop stops scheduling polls. */
+  private stopped = false;
+  /** Something happened (a run event, an enqueue nudge) since the last poll started. */
+  private activity = false;
+  /** Ends the backoff loop's current wait early (set only while it waits). */
+  private endWait: (() => void) | undefined;
+  /** When the owed-lifecycle listing last succeeded (see {@link owedSweepDue}). */
+  private owedSweptAt: number | undefined;
 
   constructor(
     private readonly engine: WorkflowEngine,
@@ -66,6 +100,7 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
     // receives every announcement, so a wide fan would otherwise lease and replay every child here
     // at once. Optional for an older core.
     this.unsubscribeEnqueued = this.engine.onEnqueued((runId) => {
+      this.noteActivity();
       if (typeof this.engine.runEnqueued === 'function') {
         this.engine.runEnqueued(runId);
         return;
@@ -74,12 +109,108 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
         console.error(`[nestjs-durable] could not run enqueued run ${runId}:`, error);
       });
     });
-    void this.poll();
     const intervalMs = this.options.timerPollMs ?? 1_000;
+    const maxIdleMs = this.options.maxIdleIntervalMs ?? 5_000;
+    if (intervalMs > 0 && maxIdleMs > intervalMs && this.canBackOff()) {
+      // Any run event, local or from another instance (control plane), ends an idle wait.
+      this.unsubscribeEvents = this.engine.subscribe(() => this.noteActivity());
+      void this.loop(intervalMs, maxIdleMs);
+      return;
+    }
+    void this.poll();
     if (intervalMs > 0) {
       this.timer = setInterval(() => void this.poll(), intervalMs);
       this.timer.unref?.();
     }
+  }
+
+  /**
+   * Whether polls may be spaced out while idle: the engine must reach new runs without the
+   * pending-run poll and say when its next timer is due, and the in-process schedules must be able
+   * to say when their next window is. Optional calls throughout: an older core keeps the fixed tick.
+   */
+  private canBackOff(): boolean {
+    if (this.engine.idleBackoffSupported !== true) return false;
+    if (typeof this.engine.nextDueAt !== 'function') return false;
+    if ((this.options.schedules?.length ?? 0) > 0 && nextScheduleFireAt === undefined) return false;
+    return true;
+  }
+
+  private noteActivity(): void {
+    this.activity = true;
+    this.endWait?.();
+  }
+
+  /**
+   * Poll, then wait: `intervalMs` after a poll that found work (or while anything happened), else
+   * twice the last wait up to `maxIdleMs`, cut short so the next poll runs no later than the earliest
+   * known due time. A run event or an enqueue nudge ends a wait at once.
+   */
+  private async loop(intervalMs: number, maxIdleMs: number): Promise<void> {
+    let wait = intervalMs;
+    while (!this.stopped) {
+      // Whatever arrived during the wait (it ended the wait) counts as this poll's work.
+      const arrived = this.activity;
+      this.activity = false;
+      const worked = await this.poll();
+      if (this.stopped) return;
+      const idle = !worked && !arrived && !this.activity;
+      wait = idle ? Math.min(wait * 2, maxIdleMs) : intervalMs;
+      let next = wait;
+      if (next > intervalMs) next = await this.untilDue(next, intervalMs);
+      if (this.stopped) return;
+      if (this.activity) next = Math.min(next, intervalMs); // something happened during the read
+      await new Promise<void>((resolve) => {
+        const done = () => {
+          clearTimeout(timer);
+          this.endWait = undefined;
+          resolve();
+        };
+        const timer = setTimeout(done, next);
+        timer.unref?.();
+        // Only a wait longer than the regular tick is ended early; shutdown ends any.
+        this.endWait = () => {
+          if (this.stopped || next > intervalMs) done();
+        };
+      });
+    }
+  }
+
+  /**
+   * `wait`, shortened so the next poll runs no later than the earliest known due time: the engine's
+   * next timer, blocked-run recovery poll or persisted schedule, and the next window of the
+   * in-process `schedules`. Never below `intervalMs` (the regular tick catches what is due sooner). A
+   * failed read keeps the regular tick.
+   */
+  private async untilDue(wait: number, intervalMs: number): Promise<number> {
+    try {
+      const now = Date.now();
+      const stored = await this.engine.nextDueAt(now + wait, {
+        persistedSchedules: this.options.persistedSchedules === true,
+      });
+      const schedules = this.options.schedules;
+      const scheduled =
+        schedules && schedules.length > 0 && nextScheduleFireAt
+          ? nextScheduleFireAt(this.engine, schedules, now)
+          : undefined;
+      let due = wait;
+      for (const at of [stored, scheduled]) {
+        if (at !== undefined) due = Math.min(due, at - Date.now());
+      }
+      return Math.max(intervalMs, due);
+    } catch {
+      return intervalMs;
+    }
+  }
+
+  /**
+   * Whether this poll lists the owed lifecycle runs: until a sweep that listed them succeeded, then
+   * once per `owedLifecycleSweepMs` (a clock that went back lists them again).
+   */
+  private owedSweepDue(now: number): boolean {
+    const every = this.options.owedLifecycleSweepMs ?? 10_000;
+    const last = this.owedSweptAt;
+    return every <= 0 || last === undefined || now < last || now - last >= every;
   }
 
   /**
@@ -91,8 +222,11 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
    * from the later `engine.drain()`, so poll wait plus drain stay within one `shutdownTimeoutMs`.
    */
   async onModuleDestroy(): Promise<void> {
+    this.stopped = true;
     if (this.timer) clearInterval(this.timer);
+    this.endWait?.();
     this.unsubscribeEnqueued?.();
+    this.unsubscribeEvents?.();
     // Only an operator that DRIVES the engine has a poll to wait for, and only it stops taking work
     // here. A non-driving operator (dashboard-only, `drive: false`) keeps running whatever its
     // finishing requests or `beforeApplicationShutdown` hooks start; `drain()` in the registrar
@@ -128,8 +262,8 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
    * `recoverIncomplete` says nothing about whether durable timers should still fire, and skipping
    * the rest of the tick would silently widen one subsystem's outage into all of them.
    */
-  private poll(): Promise<void> {
-    if (this.polling) return this.current ?? Promise.resolve(); // never overlap two sweeps
+  private poll(): Promise<boolean> {
+    if (this.polling) return this.current ?? Promise.resolve(true); // never overlap two sweeps
     this.polling = true;
     const run = this.pollOnce().finally(() => {
       this.polling = false;
@@ -139,51 +273,77 @@ export class TimerPoller implements OnApplicationBootstrap, OnModuleDestroy {
     return run;
   }
 
-  private async pollOnce(): Promise<void> {
-    {
-      // Pick up runs enqueued elsewhere (an API pod's `start`, or another worker) still `pending`,
-      // reclaim runs orphaned by a crashed worker (lease expired — a live worker renews its lease so
-      // only dead ones are reclaimed), then resume due timers and sweep execution timeouts.
-      await this.sweep('runPending', () => this.engine.runPending());
-      await this.sweep('recoverIncomplete', () => this.engine.recoverIncomplete());
-      await this.sweep('resumeDueTimers', () => this.engine.resumeDueTimers());
-      await this.sweep('sweepTimeouts', () => this.engine.sweepTimeouts());
-      // The stalled-run pager: throttled to a pass a minute inside the engine, a no-op without an
-      // `onStalled` listener. Optional call: an older core (the peer range is wide) has no sweep.
-      // One pod pages when `@nestjs/locks` is present (see SweepLeases); every pod otherwise.
+  /** One poll of every sweep. Resolves whether it found work (or a sweep failed): see {@link loop}. */
+  private async pollOnce(): Promise<boolean> {
+    let worked = false;
+    // Work: a sweep returned runs (or run ids) it acted on, or failed (the loop keeps the regular
+    // tick so the failure is retried soon).
+    const note = (result: unknown) => {
+      if (result === SWEEP_FAILED || (Array.isArray(result) && result.length > 0)) worked = true;
+    };
+    // Pick up runs enqueued elsewhere (an API pod's `start`, or another worker) still `pending`,
+    // reclaim runs orphaned by a crashed worker (lease expired — a live worker renews its lease so
+    // only dead ones are reclaimed), then resume due timers and sweep execution timeouts.
+    note(await this.sweep('runPending', () => this.engine.runPending()));
+    note(await this.sweep('recoverIncomplete', () => this.engine.recoverIncomplete()));
+    note(await this.sweep('resumeDueTimers', () => this.engine.resumeDueTimers()));
+    note(await this.sweep('sweepTimeouts', () => this.engine.sweepTimeouts()));
+    // The stalled-run pager: throttled to a pass a minute inside the engine, a no-op without an
+    // `onStalled` listener. Optional call: an older core (the peer range is wide) has no sweep.
+    // One pod pages when `@nestjs/locks` is present (see SweepLeases); every pod otherwise.
+    note(
       await this.sweep('sweepStalled', () =>
         this.leases.run('stalled-pager', async () => this.engine.sweepStalled?.()),
-      );
-      // Buffered child completions no parent will consume: a few pages per tick until a pass ends,
-      // then a rest (throttled inside the engine). Optional call, like the stalled sweep.
+      ),
+    );
+    // Buffered child completions no parent will consume: a few pages per tick until a pass ends,
+    // then a rest (throttled inside the engine). Optional call, like the stalled sweep.
+    note(
       await this.sweep('sweepBufferedSignals', () =>
         this.leases.run('buffered-signals', async () => this.engine.sweepBufferedSignals?.()),
-      );
-      // Signal dedupe ids past their TTL (`signal(..., { id })`): a few bounded deletes per tick, one
-      // pod at a time like the buffered-signals sweep.
+      ),
+    );
+    // Signal dedupe ids past their TTL (`signal(..., { id })`): a few bounded deletes per tick, one
+    // pod at a time like the buffered-signals sweep.
+    note(
       await this.sweep('sweepExpiredSignalIds', () =>
         this.leases.run('signal-ids', async () => this.engine.sweepExpiredSignalIds?.()),
-      );
-      // Lifecycle events a settled run still owes to a subscriber this instance has (its process
-      // died before publishing, or did not have the subscriber), and `ctx.waitForRun` waits whose
-      // run settled without resuming them. Optional call, like the sweeps above.
-      await this.sweep('sweepLifecycleEvents', async () => this.engine.sweepLifecycleEvents?.());
-      const schedules = this.options.schedules;
-      if (schedules && schedules.length > 0) {
-        await this.sweep('schedules', () => runSchedules(this.engine, schedules, Date.now()));
-      }
-      if (this.options.persistedSchedules) {
-        await this.sweep('persistedSchedules', () => this.engine.schedules.tick());
-      }
+      ),
+    );
+    // Lifecycle events a settled run still owes to a subscriber this instance has (its process
+    // died before publishing, or did not have the subscriber), and `ctx.waitForRun` waits whose
+    // run settled without resuming them. The owed listing (a tag filter over settled runs) and the
+    // heal run once per `owedLifecycleSweepMs`; the run waits every poll. Only a listing that got
+    // through starts the interval: a failed one is retried on the next poll. Optional call, like
+    // the sweeps above (an older core ignores the third argument and sweeps everything).
+    const now = Date.now();
+    const owed = this.owedSweepDue(now);
+    note(
+      await this.sweep('sweepLifecycleEvents', async () => {
+        const published = await this.engine.sweepLifecycleEvents?.(undefined, undefined, {
+          owed,
+        });
+        if (owed) this.owedSweptAt = now;
+        return published;
+      }),
+    );
+    const schedules = this.options.schedules;
+    if (schedules && schedules.length > 0) {
+      note(await this.sweep('schedules', () => runSchedules(this.engine, schedules, Date.now())));
     }
+    if (this.options.persistedSchedules) {
+      note(await this.sweep('persistedSchedules', () => this.engine.schedules.tick()));
+    }
+    return worked;
   }
 
   /** Run one sweep, absorbing and reporting its failure — see {@link poll}. */
-  private async sweep(name: string, run: () => Promise<unknown>): Promise<void> {
+  private async sweep(name: string, run: () => Promise<unknown>): Promise<unknown> {
     try {
-      await run();
+      return await run();
     } catch (error) {
       console.error(`[nestjs-durable] timer poll: ${name} failed; continuing:`, error);
+      return SWEEP_FAILED;
     }
   }
 }

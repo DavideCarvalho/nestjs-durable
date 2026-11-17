@@ -171,6 +171,10 @@ with `CREATE SCHEMA IF NOT EXISTS`. The name must be a plain identifier of at mo
   `schema` option writes the schema into every statement instead.
 </Callout>
 
+The tag filters (the timer poller's listing of settled runs that still owe a lifecycle event,
+every 10 s, included) are JSON containment (`@>`) served by `durable_runs_tags_gin_idx`, so they
+never scan the runs table.
+
 ## What the Postgres flavour adds
 
 - **Atomic leases.** `tryLockRun` / `renewRunLock` are one conditional `UPDATE … RETURNING`: of N

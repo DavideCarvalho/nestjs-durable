@@ -10,6 +10,11 @@ import {
   WorkflowRunEntity,
   durableSchemaName,
 } from './entities';
+import {
+  LIFECYCLE_PENDING_INDEX,
+  LIFECYCLE_PENDING_LIKE,
+  ensurePgLifecyclePendingIndex,
+} from './lifecycle-index';
 
 /** The JSON-blob columns per table (keyed by table name) that hold free-form payloads and so must
  *  be the unbounded text type — `longtext` on MySQL, `text` elsewhere. Keyed by entity PROPERTY name;
@@ -603,6 +608,30 @@ export async function ensureTypeOrmDurableSchema(
         if (!created.has(table)) repairs.push(`created index ${name} on ${table}`);
       } catch {
         /* index already exists */
+      }
+    }
+    // Postgres: the owed-lifecycle listing (`tags LIKE '%"durable:lifecycle:pending"%'`, settled runs,
+    // newest first) reads a partial index of the few marked runs instead of scanning the whole table.
+    // Built concurrently, so a large table keeps taking writes; a failure is retried on the next boot.
+    // MySQL has no partial index, and SQLite's would serve only an exact copy of the predicate in
+    // every query; both keep the scan, bounded by the poller's 10 s interval.
+    if (isPg) {
+      try {
+        const built = await ensurePgLifecyclePendingIndex(
+          (sql, params) => runner.query(sql, params),
+          {
+            schema,
+            table: runs,
+            createdAt: runsCol('createdAt'),
+            predicate: `${runsCol('tags')} LIKE '${LIFECYCLE_PENDING_LIKE}'`,
+          },
+        );
+        if (built && !created.has('durable_workflow_runs'))
+          repairs.push(`created index ${LIFECYCLE_PENDING_INDEX} on durable_workflow_runs`);
+      } catch (error) {
+        logger.warn(
+          `[nestjs-durable] store-typeorm could not create the partial index ${LIFECYCLE_PENDING_INDEX} (the owed-lifecycle listing scans the runs table until it exists); retrying on the next boot: ${(error as Error).message}`,
+        );
       }
     }
   } finally {

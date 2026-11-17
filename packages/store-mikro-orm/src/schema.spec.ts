@@ -135,7 +135,10 @@ function makeOrm(
     schema: { getUpdateSchemaSQL },
     em: {
       getConnection: () => ({ execute: gatedExecute }),
-      getPlatform: () => ({ constructor: { name: platform } }),
+      getPlatform: () => ({
+        constructor: { name: platform },
+        quoteIdentifier: (id: string) => `"${id}"`,
+      }),
     },
     config: { get: (key: string) => (key === 'collate' ? opts.collate : undefined) },
     getMetadata: () => metadata,
@@ -276,7 +279,9 @@ describe('ensureMikroOrmDurableSchema collation alignment', () => {
     await ensureMikroOrmDurableSchema(
       makeOrm('', execute, { platform: 'PostgreSqlPlatform', collate: 'whatever' }),
     );
-    expect(execute).not.toHaveBeenCalled();
+    // Only the Postgres owed-lifecycle index statements run; nothing about collation.
+    const statements = execute.mock.calls.map((call) => String((call as unknown[])[0]));
+    expect(statements.filter((statement) => /collat/i.test(statement))).toEqual([]);
   });
 
   it('is a no-op when no collate is configured', async () => {
@@ -429,7 +434,7 @@ describe('ensureMikroOrmDurableSchema repair warning', () => {
 
     expect(logger.messages).toEqual([
       expect.stringContaining(
-        'at boot: added column durable_signal_waiters.parallel_group; created index durable_runs_status_idx on durable_workflow_runs.',
+        'at boot: added column durable_signal_waiters.parallel_group; created index durable_runs_status_idx on durable_workflow_runs; created index durable_runs_lifecycle_pending_idx on durable_workflow_runs.',
       ),
     ]);
   });

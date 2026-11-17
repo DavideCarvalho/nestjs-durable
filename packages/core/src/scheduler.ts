@@ -120,6 +120,37 @@ function jitterDue(
   return due;
 }
 
+/**
+ * The earliest time after `nowMs` at which {@link runSchedules} may have a window of `schedules` to
+ * fire for `engine`: each unpaused schedule's next window boundary, and the fire time of any jittered
+ * window an earlier call deferred. `nowMs` when a schedule cannot say (an unparsable cron, a missing
+ * `cron-parser`), so a caller never waits past a window; `undefined` for none. Pass the same `engine`
+ * object as to `runSchedules` (the deferred windows are remembered per engine object).
+ */
+export function nextScheduleFireAt(
+  engine: object,
+  schedules: readonly ScheduledWorkflow[],
+  nowMs: number,
+): number | undefined {
+  let next: number | undefined;
+  const consider = (at: number) => {
+    if (next === undefined || at < next) next = at;
+  };
+  for (const s of schedules) {
+    for (const at of jitterFireAt.get(engine)?.get(s.key)?.values() ?? []) consider(at);
+    if (s.paused) continue;
+    try {
+      if (s.cron != null) consider(nextCronFireMs(s.cron, nowMs, s.timezone));
+      else if (s.everyMs != null && s.everyMs > 0)
+        consider((Math.floor(nowMs / s.everyMs) + 1) * s.everyMs);
+      else return nowMs;
+    } catch {
+      return nowMs;
+    }
+  }
+  return next;
+}
+
 /** Deterministic run id for a fixed-interval schedule's current time window. */
 export function scheduledRunId(key: string, everyMs: number, nowMs: number): string {
   return `sched:${key}:${Math.floor(nowMs / everyMs)}`;

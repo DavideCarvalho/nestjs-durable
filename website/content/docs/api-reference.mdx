@@ -373,6 +373,8 @@ Options for `DurableModule.forRoot` / `forRootAsync`. The role (**operator** / *
 | `transports` | `NamedTransport[]` | — | Ordered pool for failover / multi-broker, instead of `transport`. |
 | `controlPlane` | `ControlPlane` | first broadcast-capable transport | Cross-instance lifecycle-event + cancellation pub/sub. |
 | `timerPollMs` | `number` | `1000` | Durable-timer poller interval; `0` disables it. Operator only. |
+| `maxIdleIntervalMs` | `number` | `5000` | Longest wait between timer polls while idle: the wait doubles from `timerPollMs` up to this after polls that find nothing, never past the next due timer, blocked-run poll or schedule window, and drops back to `timerPollMs` on any run event or enqueue nudge. Only recovery (crashed runs, execution timeouts, housekeeping sweeps) waits up to this long. At or below `timerPollMs`, or without a control plane or run queue, the tick stays fixed. Operator only. |
+| `owedLifecycleSweepMs` | `number` | `10000` | How often the poller lists settled runs that still owe a lifecycle event (and heals runs that missed a new subscriber); run waits are still swept every poll. A failed listing is retried on the next poll. `0` lists on every poll. Operator only. |
 | `autoSchema` | `boolean` | `true` | Auto-create durable tables via `store.ensureSchema()` on boot. Turn off in production; migrate instead. |
 | `namespace` | `string` | unset = **operator** | Worker-pool partition; poll paths only act on runs in this namespace. See [Tenancy](/docs/concepts/tenancy). |
 | `leaseMs` | `number` | `30000` | Multi-instance recovery-lease duration. Operator only. |
