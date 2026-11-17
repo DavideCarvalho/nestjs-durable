@@ -1578,7 +1578,13 @@ export class WorkflowEngine {
         // A singleton served by convention (announced by a tenant) has no registration here: wake
         // its next waiter by the run's key tag. The woken run re-checks admission itself.
         const key = this.latest.has(run.workflow) ? undefined : singletonKeyOf(run);
-        return key === undefined ? undefined : { key: () => key };
+        if (key === undefined) return undefined;
+        // The limit its workers last announced (noted by convention resolution), so a limit-N
+        // singleton wakes up to N waiters per settlement.
+        const limit = this.conventionSingletonLimits.get(
+          `${runNamespace(run.namespace)}\u0000${run.workflow}`,
+        );
+        return { key: () => key, ...(limit !== undefined ? { limit } : {}) };
       },
     });
     this.schedules = new ScheduleClient(
@@ -4284,7 +4290,12 @@ export class WorkflowEngine {
     tenant: Pick<StartOptions, 'tenantId' | 'tenantKind'>,
     signal: { token: string; payload?: unknown },
   ): Promise<{ runId: string; signalled: boolean }> {
-    await this.startForTenant(start, namespace, tenant);
+    const started = await this.startForTenant(start, namespace, tenant);
+    // A start refused (quota, singleton queue, invalid input) or a run already settled will never
+    // wait on the token: buffering for it would only leave an orphan row behind.
+    if (TERMINAL_RUN_STATUSES.includes(started.status)) {
+      return { runId: start.runId, signalled: false };
+    }
     const waiter = (await this.store.listSignalWaiters(signal.token)).find(
       (w) => w.token === signal.token,
     );
@@ -4895,6 +4906,12 @@ export class WorkflowEngine {
     // nothing on this engine registers, so a control-plane registration always wins over them.
     const announced = await this.announcedRegistration(group, run.workflow, version);
     const singleton = conventionSingleton(run, announced, opts.singleton);
+    if (singleton?.limit !== undefined) {
+      this.conventionSingletonLimits.set(
+        `${runNamespace(run.namespace)}\u0000${run.workflow}`,
+        singleton.limit,
+      );
+    }
     const tags = announced?.options?.tags;
     return {
       name: run.workflow,
@@ -5195,6 +5212,13 @@ export class WorkflowEngine {
       await this.cancelTimedOut(workflow, namespace, now - timeoutMs);
     }
   }
+
+  /**
+   * The singleton limit last resolved for a workflow served by convention, by `<namespace>\0<name>`
+   * (see {@link resolveRemoteByConvention}): what the singleton gate's release wake-up reads, since
+   * it cannot wait on the fleet. One entry per convention singleton the fleet serves.
+   */
+  private readonly conventionSingletonLimits = new Map<string, number>();
 
   /** The last read of the announced execution timeouts (see {@link announcedTimeouts}). */
   private announcedTimeoutsRead:

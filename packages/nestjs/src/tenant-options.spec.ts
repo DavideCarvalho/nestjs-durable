@@ -252,6 +252,37 @@ describe('signal, signalWithStart and publishEvent from a tenant', () => {
     expect(sink).toHaveLength(1);
   });
 
+  it('publishEvent: a subscriber that throws is skipped, the others and the resume still happen', async () => {
+    const sink: { name: string; data: Record<string, unknown> }[] = [];
+    const { sent, api } = requests();
+    const facade = new DurableStartClient(
+      { connection: 'redis://x', partition: 'acme' },
+      { Queue: fakeQueue(sink) as never },
+      undefined,
+      () => api,
+    );
+    facade.declareWorkflow('broken', {
+      onEvent: [
+        {
+          event: 'paid',
+          input: () => {
+            throw new Error('bad mapping');
+          },
+        },
+      ],
+    });
+    facade.declareWorkflow('fine', { onEvent: ['paid'] });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(await facade.publishEvent('paid', {}, { id: 'e' })).toBe(3);
+      expect(sink.map((j) => j.data.workflow)).toEqual(['fine']);
+      expect(sent.map((c) => c[0])).toEqual(['publishEvent']);
+      expect(warn.mock.calls.flat().join(' ')).toMatch(/broken not started/);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('without a transport they fail naming what is missing', async () => {
     const facade = new DurableStartClient({ connection: 'redis://x', partition: 'acme' });
     await expect(facade.signal('tok', 1)).rejects.toThrow(/transport/);

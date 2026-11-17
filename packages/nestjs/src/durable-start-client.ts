@@ -276,32 +276,39 @@ export class DurableStartClient {
    * whose `where` accepts the payload, with its `input` mapping) as runs of this partition, by the
    * start path ({@link start}, run id `evt:<id>:<workflow>`), and has the control plane resume the
    * runs of this partition waiting on it (`ctx.waitForEvent`). Resolves how many runs it started or
-   * resumed. Unlike a control plane's `publishEvent`, an event nobody received is not buffered, and
+   * resumed; a subscriber that throws is warned about and skipped. Unlike a control plane's
+   * `publishEvent`, an event nobody received is not buffered (there is no `buffer` option), and
    * a subscriber's `debounce`/`batch` is not applied (it starts once per event, with a warning).
    */
-  async publishEvent(
-    name: string,
-    payload: unknown,
-    opts?: { id?: string; buffer?: boolean },
-  ): Promise<number> {
+  async publishEvent(name: string, payload: unknown, opts?: { id?: string }): Promise<number> {
     const requests = this.runRequests('publishEvent');
     const eventId = opts?.id ?? globalThis.crypto.randomUUID();
     let started = 0;
     for (const [workflow, policy] of this.policies) {
-      const subscriptions = (policy.onEvent ?? [])
-        .map(toEventSubscription)
-        .filter((sub) => sub.event === name);
-      const { accepted } = acceptingSubscription(subscriptions, payload);
-      if (!accepted) continue;
-      if (policy.coalesces && !this.warnedCoalescing.has(workflow)) {
-        this.warnedCoalescing.add(workflow);
-        console.warn(
-          `[nestjs-durable] ${workflow} debounces/batches its events, which a tenant's publishEvent does not apply: it starts once per event.`,
-        );
+      // One subscriber that throws (its `where`, its `input`, or its start) must not keep the
+      // others, or the control plane's resume of the waiting runs, from getting the event: as on a
+      // control plane, it is reported and skipped.
+      try {
+        const subscriptions = (policy.onEvent ?? [])
+          .map(toEventSubscription)
+          .filter((sub) => sub.event === name);
+        const { accepted, errors } = acceptingSubscription(subscriptions, payload);
+        if (!accepted) {
+          if (errors.length > 0) throw errors[0];
+          continue;
+        }
+        if (policy.coalesces && !this.warnedCoalescing.has(workflow)) {
+          this.warnedCoalescing.add(workflow);
+          console.warn(
+            `[nestjs-durable] ${workflow} debounces/batches its events, which a tenant's publishEvent does not apply: it starts once per event.`,
+          );
+        }
+        const input = accepted.input ? accepted.input(payload) : payload;
+        await this.start(workflow, input, `evt:${eventId}:${workflow}`);
+        started += 1;
+      } catch (error) {
+        console.warn(`[nestjs-durable] event ${name}: subscriber ${workflow} not started:`, error);
       }
-      const input = accepted.input ? accepted.input(payload) : payload;
-      await this.start(workflow, input, `evt:${eventId}:${workflow}`);
-      started += 1;
     }
     const resumed = await requests.publishEvent(name, payload, { id: eventId });
     return started + resumed;

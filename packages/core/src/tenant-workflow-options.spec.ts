@@ -165,6 +165,39 @@ describe('announced @Workflow options on a convention-served tenant workflow (it
     expect(broker.turns.map((t) => t.runId)).toEqual(['a', 'g']);
   });
 
+  it('wakes up to the announced limit of waiters when a convention singleton run frees its slot', async () => {
+    const { store, broker, engine } = setup();
+    broker.live = ['invoice@acme'];
+    broker.descriptors = [
+      worker('w1', 1, [
+        {
+          name: 'invoice',
+          version: '1',
+          group: 'invoice@acme',
+          options: { singleton: { limit: 2 } },
+        },
+      ]),
+    ];
+    const singleton = { key: 'k', limit: 2 };
+    for (const id of ['a', 'b', 'c', 'd']) {
+      await broker.deliver({
+        tenant: 'acme',
+        workflow: 'invoice',
+        input: {},
+        runId: id,
+        singleton,
+      });
+    }
+    expect(broker.turns.map((t) => t.runId).sort()).toEqual(['a', 'b']);
+    // A cancel frees a slot and wakes the oldest `limit` suspended runs of the key (notify-on-release):
+    // with the announced limit 2 that reaches `c` now; read as limit 1 it would only re-wake `b`
+    // and leave `c` to its retry timer.
+    await engine.cancel('a');
+    await settle();
+    expect(broker.turns.map((t) => t.runId)).toContain('c');
+    expect((await store.getRun('c'))?.tags).toContain('durable:singleton:admitted');
+  });
+
   it('a pinned registration on the control plane wins over the announced options', async () => {
     const { store, broker, engine } = setup();
     broker.live = ['invoice@acme'];
@@ -332,6 +365,29 @@ describe('tenant signalWithStart and publishEvent (item 11)', () => {
     expect(out).toEqual({ runId: 'counter-1', signalled: true });
     expect((await store.getRun('counter-1'))?.namespace).toBe('acme');
     expect(await store.takeBufferedSignal('counter-1:add')).toEqual({ payload: 2 });
+  });
+
+  it('signalWithStart signals nothing for a start the control plane refused', async () => {
+    const { store, broker, engine } = setup();
+    broker.live = ['counter@acme'];
+    broker.descriptors = [
+      worker('w1', 1, [{ name: 'counter', version: '1', group: 'counter@acme' }]),
+    ];
+    const out = await engine.signalWithStartForTenant(
+      {
+        tenant: 'acme',
+        workflow: 'counter',
+        input: {},
+        runId: 'counter-3',
+        concurrency: { key: 'none', limit: 0 },
+      },
+      'acme',
+      {},
+      { token: 'counter-3:add', payload: 1 },
+    );
+    expect(out).toEqual({ runId: 'counter-3', signalled: false });
+    expect((await store.getRun('counter-3'))?.error?.code).toBe('concurrency_limit');
+    expect(await store.takeBufferedSignal('counter-3:add')).toBeNull();
   });
 
   it('signalWithStart buffers nothing on a token that does not name the run', async () => {
