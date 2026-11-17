@@ -11,7 +11,7 @@ import {
   type WorkflowRun,
   isWorkflowControlFlowSignal,
 } from '@dudousxd/nestjs-durable-core';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { StepFailed, toError } from './errors';
 import { WorkflowWorker } from './workflow-worker';
 
@@ -331,6 +331,36 @@ describe('negotiated ctx commands, applied by the control plane', () => {
     const last = runs.find((r) => r.status === 'completed' && r.output === 2);
     expect(last?.id.startsWith('l1~')).toBe(true);
     expect(runs.filter((r) => r.workflow === 'loop')).toHaveLength(3);
+  });
+
+  it('a body that swallows continueAsNew fails, and starts no continuation', async () => {
+    const cp = controlPlane({
+      loop: async (ctx) => {
+        try {
+          await ctx.continueAsNew({ n: 1 });
+        } catch {
+          throw new Error('swallowed the handoff');
+        }
+      },
+    });
+    await cp.engine.start('loop', {}, 'l1');
+    const run = await runOf(cp.engine, 'l1');
+    expect(run?.status).toBe('failed');
+    expect((await cp.store.listRuns({})).map((r) => r.id)).toEqual(['l1']);
+  });
+
+  it('a continuation that cannot start fails the run with the reason instead of completing it', async () => {
+    const cp = controlPlane({ loop: async (ctx) => ctx.continueAsNew({ n: 1 }) });
+    const start = cp.engine.start.bind(cp.engine);
+    vi.spyOn(cp.engine, 'start').mockImplementation((async (...args: Parameters<typeof start>) => {
+      if (args[2]?.startsWith('l1~')) throw new Error('quota full');
+      return start(...args);
+    }) as typeof start);
+    await cp.engine.start('loop', {}, 'l1');
+    const run = await runOf(cp.engine, 'l1');
+    expect(run?.status).toBe('failed');
+    expect(run?.error?.code).toBe('continue_as_new_failed');
+    expect(run?.error?.message).toContain('quota full');
   });
 
   it('setEvent publishes a value engine.getEvent reads while the run is still going', async () => {

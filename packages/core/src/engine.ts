@@ -8677,7 +8677,10 @@ export class WorkflowEngine {
     // Zombie fence (as in settleRun): a decision applied under a lost lease must not write.
     if (this.isFenced(run.id)) return this.echoCurrentStatus(run.id);
     const handoff = decision.commands.find((cmd) => cmd.kind === 'continueAsNew');
-    if (handoff !== undefined && decision.status !== 'cancelled') {
+    // Only a completed turn hands off: the worker maps `ctx.continueAsNew` to `completed`, so any other
+    // status carrying the command is a body that caught and swallowed the signal — it settles as that
+    // status (the command itself is a no-op in applyCommands), as the in-process run would.
+    if (handoff !== undefined && decision.status === 'completed') {
       return this.applyRemoteContinueAsNew(run, decision.commands, handoff.input);
     }
     if (decision.status === 'completed') {
@@ -8740,8 +8743,7 @@ export class WorkflowEngine {
    * A remote turn that ended in `ctx.continueAsNew(input)`: record what the turn ran, complete this
    * run and start its continuation (`<runId>~N`) with `input` on a clean history — the in-process
    * engine's handoff, with the run's partition and tenant carried over. A run cancelled while the
-   * turn replayed stays cancelled and starts nothing. Deferred and idempotent by the continuation id,
-   * so a re-applied decision converges on the same next run.
+   * turn replayed stays cancelled and starts nothing.
    */
   private async applyRemoteContinueAsNew(
     run: WorkflowRun,
@@ -8762,6 +8764,26 @@ export class WorkflowEngine {
     ) {
       return { runId: run.id, status: fresh.status, output: fresh.output, error: fresh.error };
     }
+    // Start the continuation BEFORE completing this run, and wait for it: `start` is idempotent by
+    // the continuation id, so a crash between the two re-applies this turn (the run is not terminal
+    // yet) and converges on the same next run. A continuation that cannot start fails this run with
+    // the reason instead of completing it with nothing after it.
+    const nextId = nextContinuationId(run.id);
+    try {
+      await this.start(run.workflow, input, nextId, {
+        namespace: run.namespace,
+        ...inheritTenant(run),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return this.settleRun(run, {
+        kind: 'failed',
+        error: {
+          message: `continueAsNew: the continuation ${nextId} failed to start: ${message}`,
+          code: 'continue_as_new_failed',
+        },
+      });
+    }
     await this.store.updateRun(run.id, {
       status: 'completed',
       output: undefined,
@@ -8774,14 +8796,6 @@ export class WorkflowEngine {
       { lifecycle: false },
     );
     void this.notifyParent(run.id, { ok: true, value: undefined });
-    const nextId = nextContinuationId(run.id);
-    queueMicrotask(
-      () =>
-        void this.start(run.workflow, input, nextId, {
-          namespace: run.namespace,
-          ...inheritTenant(run),
-        }).catch(() => undefined),
-    );
     return { runId: run.id, status: 'completed' };
   }
 
@@ -9385,13 +9399,26 @@ export class WorkflowEngine {
         // `ctx.startChild` (fire-and-forget): start the child once, idempotent by its id, and journal
         // `spawn:<childId>` at this position — the in-process checkpoint, so replay returns the id.
         // The child inherits the parent's partition and tenant, like an awaited child.
+        // The start is awaited BEFORE the spawn is journaled — not deferred, which would be dropped on
+        // drain or a crash after the journal and orphan the child (once journaled, the worker replays
+        // the spawn and never sends it again). No waiter exists on the parent, so there is nothing for
+        // a fast child to re-enter. `start` is idempotent by id, so a re-applied turn converges.
         if (await this.store.getCheckpoint(run.id, cmd.seq)) continue;
         if (!(await this.store.getRun(cmd.childId))) {
-          this.startChildDeferred(cmd.workflow, cmd.input, cmd.childId, {
-            namespace: run.namespace,
-            ...inheritTenant(run),
-            ...(cmd.priority !== undefined ? { priority: cmd.priority } : {}),
-          });
+          try {
+            await this.start(cmd.workflow, cmd.input, cmd.childId, {
+              namespace: run.namespace,
+              ...inheritTenant(run),
+              ...(cmd.priority !== undefined ? { priority: cmd.priority } : {}),
+            });
+          } catch (err) {
+            // As in-process: the failure is kept for a later join of the id (`ctx.child(…, id)`).
+            const message = err instanceof Error ? err.message : String(err);
+            this.notifyParent(cmd.childId, {
+              ok: false,
+              error: `child workflow "${cmd.workflow}" failed to start: ${message}`,
+            });
+          }
         }
         await this.store.saveCheckpoint(
           instantCheckpoint({
