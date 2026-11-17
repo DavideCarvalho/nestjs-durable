@@ -27,6 +27,10 @@ import {
   workerDescriptorKey,
   workerHeartbeatKey,
 } from './runner-core';
+import { RegistryWriter, type WorkerRegistryWriteOptions } from './worker-registry';
+
+/** How long `close()` waits for this worker's registry entries to be removed. */
+const REGISTRY_REMOVE_WAIT_MS = 1_000;
 
 // Worker liveness heartbeat: a worker stamps a TTL'd key while it's consuming; the key expiring is
 // the "this worker is gone/stalled" signal a monitor watches. TTL comfortably exceeds the interval
@@ -109,6 +113,14 @@ export interface RunRedisWorkerOptions {
   partition?: string;
   /** Stable id for this worker process in heartbeats/control. Defaults to `ts-<hostname>-<pid>`. */
   instanceId?: string;
+  /**
+   * The worker registry this worker advertises into: its field of `<prefix>-workers:instances` (one
+   * `HSET` per beat, the layout the BullMQ transport and the AdonisJS lib read), plus the
+   * per-instance keys older readers read while `legacyWrites` is on (default; refreshed every
+   * `legacyWriteIntervalMs`, 30 s). Turn `legacyWrites` off once every reader runs a version that
+   * reads the hash.
+   */
+  workerRegistry?: WorkerRegistryWriteOptions;
   /** Override the Worker's job-lock duration (ms). Defaults to 5 min — see {@link DEFAULT_LOCK_DURATION_MS}. */
   lockDuration?: number;
   /**
@@ -156,6 +168,12 @@ export interface RunnerDeps {
   ) => {
     duplicate(): RedisSubClient;
     set(key: string, value: string, mode: string, ttl: number): Promise<unknown>;
+    /** Worker registry hash commands (see `workerRegistry`); without them only the keys are written. */
+    del?(...keys: string[]): Promise<unknown>;
+    hset?(key: string, field: string, value: string): Promise<unknown>;
+    hgetall?(key: string): Promise<Record<string, string>>;
+    hdel?(key: string, ...fields: string[]): Promise<unknown>;
+    pexpire?(key: string, ms: number): Promise<unknown>;
     /** Reply routing reads an engine's alive key; without it results go to the shared queue. */
     exists?(key: string): Promise<number>;
     publish(channel: string, payload: string): Promise<unknown>;
@@ -371,6 +389,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
   let closing = false;
   let heartbeatClient: InstanceType<NonNullable<RunnerDeps['Redis']>> | undefined;
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  let registry: RegistryWriter | undefined;
 
   if (deps.Redis) {
     try {
@@ -401,12 +420,8 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       });
 
       heartbeatClient = base;
-      // One TTL'd key PER subscribed name/partition token, so `listWorkerGroups()` reports liveness
-      // per queue rather than one blended signal for a process that may serve several handlers.
-      const keys = queueTokens.map((token) => workerHeartbeatKey(prefix, token, instanceId));
-      const descriptorKeys = queueTokens.map((token) =>
-        workerDescriptorKey(prefix, token, instanceId),
-      );
+      registry = new RegistryWriter(base, prefix, instanceId, options.workerRegistry);
+      const writer = registry;
       // This worker's handshake descriptor, including what it ANNOUNCES it can execute (design
       // §7.9). Built ONCE: the registration surface is fixed before the first task is consumed (both
       // Nest registrars run in `onModuleInit`, this runner starts in `onApplicationBootstrap`), so
@@ -416,25 +431,26 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       const descriptorJson = JSON.stringify(descriptor);
       const etag = descriptorHash(descriptor);
       const beat = () => {
-        // The heartbeat value is now `{ts,status,descriptorHash}` JSON (was a bare ms timestamp) —
-        // readers accept both. The status is the controller's live snapshot, refreshed cheaply on
-        // every beat; the hash is the two-tier ETag that tells a control plane when to re-read the
-        // full descriptor below (design §7.2).
+        // One entry PER subscribed name/partition token, so `listWorkerGroups()` reports liveness per
+        // queue rather than one blended signal for a process that may serve several handlers. The
+        // value is `{ts,status,descriptorHash}` JSON; the hash is the two-tier ETag that tells a
+        // control plane when the descriptor changed (design §7.2). The descriptor rides the SAME
+        // beat with the SAME TTL, so this worker's announcements cannot outlive its liveness.
         const value = JSON.stringify({
           ts: Date.now(),
           status: controller.snapshot(),
           descriptorHash: etag,
         });
-        for (const key of keys) {
-          void heartbeatClient?.set(key, value, 'EX', WORKER_HEARTBEAT_TTL_SECONDS).catch(() => {});
-        }
-        // Refreshed on the SAME beat and with the SAME TTL as the liveness key, so this worker's
-        // announcements cannot outlive its liveness: stop beating and both expire together.
-        for (const key of descriptorKeys) {
-          void heartbeatClient
-            ?.set(key, descriptorJson, 'EX', WORKER_HEARTBEAT_TTL_SECONDS)
-            .catch(() => {});
-        }
+        void writer
+          .beat({
+            tokens: queueTokens,
+            heartbeat: value,
+            descriptor: descriptorJson,
+            ttlSeconds: WORKER_HEARTBEAT_TTL_SECONDS,
+            heartbeatKey: (token) => workerHeartbeatKey(prefix, token, instanceId),
+            descriptorKey: (token) => workerDescriptorKey(prefix, token, instanceId),
+          })
+          .catch(() => {});
       };
       beat(); // fire immediately so a fresh worker is visible without waiting a full interval
       heartbeatTimer = setInterval(beat, WORKER_HEARTBEAT_INTERVAL_MS);
@@ -451,6 +467,19 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       closing = true;
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       controller.stop();
+      // Leave the registry now rather than at expiry, so readers stop routing to this worker. Bounded:
+      // an unreachable Redis must not hold the shutdown (the entries expire on their own anyway).
+      if (registry) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          registry.remove(),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, REGISTRY_REMOVE_WAIT_MS);
+            timer.unref?.();
+          }),
+        ]);
+        if (timer) clearTimeout(timer);
+      }
       await Promise.all(workersRef.current.map((w) => w.close()));
       await Promise.all([decisions.close(), publisher.close(), stepEvents.close()]);
       controlSub?.disconnect();

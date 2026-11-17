@@ -1989,9 +1989,13 @@ export interface Transport {
    * broker transports that carry the two-tier descriptor advertisement (BullMQ) implement it; a pure
    * in-process transport returns nothing, so the engine's routing guard stays disengaged (legacy
    * assume-compatible, design §7.7). The engine feeds these into {@link planDispatch} to decide whether
-   * a run can dispatch to `group` or must park `blocked`.
+   * a run can dispatch to `group` or must park `blocked`. A transport may reuse a recent read of its
+   * registry; `opts.fresh` asks it to read again (the engine does before it parks a run `blocked`).
    */
-  readWorkerDescriptors?(group: string): Promise<WorkerDescriptor[]>;
+  readWorkerDescriptors?(
+    group: string,
+    opts?: { fresh?: boolean | undefined },
+  ): Promise<WorkerDescriptor[]>;
   /**
    * Every live {@link WorkerDescriptor} in the deployment, across all groups — the read behind
    * {@link WorkflowEngine.announcedWorkflows}. Optional, same as {@link readWorkerDescriptors}: a

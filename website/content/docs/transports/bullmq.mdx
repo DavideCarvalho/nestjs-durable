@@ -195,6 +195,67 @@ module, construct the transport with `deferConsumers: true` (or call `deferConsu
 `handle()` / `onResult()`). Pub/sub (heartbeats, control, run replies, tenant events) is broadcast
 and is not parked.
 
+## Worker registry
+
+Workers advertise which handler queues they consume (liveness plus live status), their
+[handshake descriptor](/docs/cluster/handshake), and, for an engine running workflow bodies
+in-process, that it consumes the run queue. All of it lives in **one Redis hash per prefix**,
+`<P>-workers:instances`, with one field per instance listing every token it serves. A worker writes
+its field once per 10 s beat, whatever its number of handlers. A process reads the whole hash with
+one `HGETALL` and reuses it for 30 s across every reader: the dashboard's Workers page, convention
+routing (`listWorkerGroups`), the announced-workflow directory and the descriptors read before a
+dispatch. Before the engine parks a run `blocked` it reads the hash again, so a worker that joined
+inside those 30 s is never missed. A process sees its own entries at once. The hash has a TTL, and
+every writer deletes other writers' expired fields (a crashed process). A clean `close()` removes
+the instance's field at once.
+
+The layout is the AdonisJS durable lib's, byte for byte, so a NestJS fleet and an Adonis fleet on one
+Redis see each other's workers.
+
+Before this version workers wrote one key per handler (`<P>-worker-heartbeat:<token>:<instance>`,
+`<P>-worker-descriptor:<token>:<instance>`), and readers found them with `SCAN`. A `SCAN` visits every
+key of the db however few match, so on a Redis holding BullMQ jobs that walk was most of the
+registry's cost. For a rolling upgrade both sides of the old layout are kept, behind two switches:
+
+```ts
+new BullMQTransport({
+  connection,
+  workerRegistry: {
+    legacyWrites: true, // default; false once every reader runs this version
+    legacyWriteIntervalMs: 30_000, // default
+    legacyScan: true, // default; false once every writer runs this version
+    legacyScanIntervalMs: 60_000, // default
+    connection: { ...redisOptions, db: 2 }, // optional: keep the registry hash on another db
+  },
+})
+```
+
+- `legacyWrites` keeps writing the per-instance keys (and the per-token hashes older Adonis versions
+  read) every `legacyWriteIntervalMs`, living three intervals.
+- `legacyScan` keeps reading the per-instance keys of writers that never write the hash (an older
+  version, and the **Python worker**, which still writes per-instance keys): ONE `SCAN` walk shared by
+  every reader of the process, at most once per `legacyScanIntervalMs`. After the first walk readers
+  get the last walk at once while the next one runs in the background, so a Python worker that just
+  started can take up to a minute to appear.
+
+`workerRegistry.connection` takes the same forms as `connection` and holds the registry hashes; the
+per-instance keys stay on `connection`. Every process of the fleet must use the same value.
+
+Measured with 85 handlers, one engine polling the Workers view every 5 s, and 40 000 unrelated keys
+in the db: 424 512 `SCAN` calls a minute and 7 293 commands/s before; 5 `SCAN` calls a minute and
+158 commands/s with the defaults; no `SCAN` and 150 commands/s with both switches off (the rest is
+the per-group queue counts and BullMQ's own polling).
+
+### Upgrading a fleet
+
+1. Deploy this version everywhere (transport, `@dudousxd/durable-worker`), with the defaults. Its
+   workers still write what older readers read, and its readers still read older workers.
+2. Once every process that **reads** the registry runs this version (engines, dashboards, Adonis
+   control planes on 1.0.0-rc.32 or later), set `legacyWrites: false` on the workers.
+3. Once every process that **writes** the registry writes the hash (no Python worker, no older
+   NestJS or Adonis worker shares the Redis), set `legacyScan: false` on the readers. They then never
+   walk the keyspace. Keep it on while Python workers share the Redis.
+
 ## Control plane & tenant protocol
 
 Every `onDecision` and `onResult` handler registered on one transport gets every decision and every
@@ -221,6 +282,7 @@ lifecycle events and cancellation — and carries the tenant `start-run` / `run-
 | `resultConcurrency` | The most step results this instance handles at once from the results queue, when above the built-in 512. One run's results still resume it in order. See [Result concurrency](#result-concurrency). |
 | `drainDelay` | Seconds each BullMQ worker blocks on an **empty** queue before polling it again. A new job wakes the worker at once (BullMQ's marker) and a delayed job's due time shortens the block, so this only sets how often idle queues are re-polled (a `BZPOPMIN` and a `moveToActive` script per queue). Closing is not held up by it. Defaults to `30` (BullMQ's own default is 5). |
 | `stalledInterval` | Milliseconds between each worker's stalled-job checks (one script per queue). Raising it lowers idle Redis load and delays recovering a job whose worker died. Defaults to BullMQ's 30 000. |
+| `workerRegistry` | `{ legacyWrites?, legacyWriteIntervalMs?, legacyScan?, legacyScanIntervalMs?, connection? }`: what the worker registry still writes and reads for older versions, and an optional separate connection for its hash. See [Worker registry](#worker-registry). Defaults to `{ legacyWrites: true, legacyWriteIntervalMs: 30_000, legacyScan: true, legacyScanIntervalMs: 60_000 }`. |
 
 The payload is the documented `RemoteTask` / `StepResult` JSON, so a non-Node worker on the same
 queues interoperates — that's exactly how the [Python worker](/docs/python) plugs in.

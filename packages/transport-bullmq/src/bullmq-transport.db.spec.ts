@@ -193,8 +193,15 @@ describe('BullMQTransport (real Redis) [testcontainers]', () => {
     const prefix = `durtest-${Date.now()}-a`;
     const admin = new Redis(connection);
 
-    // A real in-app worker: `handle()` starts its advertisement, one descriptor key per token.
-    const local = new BullMQTransport({ connection, prefix, instanceId: 'ts-local' });
+    // A real in-app worker: `handle()` starts its advertisement, one descriptor key per token. The
+    // compatibility walk (how a Python worker's keys are read) is throttled; a short interval keeps
+    // this case fast.
+    const local = new BullMQTransport({
+      connection,
+      prefix,
+      instanceId: 'ts-local',
+      workerRegistry: { legacyScanIntervalMs: 50 },
+    });
     local.handle('payments.charge-card', async () => ({}));
     local.handle('payments.refund', async () => ({}));
 
@@ -217,6 +224,12 @@ describe('BullMQTransport (real Redis) [testcontainers]', () => {
       'EX',
       35,
     );
+    await admin.set(
+      `${prefix}-worker-heartbeat:pipeline:py-1`,
+      JSON.stringify({ ts: Date.now() / 1000 }),
+      'EX',
+      35,
+    );
 
     const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport: local });
     // Wait for the in-app worker's first beat to land, then assert BOTH sides are visible from one
@@ -231,9 +244,13 @@ describe('BullMQTransport (real Redis) [testcontainers]', () => {
     expect(announced[0]?.groups).toEqual(['pipeline']);
     expect(announced[0]?.origins).toEqual(['flip']);
 
-    // Liveness IS the key's TTL: drop the key and the announcement is gone on the next read, with
-    // no expiry bookkeeping anywhere in the engine.
-    await admin.del(`${prefix}-worker-descriptor:pipeline:py-1`);
+    // Liveness IS the key's TTL: drop the key and the announcement is gone once the next walk ran,
+    // with no expiry bookkeeping anywhere in the engine.
+    await admin.del(
+      `${prefix}-worker-descriptor:pipeline:py-1`,
+      `${prefix}-worker-heartbeat:pipeline:py-1`,
+    );
+    await waitUntil(async () => (await engine.announcedWorkflows()).length === 0);
     expect(await engine.announcedWorkflows()).toEqual([]);
 
     await admin.quit();
