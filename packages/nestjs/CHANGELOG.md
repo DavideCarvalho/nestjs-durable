@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-durable
 
+## 0.63.0
+
+### Minor Changes
+
+- [#478](https://github.com/DavideCarvalho/nestjs-durable/pull/478) [`4459117`](https://github.com/DavideCarvalho/nestjs-durable/commit/44591171f3fded28cd34a495ffbb88a9629dffca) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A `DurableModule` tenant (a `connection`, no `store`) now behaves like a standalone app for the basics. `MyWorkflow.start()` works on a tenant: the class statics are bound to the tenant's start client. `version`, `priority`, `startAt` and `concurrency` travel on `StartRunMessage` and the control plane applies them. A start whose workflow no live worker serves yet is created `blocked` with `error.code: 'no_live_worker'` and starts once a worker (declaring the pinned version, if any) is live, instead of being dropped. A start the quota refuses, or whose input the control plane's registration rejects, is recorded as a `failed` run (`concurrency_limit` / `invalid_input`). A start the control plane fails to create for a transient reason is redelivered with backoff under one run id. Workflow-level `singleton`, default `concurrency` and input schemas declared only on the tenant are not enforced by the control plane yet. A workflow turn dispatched to a remote worker now takes `reconcileMs` (5 min) as its re-drive deadline when `remoteAdvanceSilenceMs` is unset, so a run whose worker died mid-turn is re-driven instead of hanging; `reconcileMs: 0` keeps the old wait. A pinned start resolved by convention routing is accepted when the live workers declare that version. Due runs nothing can resolve are retried with a back-off instead of on every timer poll.
+
 ## 0.62.0
 
 ### Minor Changes
