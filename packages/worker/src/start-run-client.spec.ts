@@ -131,3 +131,38 @@ describe('startRun — wire payload', () => {
     expect(captures[0]?.data).toMatchObject({ searchAttributes: { tier: 'pro' } });
   });
 });
+
+describe('startRun — start options', () => {
+  it('carries version, priority, startAt (a Date sent as epoch ms) and concurrency', async () => {
+    const { deps, captures } = makeFakeDeps();
+    await startRun(
+      {},
+      {
+        tenant: 'acme',
+        workflow: 'checkout',
+        input: null,
+        version: '2',
+        priority: 9,
+        startAt: new Date(1_700_000_000_000),
+        concurrency: { key: 'acme', limit: 3 },
+        deps,
+      },
+    );
+    expect(captures[0]?.data).toMatchObject({
+      version: '2',
+      priority: 9,
+      startAt: 1_700_000_000_000,
+      concurrency: { key: 'acme', limit: 3 },
+    });
+  });
+
+  it('sends none of them when none is given, so an older control plane reads the same message', async () => {
+    const { deps, captures } = makeFakeDeps();
+    await startRun({}, { tenant: 'acme', workflow: 'checkout', input: null, deps });
+    expect(Object.keys(captures[0]?.data as object).sort()).toEqual([
+      'input',
+      'tenant',
+      'workflow',
+    ]);
+  });
+});

@@ -219,6 +219,45 @@ That is why the table lists `cancel` as a working verb. It is `RunGateway.cancel
 more than one shape, and you never meet the distinction.
 </Callout>
 
+### What a tenant gets
+
+A tenant's workflows run on the tenant's worker, but the control plane orchestrates them. These
+basics behave as on a standalone app:
+
+- **Class statics.** `MyWorkflow.start(input, opts)` works on a tenant. It publishes the start to the
+  control plane through the same start-only client `WorkflowEngine` injects. `MyWorkflow.execute()`
+  outside a workflow still throws there, because waiting on a run needs the store.
+- **Start options.** `version`, `priority`, `startAt` and `concurrency` travel with the start and
+  the control plane applies them: the run is stamped with the priority, waits for its `startAt`,
+  counts against the quota, and starts only on a live worker that declares the pinned version.
+  A start the quota refuses is recorded as a `failed` run with `error.code: 'concurrency_limit'`
+  (`'singleton_queue_full'` for singleton back-pressure). The tenant caller has already returned,
+  so the refusal has to be stored where you can find it by run id.
+- **A start is never lost.** When no worker serves the workflow yet (the tenant pod is down, rolling
+  or not deployed), the control plane creates the run `blocked` with `error.code: 'no_live_worker'`
+  and starts it once a worker is live. It checks every `blockedPollMs`, backing off to once a minute
+  for a run that has waited long. Liveness is read through a registry snapshot up to 30 seconds old,
+  so a worker that just booted is noticed within that window. Such a run is never dead-lettered for
+  waiting; cancel it to drop it. A start the control plane fails to create (a store error) is put
+  back on the start queue and retried with a delay that doubles up to a minute, for about an hour.
+  Redelivery is safe: a run id is started once.
+- **A dead worker does not hang its run.** A workflow turn dispatched to a worker carries a re-drive
+  deadline: `remoteAdvanceSilenceMs` when you set it, else `reconcileMs` (5 minutes by default). The
+  worker's run heartbeat (every 5 seconds while it replays the turn) pushes it forward. If the worker
+  dies holding the turn, the control plane sends the turn again once the deadline passes, to any live
+  worker on the partition. `reconcileMs: 0` with `remoteAdvanceSilenceMs` unset keeps the old
+  unbounded wait.
+
+A remote **step** that a dead worker took with it is a separate case. `remoteRedispatchMs` re-sends
+it, and stays off by default because it re-runs a step that was only slow. See
+[Retries](/docs/reliability/retries#a-third-case-the-dispatch-itself-gets-lost).
+
+<Callout type="warn">
+A worker on an SDK that does not send run heartbeats (the TypeScript and Python workers do) is
+re-sent any turn that takes longer than `reconcileMs`. Set `remoteAdvanceSilenceMs` above your
+longest turn if you run one.
+</Callout>
+
 ### Rolling upgrades
 
 Tenant pods and the control plane can be upgraded in either order. While they are on different
@@ -229,6 +268,13 @@ releases, run detail keeps working in both directions:
 | 0.47.2+ | 0.46.x or older | The old responder ignores the detail options and has no `getFanMembers`. `ProxyRunGateway` sees the full detail come back without `fans` and summarizes it on the tenant. A `getFanMembers` gets no data from an old responder, so the proxy reads the full detail and pages the fan out of it. Both fallbacks happen on that reply, with no timeout wait. A `getRun` gets no data either, so the proxy takes the run out of the full detail. |
 | 0.47.0 or 0.47.1 | 0.46.x or older | These tenants have no fallback: run detail comes back unsummarized and fan pages answer 404. Upgrade the control plane first, or move the tenants straight to 0.47.2. |
 | 0.46.x or older | 0.47.0+ | An old proxy never sends detail options or `getFanMembers`. The new responder answers its requests exactly as before: a full detail, and the same ownership checks. |
+
+Starts follow the same rule: a field one side does not know is ignored.
+
+| Tenant | Control plane | What happens to a start |
+| --- | --- | --- |
+| this release | older | The old control plane ignores `version`, `priority`, `startAt` and `concurrency` and starts the newest version at once. A start with no live worker is dropped, as before. `MyWorkflow.start()` works on the tenant either way. |
+| older | this release | The start carries no options and runs as before. A start with no live worker now waits `blocked` instead of being dropped, and a turn whose worker dies is re-driven after `reconcileMs`. |
 
 After a control plane answers that it does not know `getFanMembers` (or `getRun`), the proxy pages fans locally
 for the next minute before it asks again. The control plane can be several pods behind one queue,

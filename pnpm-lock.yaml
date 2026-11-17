@@ -437,6 +437,9 @@ importers:
       '@types/supertest':
         specifier: 6.0.3
         version: 6.0.3
+      bullmq:
+        specifier: 6.3.17
+        version: 6.3.17(ioredis@6.0.0)(pg@8.21.0)
       class-transformer:
         specifier: 0.5.1
         version: 0.5.1
@@ -446,6 +449,9 @@ importers:
       eventemitter2:
         specifier: 6.4.9
         version: 6.4.9
+      ioredis:
+        specifier: 6.0.0
+        version: 6.0.0
       jose:
         specifier: 6.2.14
         version: 6.2.14

@@ -19,6 +19,9 @@ import {
   type RunValueFacetOptions,
   type RunValueFacetRow,
   type RunWaiting,
+  WorkflowEngine,
+  type WorkflowStartClient,
+  bindWorkflowClass,
 } from '@dudousxd/nestjs-durable-core';
 import {
   Inject,
@@ -77,18 +80,27 @@ export class ThinWorkflowRegistrar implements OnModuleInit {
     private readonly metadataScanner: MetadataScanner,
     @Inject(DURABLE_WORKER_RUNTIME) private readonly runtime: DurableWorkerRuntime | null,
     @Inject(DURABLE_OPTIONS_CANONICAL) private readonly options: DurableModuleOptions,
+    /** In this role the store-less `DurableStartClient` facade the module binds under this token. */
+    @Inject(WorkflowEngine) private readonly starter: WorkflowStartClient,
   ) {}
 
   onModuleInit(): void {
     const runtime = this.runtime;
     if (runtime === null || !isPureThinWorker(this.options)) return;
+    const starter = this.starter;
     // The `@Workflow` metadata is also what this worker ANNOUNCES about each body it serves (design
     // §7.9) — version, capability demand, and the declaring package `scanWorkflows` derived. It is
     // passed straight through: the registry states what the decorator states, and an option the
     // decorator left off stays un-stated rather than becoming a default.
-    scanWorkflows(this.discovery, (meta, instance, origin) =>
-      registerOnRuntime(runtime, this.metadataScanner, meta, instance, origin),
-    );
+    scanWorkflows(this.discovery, (meta, instance, origin) => {
+      registerOnRuntime(runtime, this.metadataScanner, meta, instance, origin);
+      // Class-first statics (`MyWorkflow.start()`), as on an operator: bound to the start facade, so
+      // they publish a start-run message to the control plane. `waitForRun` stays unbound (a tenant
+      // has no store), so `MyWorkflow.execute()` outside a workflow fails with a clear error.
+      bindWorkflowClass(instance.constructor, {
+        start: (name, input, runId, opts) => starter.start(name, input, runId, opts),
+      });
+    });
   }
 }
 

@@ -560,6 +560,13 @@ export interface BullMQTransportOptions {
 /** Default {@link BullMQTransportOptions.drainDelay}, in seconds. */
 export const DEFAULT_DRAIN_DELAY_SECONDS = 30;
 
+/** The control plane's redelivery count on a start-run job it re-enqueued (see `onStartRun`). */
+const START_RUN_REDELIVERY = '__redelivery';
+/** Redeliveries of one failing start-run before it is dropped and logged (~1h with the cap below). */
+const START_RUN_MAX_REDELIVERIES = 60;
+/** The longest wait between two redeliveries of a failing start-run. */
+const START_RUN_MAX_DELAY_MS = 60_000;
+
 /**
  * A queue-backed `Transport` over BullMQ/Redis — the path for true cross-process and
  * cross-language steps (e.g. a Python worker on the same queues). Steps are dispatched to a
@@ -2348,9 +2355,34 @@ export class BullMQTransport implements Transport, ControlPlane {
    *  on first call (idempotent — a second call is a no-op). */
   onStartRun(handler: (msg: StartRunMessage) => Promise<void>): void {
     if (this.startRunWorker) return;
-    this.startRunWorker = this.makeWorker(this.#startRunName(), (job) =>
-      handler(job.data as StartRunMessage),
-    );
+    this.startRunWorker = this.makeWorker(this.#startRunName(), async (job) => {
+      const data = job.data as StartRunMessage & { [START_RUN_REDELIVERY]?: number };
+      const { [START_RUN_REDELIVERY]: redelivered = 0, ...msg } = data;
+      try {
+        await handler(msg);
+      } catch (err) {
+        // The tenant producer enqueues with one attempt and `removeOnFail`, and it already answered
+        // its caller `pending`: a failed job would drop the start for good. So the control plane
+        // re-enqueues it itself, with a capped exponential delay. Safe to repeat: the engine starts a
+        // run id once, and a redelivery of a start that did create its run is a no-op.
+        if (redelivered >= START_RUN_MAX_REDELIVERIES) {
+          console.error(
+            `[nestjs-durable] dropped a start-run for "${msg.workflow}" after ${redelivered} redeliveries:`,
+            err,
+          );
+          return;
+        }
+        await this.queue(this.#startRunName()).add(
+          'startRun',
+          { ...msg, [START_RUN_REDELIVERY]: redelivered + 1 },
+          {
+            delay: Math.min(START_RUN_MAX_DELAY_MS, 1_000 * 2 ** redelivered),
+            removeOnComplete: true,
+            removeOnFail: true,
+          },
+        );
+      }
+    });
   }
 
   /** Tenant worker → control plane: enqueue a read/control request on `<effectivePrefix>-run-request`. */

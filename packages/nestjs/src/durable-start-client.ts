@@ -78,6 +78,11 @@ export class DurableStartClient {
       ...(this.options.prefix !== undefined ? { prefix: this.options.prefix } : {}),
       ...(opts?.tags !== undefined ? { tags: opts.tags } : {}),
       ...(opts?.searchAttributes !== undefined ? { searchAttributes: opts.searchAttributes } : {}),
+      // The start options the control plane applies (version pin, priority, delayed start, quota).
+      ...(opts?.version !== undefined ? { version: opts.version } : {}),
+      ...(opts?.priority !== undefined ? { priority: opts.priority } : {}),
+      ...(opts?.startAt !== undefined ? { startAt: opts.startAt } : {}),
+      ...(opts?.concurrency !== undefined ? { concurrency: opts.concurrency } : {}),
       ...(tenant
         ? {
             tenantId: tenant.id,
@@ -86,7 +91,15 @@ export class DurableStartClient {
         : {}),
       ...(this.deps !== undefined ? { deps: this.deps } : {}),
     });
-    return { runId, status: 'pending' };
+    // As `engine.start` reports it: a start delayed into the future reads `suspended` until it fires.
+    const startAtMs = opts?.startAt instanceof Date ? opts.startAt.getTime() : opts?.startAt;
+    return {
+      runId,
+      status:
+        startAtMs !== undefined && Number.isFinite(startAtMs) && startAtMs > Date.now()
+          ? 'suspended'
+          : 'pending',
+    };
   }
 
   cancel(_runId: string): Promise<void> {

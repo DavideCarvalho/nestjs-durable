@@ -15,14 +15,19 @@ import { describe, expect, it, vi } from 'vitest';
 const capturedQueues: Array<{ name: string }> = [];
 const capturedWorkers: Array<{ name: string }> = [];
 let capturedProcessor: ((job: { data: unknown }) => Promise<unknown>) | undefined;
-const capturedJobAdds: Array<{ queue: string; jobName: string; data: unknown }> = [];
+const capturedJobAdds: Array<{
+  queue: string;
+  jobName: string;
+  data: unknown;
+  opts?: Record<string, unknown> | undefined;
+}> = [];
 
 vi.mock('bullmq', () => ({
   Queue: vi.fn((name: string) => {
     capturedQueues.push({ name });
     return {
-      add: vi.fn(async (jobName: string, data: unknown) => {
-        capturedJobAdds.push({ queue: name, jobName, data });
+      add: vi.fn(async (jobName: string, data: unknown, opts?: Record<string, unknown>) => {
+        capturedJobAdds.push({ queue: name, jobName, data, opts });
       }),
       close: vi.fn().mockResolvedValue(undefined),
       getJobCounts: vi.fn().mockResolvedValue({}),
@@ -154,6 +159,51 @@ describe('BullMQTransport — onStartRun', () => {
     const transport = new BullMQTransport({ connection, namespace: 'dev-carol' });
     transport.onStartRun(async () => {});
     expect(capturedWorkers.map((w) => w.name)).toContain('durable-dev-carol-start-run');
+    await transport.close();
+  });
+});
+
+describe('BullMQTransport — onStartRun redelivery', () => {
+  it('re-enqueues a start the handler failed on, with a delay, and strips the counter before the handler', async () => {
+    resetCaptures();
+    const transport = new BullMQTransport({ connection });
+    const seen: unknown[] = [];
+    let fail = true;
+    transport.onStartRun(async (msg) => {
+      seen.push(msg);
+      if (fail) throw new Error('store blip');
+    });
+    const processor = capturedProcessor;
+    if (!processor) throw new Error('no start-run consumer');
+    const msg = { tenant: 'acme', workflow: 'invoice', input: {}, runId: 'r1' };
+
+    // Was: the error failed the job, and `removeOnFail` dropped the start for good.
+    await processor({ data: msg });
+    const retry = capturedJobAdds.find((a) => a.queue === 'durable-start-run');
+    expect(retry?.data).toMatchObject({ ...msg, __redelivery: 1 });
+    expect(retry?.opts?.delay).toBe(1_000);
+
+    // The redelivery reaches the handler as the original message, and succeeds.
+    fail = false;
+    await processor({ data: retry?.data });
+    expect(seen).toEqual([msg, msg]);
+    expect(capturedJobAdds.filter((a) => a.queue === 'durable-start-run')).toHaveLength(1);
+    await transport.close();
+  });
+
+  it('gives up after the redelivery cap instead of looping forever', async () => {
+    resetCaptures();
+    const transport = new BullMQTransport({ connection });
+    transport.onStartRun(async () => {
+      throw new Error('poison');
+    });
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    await capturedProcessor?.({
+      data: { tenant: 'acme', workflow: 'invoice', input: {}, __redelivery: 60 },
+    });
+    expect(capturedJobAdds.filter((a) => a.queue === 'durable-start-run')).toHaveLength(0);
+    expect(error).toHaveBeenCalled();
+    error.mockRestore();
     await transport.close();
   });
 });

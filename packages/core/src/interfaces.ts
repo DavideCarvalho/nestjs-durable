@@ -1,4 +1,5 @@
 import type { z } from 'zod';
+import type { ConcurrencyQuota } from './concurrency';
 import type { WorkerDescriptor } from './handshake/descriptor';
 import type { DispatchDiagnostics } from './handshake/dispatch-routing';
 import type {
@@ -1555,6 +1556,25 @@ export interface StartRunMessage {
   tenantId?: string | undefined;
   /** The kind of {@link tenantId} (`organization`, `clinic`, …). */
   tenantKind?: string | undefined;
+  /**
+   * Start THIS version (see `StartOptions.version`). The control plane starts it only on a live
+   * worker that declares that version; until one does, the run waits `blocked` (`no_live_worker`).
+   * A control plane older than this field ignores it and starts the newest version.
+   */
+  version?: string | undefined;
+  /** Dispatch priority stamped on the run (see `StartOptions.priority`). Higher wins. */
+  priority?: number | undefined;
+  /**
+   * Delayed start, as epoch ms (see `StartOptions.startAt`). Always a number on the wire: a `Date`
+   * does not survive JSON. A time not in the future starts the run at once.
+   */
+  startAt?: number | undefined;
+  /**
+   * A start-time concurrency quota (see `StartOptions.concurrency`), checked on the control plane.
+   * A start over it is recorded as a `failed` run (`concurrency_limit`) instead of throwing, since
+   * the tenant caller has already returned.
+   */
+  concurrency?: ConcurrencyQuota | undefined;
 }
 
 /**

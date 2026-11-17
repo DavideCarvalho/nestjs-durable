@@ -86,4 +86,29 @@ describe('DurableStartClient', () => {
     );
     await expect(client.publishEvent('evt', { x: 1 })).rejects.toThrow(/tenant/i);
   });
+
+  it('carries version, priority, startAt and concurrency to the control plane', async () => {
+    const sink: { name: string; data: unknown }[] = [];
+    const client = new DurableStartClient(
+      { connection: 'redis://x', partition: 'acme' },
+      { Queue: makeFakeQueue(sink) },
+    );
+    const startAt = new Date(Date.now() + 60_000);
+
+    const result = await client.start(DemoWorkflow, { n: 3 }, 'run-3', {
+      version: '2',
+      priority: 4,
+      startAt,
+      concurrency: { key: 'acme', limit: 2 },
+    });
+
+    // Reported like `engine.start` reports a delayed start.
+    expect(result).toEqual({ runId: 'run-3', status: 'suspended' });
+    expect(sink[0]?.data).toMatchObject({
+      version: '2',
+      priority: 4,
+      startAt: startAt.getTime(),
+      concurrency: { key: 'acme', limit: 2 },
+    });
+  });
 });

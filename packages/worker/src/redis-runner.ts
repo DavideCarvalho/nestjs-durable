@@ -532,6 +532,17 @@ export interface StartRunOptions {
   tenantId?: string | undefined;
   /** The kind of {@link tenantId}. */
   tenantKind?: string | undefined;
+  /**
+   * Start this version (see {@link StartRunMessage.version}). The control plane waits for a live
+   * worker that declares it before starting the run.
+   */
+  version?: string | undefined;
+  /** Dispatch priority stamped on the run. Higher wins. */
+  priority?: number | undefined;
+  /** Delayed start (epoch ms or a `Date`); sent as epoch ms. */
+  startAt?: number | Date | undefined;
+  /** A start-time concurrency quota, checked on the control plane (see {@link StartRunMessage.concurrency}). */
+  concurrency?: StartRunMessage['concurrency'];
   /** Queue key prefix. Defaults to `'durable'` (matches `BullMQTransport` default). */
   prefix?: string | undefined;
   /**
@@ -579,6 +590,14 @@ export async function startRun(connection: RedisConnection, opts: StartRunOption
     msg.tenantId = opts.tenantId;
     if (opts.tenantKind !== undefined) msg.tenantKind = opts.tenantKind;
   }
+  // Start options: only the ones given, so a message with none is byte-identical to an older one
+  // (and a control plane older than these fields reads it unchanged).
+  if (opts.version !== undefined) msg.version = opts.version;
+  if (opts.priority !== undefined) msg.priority = opts.priority;
+  if (opts.startAt !== undefined) {
+    msg.startAt = opts.startAt instanceof Date ? opts.startAt.getTime() : opts.startAt;
+  }
+  if (opts.concurrency !== undefined) msg.concurrency = opts.concurrency;
   try {
     await queue.add('startRun', msg, { removeOnComplete: true, removeOnFail: true });
   } finally {

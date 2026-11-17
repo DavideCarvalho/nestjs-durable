@@ -29,6 +29,7 @@ import {
 import { parseDuration } from './duration';
 import { Entities, type EntityConfig } from './entities';
 import {
+  ConcurrencyLimitError,
   ContinueAsNew,
   type FanJoin,
   FatalError,
@@ -38,6 +39,7 @@ import {
   RemoteStepTimeout,
   RemoteWorkflowTimeout,
   SignalTimeoutError,
+  SingletonQueueFullError,
   WorkflowSuspended,
 } from './errors';
 import { EventAccumulators, type EventBatchConfig, accumulatorRunId } from './event-accumulators';
@@ -97,6 +99,7 @@ import type {
   Settled,
   SignalOptions,
   SignalWaiter,
+  StartRunMessage,
   StateStore,
   StepCheckpoint,
   StepDef,
@@ -270,14 +273,16 @@ export interface StartOptions {
    * `latest` — a silent fallback is the exact failure this option exists to prevent (a caller that
    * asked for `name@3` and got `name@4` has no way to tell, and its run is already going).
    *
-   * NOT available on the two SYNTHESIZED registration paths, which exist precisely because nothing is
-   * registered: a child inheriting its remote ancestor's routing (see `findInheritedRegistration`),
-   * and convention routing to a live worker group of the same name (`resolveRemoteByConvention`).
-   * Both INVENT the version they stamp — the ancestor's, and the `'1'` convention default — as a
-   * routing placeholder; neither is evidence that the worker has a body at the version you asked for.
-   * A pinned start that reaches them therefore throws rather than pretending to have honoured the pin.
-   * To pin a cross-SDK workflow, register it for real — `engine.remote('name', { version: '2', group })`
-   * — which puts `name@2` in the registry and pins like any other registration.
+   * NOT available on a child inheriting its remote ancestor's routing (see `findInheritedRegistration`),
+   * which INVENTS the version it stamps (the ancestor's). Convention routing to a live worker group of
+   * the same name (`resolveRemoteByConvention`) honours a pin only when the live workers on that group
+   * themselves DECLARE the pinned version (their announced registrations); a fleet that declares
+   * another version, or none, is no evidence, and the pinned start throws rather than pretending. To
+   * pin a cross-SDK workflow whose workers declare nothing, register it for real —
+   * `engine.remote('name', { version: '2', group })` — which puts `name@2` in the registry.
+   *
+   * A tenant's start ({@link StartRunMessage.version}) does not throw: with no live worker declaring
+   * the version yet, the run waits `blocked` (`no_live_worker`) until one does.
    */
   version?: string | undefined;
   /** Run-scoped tags, merged with the workflow's static `@Workflow({ tags })` onto the run. */
@@ -521,6 +526,18 @@ interface RegisteredWorkflow {
  * and a pin against it is genuinely checked.
  */
 export const VERSION_UNDECLARED_TAG = 'version:undeclared';
+
+/**
+ * The `error.code` of a run a tenant started while no live worker served it yet (see
+ * `WorkflowEngine.startForTenant`). The run is parked `blocked` and the blocked-recovery poll starts
+ * it as soon as a worker on its group (declaring its pinned version, when it has one) is live. It is
+ * never dead-lettered for waiting: a start is a request queued for its consumer, however late that
+ * consumer boots. Cancel it to drop it.
+ */
+export const NO_LIVE_WORKER = 'no_live_worker';
+
+/** The longest a run parked {@link NO_LIVE_WORKER} waits between two checks of the live fleet. */
+const NO_LIVE_WORKER_MAX_POLL_MS = 60_000;
 
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
 
@@ -912,6 +929,11 @@ export interface WorkflowEngineDeps {
    * for the prior unbounded await — byte-identical behavior when unset. If a `RemoteWorkflowExecutor` is
    * ALSO constructed with its own `timeoutMs`, the shorter of the two deadlines wins; prefer setting only
    * one (this rearmed window for heartbeat-aware workers, or the fixed `timeoutMs` otherwise).
+   *
+   * A turn DISPATCHED over a broker (a tenant's or another SDK's worker) is never left without a
+   * deadline: unset, its window is {@link reconcileMs} (5 min by default), so a run whose worker died
+   * holding the turn is re-driven instead of waiting forever. `reconcileMs: 0` with this unset keeps
+   * the old unbounded wait.
    */
   remoteAdvanceSilenceMs?: number | undefined;
   /**
@@ -925,6 +947,9 @@ export interface WorkflowEngineDeps {
    * advances), so it's a safe self-heal, not a retry that can double-dispatch. The primary event path
    * still wins first for a healthy run (it re-drives long before this fires), so this only ever fires
    * for a genuinely-orphaned run. Default 5min; set `0` to disable (the prior wake-forever behavior).
+   *
+   * Also the default re-drive window of a workflow turn dispatched to a remote worker when
+   * {@link remoteAdvanceSilenceMs} is unset (see there).
    */
   reconcileMs?: number | undefined;
   /**
@@ -1163,6 +1188,13 @@ export class WorkflowEngine {
   private readonly maxRecoveryAttempts?: number | undefined;
   private readonly unregisteredWorkflowGraceMs: number;
   private readonly remoteAdvanceSilenceMs?: number | undefined;
+  /**
+   * The re-drive window of a DISPATCHED workflow turn (a remote worker's `advance` sent over the
+   * broker): {@link WorkflowEngineDeps.remoteAdvanceSilenceMs} when set, else `reconcileMs`. Without
+   * it a run suspended on a turn whose worker died (and whose job was lost with it) had no `wakeAt`
+   * and nothing re-drove it, ever. Heartbeats rearm it like the explicit window.
+   */
+  private readonly dispatchedTurnSilenceMs: number | undefined;
   private readonly reconcileMs: number | undefined;
   /** Parked workflow bodies kept between turns (see {@link WorkflowEngineDeps.stickyRuns}). */
   private readonly sticky: StickyCache;
@@ -1401,6 +1433,7 @@ export class WorkflowEngine {
     this.remoteAdvanceSilenceMs = deps.remoteAdvanceSilenceMs;
     // Default 5min; an explicit 0 disables the fallback (opt back into wake-forever-on-lost-event).
     this.reconcileMs = deps.reconcileMs === undefined ? 300_000 : deps.reconcileMs || undefined;
+    this.dispatchedTurnSilenceMs = this.remoteAdvanceSilenceMs ?? this.reconcileMs;
     this.sticky = new StickyCache(
       Math.max(0, deps.stickyRuns ?? DEFAULT_STICKY_RUNS),
       deps.stickyIdleMs ?? DEFAULT_STICKY_IDLE_MS,
@@ -1576,24 +1609,18 @@ export class WorkflowEngine {
         );
         return;
       }
-      await this.start(
-        message.workflow,
-        message.input,
-        message.runId ?? globalThis.crypto.randomUUID(),
-        {
-          namespace: tenant,
-          tags: message.tags,
-          searchAttributes: message.searchAttributes,
-          // The customer a tenant process claims for the run (A4): kept only when its verified
-          // token grants `tenancy:*` or `tenancy:<id>`, else the run gets no customer tenant.
-          ...(message.tenantId !== undefined
-            ? grantsClientTenant(verified, message.tenantId)
-              ? message.tenantKind !== undefined
-                ? { tenantId: message.tenantId, tenantKind: message.tenantKind }
-                : { tenantId: message.tenantId }
-              : { tenantId: null }
-            : {}),
-        },
+      await this.startForTenant(
+        message,
+        tenant,
+        // The customer a tenant process claims for the run (A4): kept only when its verified
+        // token grants `tenancy:*` or `tenancy:<id>`, else the run gets no customer tenant.
+        message.tenantId !== undefined
+          ? grantsClientTenant(verified, message.tenantId)
+            ? message.tenantKind !== undefined
+              ? { tenantId: message.tenantId, tenantKind: message.tenantKind }
+              : { tenantId: message.tenantId }
+            : { tenantId: null }
+          : {},
       );
     });
     // Control plane: re-broadcast lifecycle events from OTHER instances to this instance's
@@ -3793,11 +3820,28 @@ export class WorkflowEngine {
     runId: string,
     opts?: StartOptions,
   ): Promise<RunResult>;
-  async start(
+  start(
     workflow: WorkflowRef,
     input: unknown,
     runId: string,
     opts?: StartOptions,
+  ): Promise<RunResult> {
+    // Not `async`: an extra await hop here would shift when the dispatched body first runs.
+    return this.startWith(workflow, input, runId, opts, false);
+  }
+
+  /**
+   * {@link start}'s body. `parkUnroutable` is the tenant start path ({@link startForTenant}): a
+   * workflow that nothing here can route yet (no registration, no live worker group serving it at
+   * the asked version) is created `blocked` with code {@link NO_LIVE_WORKER} instead of throwing, so
+   * a start whose caller has already returned is never lost.
+   */
+  private async startWith(
+    workflow: WorkflowRef,
+    input: unknown,
+    runId: string,
+    opts: StartOptions | undefined,
+    parkUnroutable: boolean,
   ): Promise<RunResult> {
     const name = workflowName(workflow);
     // PINNED (`opts.version`) resolves the by-name@version registry and stops there: no `latest`, and
@@ -3822,7 +3866,7 @@ export class WorkflowEngine {
       const ancestor = await this.findRemoteAncestor(runId);
       if (ancestor) registered = this.synthesizeRemoteChild(name, ancestor.version, ancestor);
     }
-    if (!registered && pinned === undefined) {
+    if (!registered) {
       // Convention routing: if the transport reports a live group of the same name, synthesize a
       // remote registration on the fly.
       //
@@ -3847,9 +3891,20 @@ export class WorkflowEngine {
         createdAt: new Date(),
         updatedAt: new Date(),
       };
-      registered = await this.resolveRemoteByConvention(conventionRun, {
+      const convention = await this.resolveRemoteByConvention(conventionRun, {
         askFleetForVersion: true,
       });
+      // A PINNED start takes the convention route only when the live fleet itself declares the
+      // pinned version: then the version is not invented, it is what the worker states. Anything
+      // else (the fleet declares another version, or nothing) is no evidence, and the pin refuses.
+      registered =
+        pinned === undefined ||
+        (convention?.versionDeclared === true && convention.version === pinned)
+          ? convention
+          : undefined;
+    }
+    if (!registered && parkUnroutable) {
+      return this.parkStartForWorker(name, input, runId, opts);
     }
     if (!registered) {
       throw new Error(
@@ -3946,6 +4001,159 @@ export class WorkflowEngine {
         .catch(() => undefined);
     }
     return { runId, status: 'pending' };
+  }
+
+  /**
+   * Create the run of a tenant start that nothing can route yet, parked `blocked` with code
+   * {@link NO_LIVE_WORKER} (see {@link startWith}). Idempotent by run id like {@link start}, counts
+   * against a concurrency quota like it, and keeps the start's options on the row: its version (the
+   * pin, else the `'1'` placeholder tagged {@link VERSION_UNDECLARED_TAG} that the first live worker's
+   * declared version replaces), priority, tags, search attributes and customer tenant. A delayed
+   * start is checked first at its `startAt`.
+   */
+  private async parkStartForWorker(
+    name: string,
+    input: unknown,
+    runId: string,
+    opts: StartOptions | undefined,
+  ): Promise<RunResult> {
+    const prior = await this.store.getRun(runId);
+    if (prior) return this.existingStartResult(prior);
+    const quota = await resolveConcurrency(opts?.concurrency, undefined, input);
+    if (quota) await assertConcurrency(this.store, name, quota);
+    const namespace = poolNamespace(opts?.namespace) ?? this.namespace;
+    const group = tenantGroup(sanitizeQueueToken(name), namespace);
+    const pinned = opts?.version;
+    const startAtMs = opts?.startAt instanceof Date ? opts.startAt.getTime() : opts?.startAt;
+    const firstCheck = this.clock() + this.blockedPollMs;
+    const wakeAt =
+      startAtMs !== undefined && Number.isFinite(startAtMs) && startAtMs > firstCheck
+        ? startAtMs
+        : firstCheck;
+    const error: StepError = {
+      message: `no live worker serves ${group}${pinned !== undefined ? ` at version ${pinned}` : ''} yet; the run starts when one does`,
+      code: NO_LIVE_WORKER,
+      retryable: true,
+    };
+    const now = new Date();
+    const tags = mergeTags(undefined, [
+      ...(opts?.tags ?? []),
+      ...(quota ? [concurrencyTag(quota.key)] : []),
+      ...(pinned === undefined ? [VERSION_UNDECLARED_TAG] : []),
+    ])?.filter((tag) => !SINGLETON_RESERVED_TAGS.includes(tag));
+    const run: WorkflowRun = {
+      id: runId,
+      workflow: name,
+      workflowVersion: pinned ?? '1',
+      status: 'blocked',
+      error,
+      wakeAt,
+      namespace,
+      input,
+      tags,
+      searchAttributes: opts?.searchAttributes,
+      priority: opts?.priority,
+      ...this.startTenant(opts),
+      createdAt: now,
+      updatedAt: now,
+    };
+    try {
+      await this.store.createRun(run);
+    } catch (err) {
+      const winner = await this.store.getRun(runId).catch(() => null);
+      if (!winner) throw err;
+      return this.existingStartResult(winner);
+    }
+    this.emit({ type: 'run.blocked', runId, workflow: name, namespace, error });
+    return { runId, status: 'blocked', error };
+  }
+
+  /**
+   * The control plane's half of a tenant start ({@link StartRunMessage}): start the run with every
+   * option the message carries, under the tenant's namespace. The tenant caller has already returned
+   * `pending`, so nothing here may lose the start:
+   *  - a workflow no live worker serves yet is parked `blocked` ({@link NO_LIVE_WORKER}) and started
+   *    by the blocked-recovery poll once one is live;
+   *  - a start the quota or singleton back-pressure rejects is recorded as a `failed` run carrying
+   *    the reason, so the caller's run id resolves to an answer instead of nothing;
+   *  - any other error (a store blip) is rethrown for the transport to redeliver the message, and a
+   *    redelivery is a no-op once the run exists (idempotent by run id).
+   */
+  async startForTenant(
+    message: StartRunMessage,
+    namespace: string,
+    tenant: Pick<StartOptions, 'tenantId' | 'tenantKind'>,
+  ): Promise<RunResult> {
+    const runId = message.runId ?? globalThis.crypto.randomUUID();
+    const opts: StartOptions = {
+      namespace,
+      tags: message.tags,
+      searchAttributes: message.searchAttributes,
+      ...tenant,
+      // Each start option only when the message carries it: a message from an older tenant has none
+      // of them, and starts exactly as it did before.
+      ...(typeof message.version === 'string' ? { version: message.version } : {}),
+      ...(typeof message.priority === 'number' ? { priority: message.priority } : {}),
+      ...(typeof message.startAt === 'number' ? { startAt: message.startAt } : {}),
+      ...(message.concurrency !== undefined ? { concurrency: message.concurrency } : {}),
+    };
+    try {
+      return await this.startWith(message.workflow, message.input, runId, opts, true);
+    } catch (err) {
+      if (!(err instanceof ConcurrencyLimitError || err instanceof SingletonQueueFullError)) {
+        throw err;
+      }
+      return this.recordRejectedStart(message.workflow, message.input, runId, opts, err);
+    }
+  }
+
+  /** A tenant start {@link startForTenant} could not admit, kept as a `failed` run with the reason. */
+  private async recordRejectedStart(
+    name: string,
+    input: unknown,
+    runId: string,
+    opts: StartOptions,
+    err: ConcurrencyLimitError | SingletonQueueFullError,
+  ): Promise<RunResult> {
+    const prior = await this.store.getRun(runId);
+    if (prior) return this.existingStartResult(prior);
+    const error: StepError = {
+      message: err.message,
+      code: err instanceof ConcurrencyLimitError ? 'concurrency_limit' : 'singleton_queue_full',
+      retryable: false,
+    };
+    const now = new Date();
+    const run: WorkflowRun = {
+      id: runId,
+      workflow: name,
+      workflowVersion: opts.version ?? '1',
+      status: 'failed',
+      error,
+      namespace: poolNamespace(opts.namespace) ?? this.namespace,
+      input,
+      tags: opts.tags,
+      searchAttributes: opts.searchAttributes,
+      priority: opts.priority,
+      ...this.startTenant(opts),
+      createdAt: now,
+      updatedAt: now,
+    };
+    try {
+      await this.store.createRun(run);
+    } catch (createErr) {
+      const winner = await this.store.getRun(runId).catch(() => null);
+      if (!winner) throw createErr;
+      return this.existingStartResult(winner);
+    }
+    console.warn(`[nestjs-durable] tenant start ${runId} of "${name}" rejected: ${err.message}`);
+    // Not a lifecycle event: on a standalone app this start throws and nothing ran, so no
+    // `run.failed:<workflow>` subscriber starts for it. Observers and run waiters still hear of it.
+    this.emit(
+      { type: 'run.failed', runId, workflow: name, namespace: run.namespace, error },
+      { lifecycle: false },
+    );
+    void this.deliverRunWaits(runId).catch(() => undefined);
+    return { runId, status: 'failed', error };
   }
 
   /**
@@ -5052,6 +5260,38 @@ export class WorkflowEngine {
     return this.announceDead(run, error);
   }
 
+  /**
+   * Due runs whose workflow nothing could resolve on the last try (`runId` → clock ms of the next
+   * try): a tenant run whose worker is down, say. The timer poll ticks every second and the run stays
+   * due, so without this each tick would lease it, fail to resolve it and log it again. The next try
+   * backs off with the time it has been due ({@link noteUnroutable}). In memory on purpose: the run
+   * row is not touched, so its age toward `unregisteredWorkflowGraceMs` is unchanged, and another
+   * instance (or a restart) simply tries it sooner.
+   */
+  private readonly unroutableUntil = new Map<string, number>();
+
+  /** Whether `runId` is inside its {@link unroutableUntil} back-off at `nowMs`. */
+  private unroutableBackoff(runId: string, nowMs: number): boolean {
+    const until = this.unroutableUntil.get(runId);
+    if (until === undefined) return false;
+    if (nowMs >= until) {
+      this.unroutableUntil.delete(runId);
+      return false;
+    }
+    return true;
+  }
+
+  /** Back off the next timer-poll try of `run`, left for later as unresolvable (see {@link unroutableUntil}). */
+  private noteUnroutable(run: WorkflowRun, nowMs: number): void {
+    const dueSince = Math.max(new Date(run.updatedAt).getTime(), run.wakeAt ?? 0);
+    const delay = Math.min(
+      NO_LIVE_WORKER_MAX_POLL_MS,
+      Math.max(this.blockedPollMs, Math.floor((nowMs - dueSince) / 10)),
+    );
+    if (this.unroutableUntil.size > 4096) this.unroutableUntil.clear();
+    this.unroutableUntil.set(run.id, nowMs + delay);
+  }
+
   /** Log a run skipped for an unregistered workflow — still there, still not progressing. */
   private logUnregisteredSkip(run: WorkflowRun): void {
     console.error(
@@ -5078,12 +5318,16 @@ export class WorkflowEngine {
   async resumeDueTimers(nowMs: number = this.clock()): Promise<RunResult[]> {
     // Shuffled: every instance loads the same most-overdue batch, and walking it in the same order
     // would have them all contend for the same leases one row at a time.
-    const due = shuffle(await this.store.listDueTimers(nowMs, this.namespace, this.timerBatchSize));
+    const due = shuffle(
+      (await this.store.listDueTimers(nowMs, this.namespace, this.timerBatchSize)).filter(
+        (run) => !this.unroutableBackoff(run.id, nowMs),
+      ),
+    );
     // ALSO re-drive runs parked `blocked` whose recovery poll is due (handshake design §7.5): re-driving
     // re-checks the live fleet, so a run proceeds the moment a capable+compatible worker appears (else it
     // re-parks with a fresh `wakeAt`). `listDueTimers` targets `suspended`+`wakeAt`, so blocked runs are
     // gathered separately here rather than widening every store adapter's timer query.
-    const blocked = await this.dueBlockedRuns(nowMs);
+    const blocked = await this.routableBlocked(await this.dueBlockedRuns(nowMs), nowMs);
     if (due.length === 0 && blocked.length === 0) return [];
     // While this engine consumes the transport's run queue, the due runs go there, for whichever
     // instance takes them, instead of all resuming on the instance that polled.
@@ -5196,6 +5440,7 @@ export class WorkflowEngine {
           const run = await this.store.getRun(runId);
           const settled = run ? await this.settleUnregistered(run, nowMs) : null;
           if (settled !== undefined) return settled;
+          if (run) this.noteUnroutable(run, nowMs);
           if (run && this.isStartOnlyHere(run)) return null;
         }
         throw err;
@@ -5587,6 +5832,7 @@ export class WorkflowEngine {
         if (error instanceof WorkflowNotRegistered) {
           const settled = await this.settleUnregistered(run, this.clock()).catch(() => undefined);
           if (settled) return settled;
+          if (settled === undefined) this.noteUnroutable(run, this.clock());
           if (this.isStartOnlyHere(run)) return undefined;
         }
         console.error(
@@ -5634,6 +5880,7 @@ export class WorkflowEngine {
         if (error instanceof WorkflowNotRegistered) {
           const settled = await this.settleUnregistered(run, nowMs).catch(() => undefined);
           if (settled) results.push(settled);
+          if (settled === undefined) this.noteUnroutable(run, nowMs);
           if (settled !== undefined || this.isStartOnlyHere(run)) continue;
         }
         // Loud, because a skip is not nothing: the run is still there and still not progressing, and
@@ -7882,7 +8129,7 @@ export class WorkflowEngine {
       // stale turn must neither re-mark it nor enqueue a second turn.
       if (this.isFenced(run.id)) return this.echoCurrentStatus(run.id);
       const taskId = `${run.id}:wf:${globalThis.crypto.randomUUID().slice(0, 8)}`;
-      const silenceMs = this.remoteAdvanceSilenceMs;
+      const silenceMs = this.dispatchedTurnSilenceMs;
       const wakeAt = silenceMs != null ? this.clock() + silenceMs : undefined;
       // MARK FIRST: record the awaited turn before it is enqueued. No resurrection risk — unlike the old
       // mark-AFTER-dispatch order, nothing rewrites `status` past this point, so a parent-cancel that
@@ -9413,6 +9660,70 @@ export class WorkflowEngine {
     return { runId: run.id, status: 'blocked', error };
   }
 
+  /**
+   * Of the due `blocked` runs, the ones to re-drive now. A run parked {@link NO_LIVE_WORKER} (a tenant
+   * start nothing could route) is re-driven only once a live worker serves its group, at its pinned
+   * version when it has one; until then it is re-parked with a longer wait each time, up to
+   * {@link NO_LIVE_WORKER_MAX_POLL_MS}, and never reaches `resume` (which would treat it as an
+   * unregistered workflow and dead-letter it after `unregisteredWorkflowGraceMs`). Every other
+   * blocked run is re-driven as before.
+   */
+  private async routableBlocked(blocked: WorkflowRun[], nowMs: number): Promise<WorkflowRun[]> {
+    const ready: WorkflowRun[] = [];
+    for (const run of blocked) {
+      if (run.error?.code !== NO_LIVE_WORKER) {
+        ready.push(run);
+        continue;
+      }
+      try {
+        const routed = await this.routeParkedStart(run, nowMs);
+        if (routed) ready.push(routed);
+      } catch {
+        // A liveness read failed: the run keeps its due `wakeAt` and is looked at on the next poll.
+      }
+    }
+    return ready;
+  }
+
+  /**
+   * One {@link NO_LIVE_WORKER} run: the run to re-drive (its version taken from the live worker when
+   * the start did not pin one and the worker declares it), or `undefined` after re-parking it.
+   */
+  private async routeParkedStart(
+    run: WorkflowRun,
+    nowMs: number,
+  ): Promise<WorkflowRun | undefined> {
+    // A body registered here since (or all along, at the pinned version) runs it, as `resume` would.
+    if (this.isRegisteredHere(run)) return run;
+    const undeclared = run.tags?.includes(VERSION_UNDECLARED_TAG) === true;
+    const route = await this.resolveRemoteByConvention(run, { askFleetForVersion: true });
+    const routable =
+      route !== undefined &&
+      (undeclared || (route.versionDeclared === true && route.version === run.workflowVersion));
+    const updateIf = this.store.updateRunIf ?? this.updateRunIfFallback;
+    if (!routable) {
+      const waited = Math.max(0, nowMs - new Date(run.createdAt).getTime());
+      const delay = Math.min(
+        NO_LIVE_WORKER_MAX_POLL_MS,
+        Math.max(this.blockedPollMs, Math.floor(waited / 10)),
+      );
+      // No `updatedAt`: the run has not moved, and nothing ages it toward a dead-letter.
+      await updateIf.call(this.store, run.id, ['blocked'], { wakeAt: nowMs + delay });
+      return undefined;
+    }
+    if (undeclared && route.versionDeclared === true) {
+      // The version a start records comes from the fleet (see `start`): the worker now states it.
+      const tags = run.tags?.filter((tag) => tag !== VERSION_UNDECLARED_TAG);
+      const applied = await updateIf.call(this.store, run.id, ['blocked'], {
+        workflowVersion: route.version,
+        tags,
+      });
+      if (!applied) return undefined;
+      return { ...run, workflowVersion: route.version, tags };
+    }
+    return run;
+  }
+
   /** Runs parked `blocked` whose recovery poll is due (`wakeAt <= nowMs`), namespace-scoped like
    *  {@link resumeDueTimers}. Re-driving one re-checks the live fleet: it dispatches if a
    *  capable+compatible worker has appeared, else re-parks with a fresh `wakeAt` (design §7.5). */
@@ -10703,7 +11014,7 @@ export class WorkflowEngine {
    * cold (or different) instance re-derives the same answer from the run's own `wakeAt`.
    */
   private async rearmDecisionDeadline(runId: string): Promise<void> {
-    const silenceMs = this.remoteAdvanceSilenceMs;
+    const silenceMs = this.dispatchedTurnSilenceMs;
     if (silenceMs == null) return;
     const now = this.clock();
     const lookAgainAt = this.decisionDeadlineRearms.get(runId);
