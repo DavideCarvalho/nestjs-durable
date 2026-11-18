@@ -1,5 +1,14 @@
 # @dudousxd/nestjs-durable-telescope
 
+## 0.13.0
+
+### Minor Changes
+
+- [#480](https://github.com/DavideCarvalho/nestjs-durable/pull/480) [`91bea16`](https://github.com/DavideCarvalho/nestjs-durable/commit/91bea16ee1fc42c00c9cd1e99371d1359db8fe4a) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Telescope's "Slowest jobs" card can rank workflow steps.
+
+  - A step's outcome (`step.completed` / `step.failed`) is recorded with its measured duration as the entry's `durationMs` and with `durable:step:<step name>` as its family (the same for both outcomes; a name past the 64-character `family_hash` column is cut and suffixed with a short hash). A failed step is tagged `failed`. Sleeps and signal waits get no family. Run families are unchanged.
+  - On a control plane, the watcher names `durable` among the watchers Telescope runs for its tenants, so the console counts it on for every app in view (`@dudousxd/nestjs-telescope` 5.15.0+; older versions ignore it).
+
 ## 0.12.0
 
 ### Minor Changes
