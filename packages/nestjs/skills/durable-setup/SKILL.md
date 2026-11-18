@@ -149,10 +149,14 @@ import { DurableModule } from '@dudousxd/nestjs-durable';
 
 @Module({
   imports: [DurableModule.forRoot({ connection: 'redis://localhost:6379', partition: 'payments' })],
-  providers: [PaymentsWorker], // @Step handlers this worker serves
+  providers: [PaymentsWorker, CheckoutWorkflow], // @Step handlers and/or @Workflow bodies this worker serves (announced to the control plane; @Entity is refused on a tenant)
 })
 export class WorkerAppModule {}
 ```
+
+A tenant also registers its `@Workflow` bodies (with their `@DeadLetter()` routes, served as
+`<name>.dlq`) and `@StepInterceptor()` providers on its worker runtime; the control plane drives
+them by name. Source: packages/nestjs/src/durable-worker.module.ts (`ThinWorkflowRegistrar`).
 
 `partition` is an optional isolation suffix on this worker's queues — omit it for a single-tenant
 deployment. An operator with no local body for a workflow dispatches to a live worker of the same

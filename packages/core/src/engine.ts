@@ -75,6 +75,7 @@ import {
   type WorkerDescriptor,
   WorkflowBlocked,
   type WorkflowDirectory,
+  type WorkflowRegistration,
   aggregateAnnouncements,
   announcementsOf,
   buildWorkflowDirectory,
@@ -101,6 +102,7 @@ import type {
   SignalOptions,
   SignalWaiter,
   StartRunMessage,
+  StartRunSingleton,
   StateStore,
   StepCheckpoint,
   StepDef,
@@ -369,6 +371,8 @@ const isBreakpoint = (cp: { status: string; name: string }): boolean =>
 
 /** How long a read of the onError routes a fleet announces is reused. */
 const ANNOUNCED_ROUTES_TTL_MS = 5_000;
+/** How long a read of the execution timeouts a fleet announces is reused by the timeout sweep. */
+const ANNOUNCED_TIMEOUTS_TTL_MS = 15_000;
 
 /**
  * One `onEvent` subscription the fleet announces, with the namespace its announcer serves: `null` for
@@ -411,6 +415,49 @@ interface LifecyclePublishOutcome {
  * The namespace an announcer serves: the descriptor's own, else the tenant suffix of the group it
  * consumes (`<name>@<tenant>`), else `default`.
  */
+/**
+ * A quota or singleton key a tenant start carries, scoped to the tenant's namespace (`<ns>/<key>`),
+ * so two tenants using the same key never share a slot. The `default` namespace keeps the bare key.
+ */
+function tenantScopedKey(namespace: string | undefined, key: string): string {
+  return namespace && namespace !== 'default' ? `${namespace}/${key}` : key;
+}
+
+/** The `singleton:` key tag a run carries (never the engine's `durable:singleton:*` markers). */
+function singletonKeyOf(run: Pick<WorkflowRun, 'tags'>): string | undefined {
+  const tag = run.tags?.find((t) => t.startsWith('singleton:'));
+  return tag?.slice('singleton:'.length);
+}
+
+/**
+ * The singleton gate of a workflow served by convention: the key a starter evaluated (`wire`, at
+ * start), else the run's own `singleton:<key>` tag (a turn), admitted against the limit the live
+ * workers announce. A run with a key tag whose workers state no singleton (or announce nothing) is
+ * not gated; one whose workers cannot be read is gated at the limit `1`, the declared default.
+ */
+function conventionSingleton(
+  run: Pick<WorkflowRun, 'tags'>,
+  /** `null`: the announcement could not be read. `undefined`: nothing announces the workflow. */
+  announced: WorkflowRegistration | null | undefined,
+  wire: StartRunSingleton | undefined,
+): SingletonConfig | undefined {
+  if (wire !== undefined) {
+    const key = wire.key;
+    return {
+      key: () => key,
+      ...(typeof wire.limit === 'number' ? { limit: wire.limit } : {}),
+      ...(typeof wire.maxQueueDepth === 'number' ? { maxQueueDepth: wire.maxQueueDepth } : {}),
+    };
+  }
+  const key = singletonKeyOf(run);
+  if (key === undefined || announced === undefined) return undefined;
+  // Unreadable: keep gating (at the default limit) rather than let a run past the mutex on a blip.
+  if (announced === null) return { key: () => key, limit: 1 };
+  const declared = announced.options?.singleton;
+  if (declared === undefined) return undefined;
+  return { key: () => key, limit: typeof declared.limit === 'number' ? declared.limit : 1 };
+}
+
 function servedNamespace(namespace: string | undefined, group: string | undefined): string {
   if (namespace) return namespace;
   const at = group?.lastIndexOf('@') ?? -1;
@@ -1522,11 +1569,23 @@ export class WorkflowEngine {
         if (this.queuesRunsOverTransport) void this.wake(runId);
         else this.runDispatcher.dispatch(runId);
       },
-      configFor: (run) =>
-        (
+      configFor: (run) => {
+        const local = (
           this.workflows.get(versionKey(run.workflow, run.workflowVersion)) ??
           this.latest.get(run.workflow)
-        )?.singleton,
+        )?.singleton;
+        if (local) return local;
+        // A singleton served by convention (announced by a tenant) has no registration here: wake
+        // its next waiter by the run's key tag. The woken run re-checks admission itself.
+        const key = this.latest.has(run.workflow) ? undefined : singletonKeyOf(run);
+        if (key === undefined) return undefined;
+        // The limit its workers last announced (noted by convention resolution), so a limit-N
+        // singleton wakes up to N waiters per settlement.
+        const limit = this.conventionSingletonLimits.get(
+          `${runNamespace(run.namespace)}\u0000${run.workflow}`,
+        );
+        return { key: () => key, ...(limit !== undefined ? { limit } : {}) };
+      },
     });
     this.schedules = new ScheduleClient(
       this.store,
@@ -1534,8 +1593,17 @@ export class WorkflowEngine {
         start: (workflow, input, runId, opts) => this.start(workflow, input, runId, opts),
         // An announced (tenant) schedule fires through the tenant start path: with no live worker
         // of its app, the run waits `blocked` instead of the window being lost.
-        startParked: (workflow, input, runId, opts) =>
-          this.startWith(workflow, input, runId, opts, true),
+        startParked: (workflow, input, runId, opts, singleton) =>
+          this.startWith(
+            workflow,
+            input,
+            runId,
+            opts,
+            true,
+            singleton
+              ? { ...singleton, key: tenantScopedKey(opts?.namespace, singleton.key) }
+              : undefined,
+          ),
         getRun: (runId) => this.store.getRun(runId),
         isDraining: () => this.draining,
         tenant: () => this.tenancy?.current(),
@@ -2505,6 +2573,40 @@ export class WorkflowEngine {
         /* a dead-letter handler must not break recovery */
       }
     }
+    // A workflow served by convention (a tenant's): its workers' announced dead-letter route.
+    if (!this.latest.has(run.workflow)) this.inBackground(this.routeAnnouncedDeadLetter(run));
+  }
+
+  /**
+   * The dead-letter workflow the live workers serving `run`'s workflow announce (a tenant's inline
+   * `@DeadLetter()` handler, its `deadLetterWorkflow`, or its module-level default), or `undefined`
+   * when the workflow is registered on this engine (its own routing applies), they announce none, or
+   * they cannot be read. A dead-letter listener with a catch-all default (`DurableModule`'s
+   * `deadLetterWorkflow`) checks it first, so the app's own route wins over the default.
+   */
+  async announcedDeadLetter(run: WorkflowRun): Promise<string | undefined> {
+    if (this.latest.has(run.workflow) || this.isRegisteredHere(run)) return undefined;
+    const group = tenantGroup(sanitizeQueueToken(run.workflow), run.namespace);
+    const reg = await this.announcedRegistration(group, run.workflow, run.workflowVersion);
+    const target = reg?.deadLetter;
+    return typeof target === 'string' && target !== '' ? target : undefined;
+  }
+
+  /**
+   * Start the announced dead-letter workflow of a dead run (see {@link announcedDeadLetter}) in the
+   * run's namespace, as `dlq:<runId>` with the `DeadLetter` payload, through the tenant start path:
+   * with no live worker of the app it waits `blocked` instead of being lost. Idempotent by run id.
+   */
+  private async routeAnnouncedDeadLetter(run: WorkflowRun): Promise<void> {
+    const target = await this.announcedDeadLetter(run);
+    if (!target) return;
+    await this.startWith(
+      target,
+      { deadRunId: run.id, workflow: run.workflow, input: run.input, error: run.error },
+      `dlq:${run.id}`,
+      { namespace: run.namespace, ...inheritTenant(run) },
+      true,
+    );
   }
 
   /**
@@ -3872,6 +3974,9 @@ export class WorkflowEngine {
     runId: string,
     opts: StartOptions | undefined,
     parkUnroutable: boolean,
+    /** The singleton a tenant starter evaluated (see {@link StartRunMessage.singleton}). Applied only
+     *  to a workflow this engine serves by convention: a registration of its own wins. */
+    wireSingleton?: StartRunSingleton,
   ): Promise<RunResult> {
     const name = workflowName(workflow);
     // PINNED (`opts.version`) resolves the by-name@version registry and stops there: no `latest`, and
@@ -3923,6 +4028,7 @@ export class WorkflowEngine {
       };
       const convention = await this.resolveRemoteByConvention(conventionRun, {
         askFleetForVersion: true,
+        ...(wireSingleton !== undefined ? { singleton: wireSingleton } : {}),
       });
       // A PINNED start takes the convention route only when the live fleet itself declares the
       // pinned version: then the version is not invented, it is what the worker states. Anything
@@ -3934,7 +4040,7 @@ export class WorkflowEngine {
           : undefined;
     }
     if (!registered && parkUnroutable) {
-      return this.parkStartForWorker(name, input, runId, opts);
+      return this.parkStartForWorker(name, input, runId, opts, wireSingleton);
     }
     if (!registered) {
       throw new Error(
@@ -4055,11 +4161,15 @@ export class WorkflowEngine {
     input: unknown,
     runId: string,
     opts: StartOptions | undefined,
+    wireSingleton?: StartRunSingleton,
   ): Promise<RunResult> {
     const prior = await this.store.getRun(runId);
     if (prior) return this.existingStartResult(prior);
     const quota = await resolveConcurrency(opts?.concurrency, undefined, input);
     if (quota) await assertConcurrency(this.store, name, quota);
+    // The starter's singleton key travels on the waiting run, so the gate admits it once it starts.
+    const singleton = conventionSingleton({}, undefined, wireSingleton);
+    if (singleton) await this.singletons.assertCapacity(name, singleton, input);
     const namespace = poolNamespace(opts?.namespace) ?? this.namespace;
     const group = tenantGroup(sanitizeQueueToken(name), namespace);
     const pinned = opts?.version;
@@ -4077,6 +4187,7 @@ export class WorkflowEngine {
     const now = new Date();
     const tags = mergeTags(undefined, [
       ...(opts?.tags ?? []),
+      ...(singleton ? [this.singletons.tag(singleton, input)] : []),
       ...(quota ? [concurrencyTag(quota.key)] : []),
       ...(pinned === undefined ? [VERSION_UNDECLARED_TAG] : []),
     ])?.filter((tag) => !SINGLETON_RESERVED_TAGS.includes(tag));
@@ -4142,8 +4253,14 @@ export class WorkflowEngine {
       ...(typeof message.startAt === 'number' ? { startAt: message.startAt } : {}),
       ...(message.concurrency !== undefined ? { concurrency: message.concurrency } : {}),
     };
+    // The singleton key is scoped to the tenant's namespace (`<ns>/<key>`): two tenants serving a
+    // workflow of the same name with the same key never share a slot.
+    const singleton =
+      message.singleton !== undefined && typeof message.singleton?.key === 'string'
+        ? { ...message.singleton, key: tenantScopedKey(namespace, message.singleton.key) }
+        : undefined;
     try {
-      return await this.startWith(message.workflow, message.input, runId, opts, true);
+      return await this.startWith(message.workflow, message.input, runId, opts, true, singleton);
     } catch (err) {
       if (
         !(
@@ -4156,6 +4273,61 @@ export class WorkflowEngine {
       }
       return this.recordRejectedStart(message.workflow, message.input, runId, opts, err);
     }
+  }
+
+  /**
+   * The control plane's half of a tenant's `signalWithStart` (a `signalWithStart` run request):
+   * start `start` like {@link startForTenant} unless its run exists, then signal `signal.token`.
+   * Authorization is the caller's (the run-request responder): the run must belong to `namespace`,
+   * and so must a run already waiting on the token. Delivered at once to a waiting run; with none
+   * waiting yet it is buffered only when the token contains the run id (a run-scoped token), so a
+   * tenant can never plant a payload for a wait another namespace opens later. `signalled: false`
+   * when it was neither delivered nor buffered.
+   */
+  async signalWithStartForTenant(
+    start: StartRunMessage & { runId: string },
+    namespace: string,
+    tenant: Pick<StartOptions, 'tenantId' | 'tenantKind'>,
+    signal: { token: string; payload?: unknown },
+  ): Promise<{ runId: string; signalled: boolean }> {
+    const started = await this.startForTenant(start, namespace, tenant);
+    // A start refused (quota, singleton queue, invalid input) or a run already settled will never
+    // wait on the token: buffering for it would only leave an orphan row behind.
+    if (TERMINAL_RUN_STATUSES.includes(started.status)) {
+      return { runId: start.runId, signalled: false };
+    }
+    const waiter = (await this.store.listSignalWaiters(signal.token)).find(
+      (w) => w.token === signal.token,
+    );
+    if (waiter) {
+      const run = await this.store.getRun(waiter.runId);
+      if (!run || runNamespace(run.namespace) !== runNamespace(namespace)) {
+        return { runId: start.runId, signalled: false };
+      }
+    } else if (!signal.token.includes(start.runId)) {
+      return { runId: start.runId, signalled: false };
+    }
+    await this.signalUnchecked(signal.token, signal.payload);
+    return { runId: start.runId, signalled: true };
+  }
+
+  /**
+   * The control plane's half of a tenant's `publishEvent` (a `publishEvent` run request): resume the
+   * runs of `namespace` waiting on event `name` whose match the payload satisfies. Starting the
+   * tenant's own subscribers is the tenant's (it holds their `where` and `input`); nothing is
+   * buffered, since a buffered event could reach another namespace's later wait. Returns how many
+   * runs it resumed.
+   */
+  async publishEventForTenant(name: string, payload: unknown, namespace: string): Promise<number> {
+    let touched = 0;
+    for (const w of await this.store.listSignalWaiters(eventPrefix(name))) {
+      if (!eventMatches(payload, eventMatchOf(w.token))) continue;
+      const run = await this.store.getRun(w.runId);
+      if (!run || runNamespace(run.namespace) !== runNamespace(namespace)) continue;
+      await this.signalUnchecked(w.token, payload);
+      touched += 1;
+    }
+    return touched;
   }
 
   /** A tenant start {@link startForTenant} could not admit, kept as a `failed` run with the reason. */
@@ -4706,7 +4878,7 @@ export class WorkflowEngine {
    */
   private async resolveRemoteByConvention(
     run: WorkflowRun,
-    opts: { askFleetForVersion?: boolean } = {},
+    opts: { askFleetForVersion?: boolean; singleton?: StartRunSingleton } = {},
   ): Promise<RegisteredWorkflow | undefined> {
     // Workers register/heartbeat their liveGroups under the SANITIZED token (`sanitizeQueueToken`),
     // so the membership check must sanitize too — else a `:`-named workflow's live worker is under
@@ -4729,16 +4901,61 @@ export class WorkflowEngine {
     const declared = opts.askFleetForVersion
       ? await this.declaredVersion(liveTransport, group, run.workflow)
       : undefined;
+    const version = declared ?? run.workflowVersion;
+    // The `@Workflow` options the serving app announces (item 9): applied only here, to a workflow
+    // nothing on this engine registers, so a control-plane registration always wins over them.
+    const announced = await this.announcedRegistration(group, run.workflow, version);
+    const singleton = conventionSingleton(run, announced, opts.singleton);
+    if (singleton?.limit !== undefined) {
+      this.conventionSingletonLimits.set(
+        `${runNamespace(run.namespace)}\u0000${run.workflow}`,
+        singleton.limit,
+      );
+    }
+    const tags = announced?.options?.tags;
     return {
       name: run.workflow,
-      version: declared ?? run.workflowVersion,
+      version,
       fn: () => {
         throw new Error(`remote workflow ${run.workflow} has no local body`);
       },
       hasBody: false,
       remote: { group, executor },
+      ...(Array.isArray(tags) && tags.length > 0 ? { tags } : {}),
+      ...(singleton ? { singleton } : {}),
       ...(opts.askFleetForVersion ? { versionDeclared: declared !== undefined } : {}),
     };
+  }
+
+  /**
+   * The registration the live workers of `group` announce for `workflow` (at `version`, when one of
+   * them states it): where they disagree (a rolling deploy), the one from the worker that started
+   * last, as for announced schedules. `undefined` when none announces it, `null` when the read
+   * failed (what the workers state is then unknown, not "nothing"). Reads
+   * through the descriptor cache ({@link workerDescriptorCacheMs}), so a turn costs no extra round
+   * trip in steady state.
+   */
+  private async announcedRegistration(
+    group: string,
+    workflow: string,
+    version: string | undefined,
+  ): Promise<WorkflowRegistration | null | undefined> {
+    let descriptors: WorkerDescriptor[];
+    try {
+      descriptors = await this.liveWorkerDescriptors(group);
+    } catch {
+      return null;
+    }
+    let best: { at: number; reg: WorkflowRegistration } | undefined;
+    for (const descriptor of descriptors) {
+      for (const reg of descriptor.registrations ?? []) {
+        if (reg?.name !== workflow) continue;
+        if (version !== undefined && reg.version !== undefined && reg.version !== version) continue;
+        const at = Number(descriptor.startedAt) || 0;
+        if (!best || at > best.at) best = { at, reg };
+      }
+    }
+    return best?.reg;
   }
 
   /**
@@ -4987,35 +5204,105 @@ export class WorkflowEngine {
     for (const reg of new Set(this.latest.values())) {
       if (this.draining) return;
       if (reg.executionTimeoutMs == null) continue;
-      const deadline = now - reg.executionTimeoutMs;
-      const inflight = await this.store.listRuns({
-        workflow: reg.name,
-        statuses: TIMEOUT_SWEPT_STATUSES,
-        namespace: this.namespace,
-      });
-      for (const run of inflight) {
-        if (this.draining) return;
-        if (run.createdAt.getTime() > deadline) continue;
-        const error = { message: 'execution timeout', code: 'execution_timeout' };
-        await this.store.updateRun(
-          run.id,
-          await this.withLifecycleMarker(run, {
-            status: 'cancelled',
-            error,
-            updatedAt: new Date(),
-          }),
-        );
-        this.emit({
-          type: 'run.failed',
-          runId: run.id,
-          workflow: run.workflow,
-          namespace: run.namespace,
-          error,
-        });
-        // The parent is terminal FIRST (above), so a child that cascades back into it stops there.
-        await this.cancelChildren(run.id).catch(() => undefined);
-        this.notifyParent(run.id, cancelledCompletion(error));
+      await this.cancelTimedOut(reg.name, this.namespace, now - reg.executionTimeoutMs);
+    }
+    // The `executionTimeout` a tenant's workers announce for a workflow nothing registers here.
+    for (const { workflow, namespace, timeoutMs } of await this.announcedTimeouts(now)) {
+      if (this.draining) return;
+      await this.cancelTimedOut(workflow, namespace, now - timeoutMs);
+    }
+  }
+
+  /**
+   * The singleton limit last resolved for a workflow served by convention, by `<namespace>\0<name>`
+   * (see {@link resolveRemoteByConvention}): what the singleton gate's release wake-up reads, since
+   * it cannot wait on the fleet. One entry per convention singleton the fleet serves.
+   */
+  private readonly conventionSingletonLimits = new Map<string, number>();
+
+  /** The last read of the announced execution timeouts (see {@link announcedTimeouts}). */
+  private announcedTimeoutsRead:
+    | { at: number; list: { workflow: string; namespace: string; timeoutMs: number }[] }
+    | undefined;
+
+  /**
+   * The `executionTimeoutMs` live workers announce (`@Workflow({ executionTimeout })` on a tenant),
+   * per workflow and namespace, for workflows this engine does not register (a registration here
+   * applies its own). Where workers disagree, the one that started last wins. Read at most once per
+   * {@link ANNOUNCED_TIMEOUTS_TTL_MS}; empty without a transport that reads the fleet, or when the
+   * read fails.
+   */
+  private async announcedTimeouts(
+    now: number,
+  ): Promise<{ workflow: string; namespace: string; timeoutMs: number }[]> {
+    if (!this.pool.introspectsFleet) return [];
+    const cached = this.announcedTimeoutsRead;
+    if (cached && now - cached.at < ANNOUNCED_TIMEOUTS_TTL_MS) return cached.list;
+    const newest = new Map<
+      string,
+      { at: number; workflow: string; namespace: string; ms: number }
+    >();
+    try {
+      for (const descriptor of await this.pool.readAllWorkerDescriptors()) {
+        const at = Number(descriptor.startedAt) || 0;
+        for (const reg of descriptor.registrations ?? []) {
+          if (!reg || typeof reg.name !== 'string' || this.latest.has(reg.name)) continue;
+          const namespace = servedNamespace(descriptor.namespace, reg.group);
+          if (this.namespace !== undefined && runNamespace(this.namespace) !== namespace) continue;
+          const key = `${namespace}\u0000${reg.name}`;
+          const prior = newest.get(key);
+          if (prior && prior.at >= at) continue;
+          newest.set(key, {
+            at,
+            workflow: reg.name,
+            namespace,
+            ms: Number(reg.options?.executionTimeoutMs),
+          });
+        }
       }
+    } catch {
+      return cached?.list ?? [];
+    }
+    const list = [...newest.values()]
+      .filter((e) => Number.isFinite(e.ms) && e.ms > 0)
+      .map((e) => ({ workflow: e.workflow, namespace: e.namespace, timeoutMs: e.ms }));
+    this.announcedTimeoutsRead = { at: now, list };
+    return list;
+  }
+
+  /** Cancel (`execution_timeout`) the in-flight runs of `workflow` in `namespace` created before `deadline`. */
+  private async cancelTimedOut(
+    workflow: string,
+    namespace: string | undefined,
+    deadline: number,
+  ): Promise<void> {
+    const inflight = await this.store.listRuns({
+      workflow,
+      statuses: TIMEOUT_SWEPT_STATUSES,
+      namespace,
+    });
+    for (const run of inflight) {
+      if (this.draining) return;
+      if (run.createdAt.getTime() > deadline) continue;
+      const error = { message: 'execution timeout', code: 'execution_timeout' };
+      await this.store.updateRun(
+        run.id,
+        await this.withLifecycleMarker(run, {
+          status: 'cancelled',
+          error,
+          updatedAt: new Date(),
+        }),
+      );
+      this.emit({
+        type: 'run.failed',
+        runId: run.id,
+        workflow: run.workflow,
+        namespace: run.namespace,
+        error,
+      });
+      // The parent is terminal FIRST (above), so a child that cascades back into it stops there.
+      await this.cancelChildren(run.id).catch(() => undefined);
+      this.notifyParent(run.id, cancelledCompletion(error));
     }
   }
 

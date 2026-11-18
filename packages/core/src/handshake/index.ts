@@ -13,6 +13,7 @@ export {
   type WorkflowRegistration,
   type HeartbeatStatus,
   type AnnouncedSchedule,
+  type AnnouncedWorkflowOptions,
   type ScheduleAnnouncement,
   describeWorker,
   descriptorHash,

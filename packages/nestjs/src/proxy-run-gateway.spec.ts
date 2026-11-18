@@ -143,4 +143,52 @@ describe('ProxyRunGateway', () => {
     tx.emitEvent({ tenant: 'acme', event: { runId: 'r1', type: 'run.completed' } });
     expect(seen).toHaveLength(1);
   });
+
+  it('signal: an explicit null is "nobody waits"; an empty reply (a control plane older than the verb) is unsupported', async () => {
+    const tx = fakeTransport();
+    const gw = new ProxyRunGateway(tx, 'acme', 5000);
+    const nobody = gw.signal('tok', 1, { id: 'd' });
+    const req = tx.requests[0];
+    expect(req).toMatchObject({
+      body: { kind: 'signal', token: 'tok', payload: 1, opts: { id: 'd' } },
+    });
+    tx.emitReply({ requestId: req.requestId, result: { ok: true, data: null } });
+    await expect(nobody).resolves.toBeNull();
+
+    const old = gw.signal('tok', 1);
+    tx.emitReply({ requestId: tx.requests[1].requestId, result: { ok: true } });
+    await expect(old).rejects.toMatchObject({ code: 'unsupported-request' });
+    // Remembered for a while: the next call fails at once, with no round trip.
+    await expect(gw.signal('tok', 1)).rejects.toMatchObject({ code: 'unsupported-request' });
+    expect(tx.requests).toHaveLength(2);
+  });
+
+  it('round-trips signalWithStart and publishEvent as run requests', async () => {
+    const tx = fakeTransport();
+    const gw = new ProxyRunGateway(tx, 'acme', 5000);
+    const sws = gw.signalWithStart(
+      { workflow: 'counter', input: {}, runId: 'c1' },
+      { token: 'c1:add', payload: 1 },
+    );
+    expect(tx.requests[0]?.body).toEqual({
+      kind: 'signalWithStart',
+      start: { workflow: 'counter', input: {}, runId: 'c1' },
+      signal: { token: 'c1:add', payload: 1 },
+    });
+    tx.emitReply({
+      requestId: tx.requests[0].requestId,
+      result: { ok: true, data: { runId: 'c1', signalled: true } },
+    });
+    await expect(sws).resolves.toEqual({ runId: 'c1', signalled: true });
+
+    const pub = gw.publishEvent('paid', { n: 1 }, { id: 'e1' });
+    expect(tx.requests[1]?.body).toEqual({
+      kind: 'publishEvent',
+      name: 'paid',
+      payload: { n: 1 },
+      opts: { id: 'e1' },
+    });
+    tx.emitReply({ requestId: tx.requests[1].requestId, result: { ok: true, data: 0 } });
+    await expect(pub).resolves.toBe(0);
+  });
 });

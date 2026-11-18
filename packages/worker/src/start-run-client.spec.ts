@@ -165,4 +165,19 @@ describe('startRun — start options', () => {
       'workflow',
     ]);
   });
+
+  it('carries the singleton key the caller evaluated', async () => {
+    const { deps, captures } = makeFakeDeps();
+    await startRun(
+      {},
+      {
+        tenant: 'acme',
+        workflow: 'checkout',
+        input: null,
+        singleton: { key: 'c1', limit: 2 },
+        deps,
+      },
+    );
+    expect(captures[0]?.data).toMatchObject({ singleton: { key: 'c1', limit: 2 } });
+  });
 });

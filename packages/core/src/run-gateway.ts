@@ -1,3 +1,4 @@
+import type { StartOptions } from './engine';
 import type {
   EngineEvent,
   GroupHealth,
@@ -11,6 +12,8 @@ import type {
   RunValueFacetRow,
   RunWaiting,
   ScheduleAction,
+  SignalOptions,
+  StartRunMessage,
   StepCheckpoint,
   WorkflowRun,
 } from './interfaces';
@@ -301,9 +304,29 @@ export abstract class RunGateway {
    * Deliver `payload` to the run waiting on `token` (`WorkflowEngine.signal`). Null when no run waits
    * on it. Optional, like {@link listSchedules}.
    */
-  signal?(token: string, payload: unknown): Promise<RunResult | null>;
+  signal?(token: string, payload: unknown, opts?: SignalOptions): Promise<RunResult | null>;
   /** The id of the run waiting on signal `token`, or null when none waits on it yet. Optional. */
   signalWaiter?(token: string): Promise<string | null>;
+  /**
+   * A tenant's `signalWithStart` (`WorkflowEngine.signalWithStartForTenant`): start `start` in
+   * `namespace` unless its run exists, then signal it. Optional, like {@link listSchedules}.
+   */
+  signalWithStartForTenant?(
+    start: StartRunMessage & { runId: string },
+    namespace: string,
+    clientTenant: Pick<StartOptions, 'tenantId' | 'tenantKind'>,
+    signal: { token: string; payload?: unknown },
+  ): Promise<{ runId: string; signalled: boolean }>;
+  /**
+   * A tenant's `publishEvent`, scoped to `namespace` (`WorkflowEngine.publishEventForTenant`).
+   * Resolves how many runs it resumed or started. Optional, like {@link listSchedules}.
+   */
+  publishEventForTenant?(
+    name: string,
+    payload: unknown,
+    namespace: string,
+    opts?: { id?: string },
+  ): Promise<number>;
   /** Live lifecycle events for one run; returns an unsubscribe fn. Framework-agnostic (no rxjs). */
   abstract subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void;
 }

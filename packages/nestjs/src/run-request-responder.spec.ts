@@ -444,4 +444,80 @@ describe('RunRequestResponder', () => {
       { ok: false, error: { code: 'unsupported-request' } },
     ]);
   });
+
+  it('signalWithStart: starts in the requester namespace, refuses another tenant run or waiter, keeps only a granted customer claim', async () => {
+    const signalWithStartForTenant = vi.fn(async () => ({ runId: 'c1', signalled: true }));
+    const runs: Record<string, WorkflowRun> = { theirs: fakeRun('theirs', 'beta') };
+    const waiters: Record<string, string> = { 'tok-beta': 'theirs' };
+    const tx = fakeTransport();
+    new RunRequestResponder(
+      tx,
+      fakeGateway({
+        getRun: vi.fn(async (id: string) => runs[id] ?? null),
+        signalWaiter: vi.fn(async (token: string) => waiters[token] ?? null),
+        signalWithStartForTenant,
+      }),
+      {
+        verifyTenant: ({ token }) =>
+          token === 'acme-token' ? { tenant: 'acme', capabilities: ['tenancy:org-1'] } : null,
+      },
+    ).start();
+    const send = (requestId: string, start: Record<string, unknown>, token: string) =>
+      tx.deliver({
+        requestId,
+        tenant: 'acme-token',
+        body: {
+          kind: 'signalWithStart',
+          start: { workflow: 'counter', input: {}, ...start } as never,
+          signal: { token, payload: 1 },
+        },
+      });
+
+    await send('own', { runId: 'c1', tenantId: 'org-1' }, 'c1:add');
+    expect(signalWithStartForTenant).toHaveBeenCalledWith(
+      expect.objectContaining({ runId: 'c1', tenant: 'acme' }),
+      'acme',
+      { tenantId: 'org-1' },
+      { token: 'c1:add', payload: 1 },
+    );
+    await send('claim', { runId: 'c2', tenantId: 'org-2' }, 'c2:add');
+    expect(signalWithStartForTenant.mock.calls[1]?.[2]).toEqual({ tenantId: null });
+
+    await send('run', { runId: 'theirs' }, 'theirs:add');
+    await send('waiter', { runId: 'c3' }, 'tok-beta');
+    await send('bad', { runId: '' }, 'x');
+    expect(tx.replies.map((r) => (r.result.ok ? 'ok' : r.result.error.code))).toEqual([
+      'ok',
+      'ok',
+      'cross-tenant',
+      'cross-tenant',
+      'bad-request',
+    ]);
+    expect(signalWithStartForTenant).toHaveBeenCalledTimes(2);
+  });
+
+  it('publishEvent is answered over the requester namespace only, and unsupported without the gateway verb', async () => {
+    const publishEventForTenant = vi.fn(async () => 1);
+    const tx = fakeTransport();
+    new RunRequestResponder(tx, fakeGateway({ publishEventForTenant })).start();
+    await tx.deliver({
+      requestId: 'p',
+      tenant: 'acme',
+      body: { kind: 'publishEvent', name: 'paid', payload: { n: 1 } },
+    });
+    expect(publishEventForTenant).toHaveBeenCalledWith('paid', { n: 1 }, 'acme');
+    expect(tx.replies[0]?.result).toEqual({ ok: true, data: 1 });
+
+    const old = fakeTransport();
+    new RunRequestResponder(old, fakeGateway()).start();
+    await old.deliver({
+      requestId: 'p',
+      tenant: 'acme',
+      body: { kind: 'publishEvent', name: 'paid', payload: {} },
+    });
+    expect(old.replies[0]?.result).toMatchObject({
+      ok: false,
+      error: { code: 'unsupported-request' },
+    });
+  });
 });

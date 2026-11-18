@@ -210,3 +210,13 @@ once still triggers exactly one DLQ run.
 The dashboard links the two ends of this relationship: from a `dead` run you can see the DLQ run it spawned,
 and the DLQ run carries the originating `deadRunId` — so you can walk from a poison pill to its handler and
 back, retry the original once it's fixed, and confirm the DLQ run did its job.
+
+## On a tenant
+
+On a `DurableModule` tenant (a `connection`, no `store`) the same declarations work. The tenant's
+worker serves an inline `@DeadLetter()` method as `<name>.dlq` and announces it as the workflow's
+route (else its `deadLetterWorkflow` reference, else the tenant's module-level default). When a run
+of that workflow is dead-lettered on the control plane, the control plane starts the route in the
+run's partition as `dlq:<runId>`, so the handler runs on the tenant, next to the workflow. The
+control plane's own `deadLetterWorkflow` default does not apply to a workflow whose workers announce
+a route. See [What a tenant gets](/docs/cluster/roles-and-config#what-a-tenant-gets).

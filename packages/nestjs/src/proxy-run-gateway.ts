@@ -20,6 +20,8 @@ import type {
   RunValueFacetOptions,
   RunValueFacetRow,
   RunWaiting,
+  SignalOptions,
+  StartRunMessage,
   TenantTokenSource,
   Transport,
   WorkflowLifecycleLinks,
@@ -74,6 +76,14 @@ export class RunGatewayError extends Error {
     this.name = 'RunGatewayError';
     this.code = code;
   }
+}
+
+/** The error a verb the control plane does not know fails with (see `requestNewVerb`). */
+function unsupportedVerb(kind: string): RunGatewayError {
+  return new RunGatewayError(
+    `${kind} is not supported by this server: the control plane is older than this tenant`,
+    UNSUPPORTED_RUN_REQUEST,
+  );
 }
 
 /** The control plane answered a verb it does not know — an older release than this tenant's. */
@@ -386,11 +396,7 @@ export class ProxyRunGateway implements RunGateway {
    * {@link RunGatewayError} with code {@link UNSUPPORTED_RUN_REQUEST}.
    */
   private async requestNewVerb<T>(body: RunRequestKind): Promise<T> {
-    const notSupported = () =>
-      new RunGatewayError(
-        `${body.kind} is not supported by this server: the control plane is older than this tenant`,
-        UNSUPPORTED_RUN_REQUEST,
-      );
+    const notSupported = () => unsupportedVerb(body.kind);
     if (this.knownUnsupported(body.kind)) throw notSupported();
     let data: T | undefined;
     try {
@@ -401,6 +407,57 @@ export class ProxyRunGateway implements RunGateway {
     if (data !== undefined && data !== null) return data;
     this.unsupportedUntil.set(body.kind, Date.now() + this.capabilityTtlMs);
     throw notSupported();
+  }
+
+  /**
+   * Signal the run of this tenant's namespace waiting on `token` (`engine.signal`). Resolves null
+   * when no run of this namespace waits on it: the control plane does NOT buffer a tenant's signal
+   * for a wait opened later (another namespace's run could open it). A control plane that predates
+   * the verb fails it with an {@link UNSUPPORTED_RUN_REQUEST} error.
+   */
+  async signal(token: string, payload: unknown, opts?: SignalOptions): Promise<RunResult | null> {
+    if (this.knownUnsupported('signal')) throw unsupportedVerb('signal');
+    let data: RunResult | null | undefined;
+    try {
+      data = await this.request<RunResult | null | undefined>(
+        opts === undefined
+          ? { kind: 'signal', token, payload }
+          : { kind: 'signal', token, payload, opts },
+      );
+    } catch (err) {
+      if (!isUnsupported(err)) throw err;
+    }
+    // The oldest responders answer an unknown verb `ok: true` with no data at all; a real "nobody
+    // waits" answer is an explicit null.
+    if (data !== undefined) return data;
+    this.unsupportedUntil.set('signal', Date.now() + this.capabilityTtlMs);
+    throw unsupportedVerb('signal');
+  }
+
+  /**
+   * `engine.signalWithStart` for this tenant: the control plane starts `start` in this tenant's
+   * namespace unless its run exists, then signals it (buffered until the run waits, when the token
+   * names the run id). See the responder for the authorization rule.
+   */
+  signalWithStart(
+    start: Omit<StartRunMessage, 'tenant'> & { runId: string },
+    signal: { token: string; payload?: unknown },
+  ): Promise<{ runId: string; signalled: boolean }> {
+    return this.requestNewVerb({ kind: 'signalWithStart', start, signal });
+  }
+
+  /**
+   * Resume the runs of this tenant's namespace waiting on event `name` (`ctx.waitForEvent`).
+   * Resolves how many it resumed. The tenant's own `onEvent` subscribers are started by the caller
+   * (`DurableStartClient.publishEvent`), not here.
+   */
+  publishEvent(name: string, payload: unknown, opts?: { id?: string }): Promise<number> {
+    return this.requestNewVerb({
+      kind: 'publishEvent',
+      name,
+      payload,
+      ...(opts?.id !== undefined ? { opts: { id: opts.id } } : {}),
+    });
   }
 
   subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void {

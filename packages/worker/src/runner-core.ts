@@ -1,5 +1,6 @@
 import type {
   RemoteTask,
+  StepInterceptor,
   StepResult,
   WorkflowDecision,
   WorkflowRegistration,
@@ -158,6 +159,14 @@ export class DurableWorkerRuntime {
   registerStep<I = unknown, O = unknown>(name: string, handler: StepHandler<I, O>): this {
     this.steps.register(name, handler);
     return this;
+  }
+
+  /**
+   * Wrap every step handler this runtime runs with `interceptor`, as `engine.use` does on an
+   * engine (see `StepWorker.use`). Returns an unregister function.
+   */
+  use(interceptor: StepInterceptor): () => void {
+    return this.steps.use(interceptor);
   }
 
   /**

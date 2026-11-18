@@ -255,18 +255,34 @@ export class WorkflowRegistrar
       : undefined;
     if (byWorkflow.size === 0 && !fallback) return;
     this.engine.onDead((run: WorkflowRun) => {
-      const target = byWorkflow.get(run.workflow) ?? fallback;
-      if (!target) return;
-      void this.engine
-        .start(
-          target,
-          { deadRunId: run.id, workflow: run.workflow, input: run.input, error: run.error },
-          `dlq:${run.id}`,
-          // Route the dead-letter handler to the dead run's OWN tenant so an operator dispatches it to
-          // that tenant's worker group (`target@<tenant>`), not the bare group.
-          { namespace: run.namespace },
-        )
-        .catch(() => undefined);
+      void this.routeDead(run, byWorkflow, fallback).catch(() => undefined);
     });
+  }
+
+  /** {@link installDeadLetterRouting}'s routing of one dead run. */
+  private async routeDead(
+    run: WorkflowRun,
+    byWorkflow: Map<string, string>,
+    fallback: string | undefined,
+  ): Promise<void> {
+    let target = byWorkflow.get(run.workflow);
+    if (!target && fallback) {
+      // A tenant's workflow whose workers announce their own dead-letter route: the engine starts
+      // that one (see `WorkflowEngine.announcedDeadLetter`), and this app's default stands aside.
+      // Optional call: an older core (the peer range is wide) announces nothing.
+      if (await this.engine.announcedDeadLetter?.(run).catch(() => undefined)) return;
+      target = fallback;
+    }
+    if (!target) return;
+    await this.engine
+      .start(
+        target,
+        { deadRunId: run.id, workflow: run.workflow, input: run.input, error: run.error },
+        `dlq:${run.id}`,
+        // Route the dead-letter handler to the dead run's OWN tenant so an operator dispatches it to
+        // that tenant's worker group (`target@<tenant>`), not the bare group.
+        { namespace: run.namespace },
+      )
+      .catch(() => undefined);
   }
 }
