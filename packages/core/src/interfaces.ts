@@ -1779,6 +1779,49 @@ export interface WorkflowTask {
    */
   priority?: number | undefined;
   attempt: number;
+  /**
+   * The workflow-decision features the control plane that dispatched this turn can apply — see
+   * {@link REMOTE_WORKFLOW_FEATURES}. A worker checks it before emitting a command an older control
+   * plane would not understand, and fails the turn with a clear error instead. Absent on a task from
+   * a control plane that predates feature negotiation: only the original command kinds are safe.
+   */
+  features?: string[] | undefined;
+}
+
+/**
+ * The workflow-decision features this control plane applies, advertised on every {@link WorkflowTask}
+ * it dispatches (`task.features`):
+ * - `callPolicy` — a `call` command's `policy` (retries, backoff, liveness `timeoutMs`) is enforced;
+ * - `sleepUntil`, `waitSignalTimeout`, `waitEvent`, `spawnChild`, `continueAsNew` — the command kinds
+ *   of the same names.
+ * A worker must not emit a command (or a `call` policy) whose feature the task does not list.
+ */
+export const REMOTE_WORKFLOW_FEATURES = [
+  'callPolicy',
+  'sleepUntil',
+  'waitSignalTimeout',
+  'waitEvent',
+  'spawnChild',
+  'continueAsNew',
+] as const;
+
+/** One of {@link REMOTE_WORKFLOW_FEATURES}. */
+export type RemoteWorkflowFeature = (typeof REMOTE_WORKFLOW_FEATURES)[number];
+
+/**
+ * The durable dispatch policy a remote `call` command carries (feature `callPolicy`): the same fields,
+ * defaults and semantics as the in-process `ctx.step` policy ({@link StepOptions}) — `retries` is the
+ * total number of attempts; without `timeoutMs` a failed attempt is re-dispatched after `backoff`
+ * unless the worker marked the error non-retryable; with `timeoutMs` an attempt that returns no
+ * result within the window is re-dispatched (up to `retries`) and a reported failure is final.
+ */
+export interface RemoteCallPolicy {
+  retries?: number | undefined;
+  backoff?: BackoffStrategy | undefined;
+  backoffMs?: number | undefined;
+  backoffMaxMs?: number | undefined;
+  jitter?: boolean | undefined;
+  timeoutMs?: number | undefined;
 }
 
 /** One resolved durable op in a run's history — a superset of a completed {@link StepCheckpoint}. */
@@ -1795,6 +1838,11 @@ export interface HistoryEvent {
   output?: unknown;
   /** Set when the op resolved to a failure (e.g. a failed remote step the workflow may catch). */
   error?: StepError | undefined;
+  /**
+   * For a `call`: how many times the step was dispatched. A worker applying a `call` policy reads it
+   * to decide whether a failed attempt is retried (see {@link RemoteCallPolicy}).
+   */
+  attempts?: number | undefined;
 }
 
 /** A decision the workflow function produced at a `seq` that was not yet in history. */
@@ -1810,6 +1858,10 @@ export type WorkflowCommand =
       group: string;
       input: unknown;
       parallelGroup?: string;
+      /** The step's durable dispatch policy (feature `callPolicy`). Re-sent on every turn the step is
+       *  not resolved, so whichever control-plane instance applies the turn enforces it. A failed
+       *  attempt the policy retries is re-emitted with it instead of raised. */
+      policy?: RemoteCallPolicy;
     }
   /** `ctx.step(name, body)` — a LOCAL step the worker already ran this turn; the engine persists its
    *  result so replay returns it instead of re-running (durability for side-effectful work).
@@ -1832,8 +1884,47 @@ export type WorkflowCommand =
   /** `ctx.sleep(ms)` — a durable timer of `ms` duration. The engine computes the absolute deadline
    *  (now + ms) when it applies the command, so the worker never reads the clock (determinism). */
   | { kind: 'sleep'; seq: number; ms: number }
+  /** `ctx.sleepUntil(when)` — a durable timer to an absolute epoch-ms deadline (feature `sleepUntil`). */
+  | { kind: 'sleepUntil'; seq: number; until: number }
   /** `ctx.wait_signal(name)` — block until a signal `name` is delivered to the run. */
   | { kind: 'waitSignal'; seq: number; signal: string }
+  /** `ctx.waitForSignal(name, { timeoutMs })` (feature `waitSignalTimeout`): like the in-process ctx it
+   *  takes TWO positions — `deadlineSeq` for the deadline timer (stamped once, at `now + timeoutMs`
+   *  when first applied) and `seq` for the wait. Whichever resolves first shows in history: the signal
+   *  at `seq`, or a `timer` at `deadlineSeq`, which the worker raises as a `SignalTimeoutError`. */
+  | {
+      kind: 'waitSignalTimeout';
+      seq: number;
+      deadlineSeq: number;
+      signal: string;
+      timeoutMs: number;
+    }
+  /** `ctx.waitForEvent(name, { match, timeoutMs })` (feature `waitEvent`): wait for a named event
+   *  published with `engine.publishEvent`, buffered events included. Bounded like
+   *  `waitSignalTimeout` when `timeoutMs` is set (then `deadlineSeq` is the deadline's position). */
+  | {
+      kind: 'waitEvent';
+      seq: number;
+      name: string;
+      match?: Record<string, unknown>;
+      deadlineSeq?: number;
+      timeoutMs?: number;
+    }
+  /** `ctx.startChild(workflow, input, opts)` (feature `spawnChild`): start a child run WITHOUT awaiting
+   *  it. The worker returns `childId` immediately and the turn goes on; the control plane starts the
+   *  child once (idempotent by id) and journals a `spawn:<childId>` step at `seq`. */
+  | {
+      kind: 'spawnChild';
+      seq: number;
+      workflow: string;
+      input: unknown;
+      childId: string;
+      priority?: number;
+    }
+  /** `ctx.continueAsNew(input)` (feature `continueAsNew`): the LAST command of a turn. The control
+   *  plane completes this run and starts its continuation (`<runId>~N`) with `input`, as the
+   *  in-process engine does. `seq` is the position the body had reached (not consumed). */
+  | { kind: 'continueAsNew'; seq: number; input: unknown }
   /** `ctx.waitForAny(name, conditions)` — block until the first of `conditions` happens. The engine
    *  resolves it exactly as the in-process ctx does (see `wait-any.ts`), journals `{ key, value }` at
    *  `seq` and replays it as an `any` {@link HistoryEvent}. A timer's `ms` counts from when the engine

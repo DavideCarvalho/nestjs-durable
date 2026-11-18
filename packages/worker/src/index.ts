@@ -12,10 +12,12 @@ export {
 } from './adaptive-concurrency';
 export {
   Cancelled,
+  ContinuedAsNew,
   GatherReplayError,
   NondeterminismError,
   StepFailed,
   Suspend,
+  UnsupportedByControlPlane,
   UnsupportedOnThinWorker,
   WorkflowError,
   toError,

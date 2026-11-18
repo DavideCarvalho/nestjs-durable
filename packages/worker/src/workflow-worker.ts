@@ -5,7 +5,7 @@ import {
   runDurableExecution,
   runInWorkflowCtx,
 } from '@dudousxd/nestjs-durable-core';
-import { Cancelled, StepFailed, Suspend, toError } from './errors';
+import { Cancelled, ContinuedAsNew, StepFailed, Suspend, toError } from './errors';
 import { WorkflowContext } from './workflow-context';
 
 /** A registered workflow body. Receives the {@link WorkflowContext} and the run's input. */
@@ -94,6 +94,7 @@ export class WorkflowWorker {
       pendingSignals: task.pendingSignals,
       onStep: opts.onStep,
       isCancelled: opts.isCancelled,
+      features: task.features,
     });
 
     try {
@@ -104,6 +105,10 @@ export class WorkflowWorker {
     } catch (err) {
       if (err instanceof Suspend) {
         return { ...base, status: 'continue', commands: ctx.commands };
+      }
+      if (err instanceof ContinuedAsNew) {
+        // Terminal: the last command is `continueAsNew`, which the engine applies as the handoff.
+        return { ...base, status: 'completed', commands: ctx.commands };
       }
       if (err instanceof Cancelled) {
         // Cancelled at an op boundary. Return the steps that DID run this turn so the engine can

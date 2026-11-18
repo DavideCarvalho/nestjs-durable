@@ -25,21 +25,28 @@ import type {
 } from '@dudousxd/nestjs-durable-core';
 import {
   NestedWorkflowCallError,
+  type RemoteWorkflowFeature,
+  SignalTimeoutError,
   createStepLogger,
   currentStepScope,
   parseDuration,
+  remoteCallPolicyOf,
+  remoteCallRetries,
   runInStepLogger,
   runInStepScope,
+  stepConfigOf,
   stepNameOf,
   workflowName,
 } from '@dudousxd/nestjs-durable-core';
 import {
   Cancelled,
+  ContinuedAsNew,
   type GatherFailure,
   GatherReplayError,
   NondeterminismError,
   StepFailed,
   Suspend,
+  UnsupportedByControlPlane,
   UnsupportedOnThinWorker,
   toError,
 } from './errors';
@@ -82,6 +89,13 @@ export interface WorkflowContextOptions {
    * at the next op boundary when this reports the run cancelled — see {@link WorkflowContext.next}.
    */
   isCancelled?: ((runId: string) => boolean) | undefined;
+  /**
+   * The workflow-decision features the dispatching control plane applies (`WorkflowTask.features`).
+   * An op whose command needs a feature not listed fails the turn with
+   * {@link UnsupportedByControlPlane} instead of emitting it. Absent = a control plane from before
+   * feature negotiation: only the original command kinds.
+   */
+  features?: readonly string[] | undefined;
 }
 
 /**
@@ -92,15 +106,17 @@ export interface WorkflowContextOptions {
  * It `implements` the engine's {@link WorkflowCtx}, so a NestJS `@Workflow` body typed against
  * `WorkflowCtx` runs UNCHANGED on the thin worker. The API splits in two:
  *
- * - **Supported** (wire-expressible) — {@link step} (always dispatched — no local placement),
- *   {@link sleep}, {@link waitForSignal}, {@link waitForAny}, {@link child}, {@link all}, {@link now}/{@link sideEffect}
- *   (deterministic capture, backed by the internal {@link localStep} primitive): each maps to a
- *   {@link WorkflowCommand} (`call`/`recordStep`/`sleep`/`waitSignal`/`startChild`) the engine applies
- *   durably.
- * - **Unsupported** — `transaction`, `callEntity`, `signalEntity`, `continueAsNew`, `sleepUntil`,
- *   `waitForEvent`, `waitForRun`, `task`, `startChild` (fire-and-forget), `breakpoint`, `webhook`, `setEvent`,
- *   `onUpdate`, `patched`: they need engine/store/transport features the remote wire can't express,
- *   so each throws {@link UnsupportedOnThinWorker} (run such a workflow in-process on the engine).
+ * - **Supported** (wire-expressible) — {@link step} (always dispatched — no local placement; its
+ *   retries/backoff/timeout ride the `call` as its `policy`), {@link sleep}, {@link sleepUntil},
+ *   {@link waitForSignal} (bounded or not), {@link waitForEvent}, {@link waitForAny}, {@link child},
+ *   {@link startChild} (fire-and-forget), {@link all}, {@link continueAsNew}, {@link setEvent},
+ *   {@link now}/{@link sideEffect} (deterministic capture, backed by the internal {@link localStep}
+ *   primitive): each maps to a {@link WorkflowCommand} the engine applies durably. The newer commands
+ *   are negotiated: see {@link WorkflowContextOptions.features}.
+ * - **Unsupported** — `transaction`, `callEntity`, `signalEntity`, `waitForRun`, `task`,
+ *   `breakpoint`, `webhook`, `onUpdate`, `patched`, `upsertSearchAttributes`: they need engine/store/
+ *   transport features the remote wire can't express yet, so each throws
+ *   {@link UnsupportedOnThinWorker} (run such a workflow in-process on the engine).
  *
  * {@link gather} is a worker-only extension (Python `gather` parity) beyond `WorkflowCtx`.
  */
@@ -116,6 +132,7 @@ export class WorkflowContext implements WorkflowCtx {
   private readonly onStep: ((event: WorkflowStepEvent) => void) | undefined;
   private readonly isCancelled: ((runId: string) => boolean) | undefined;
   private readonly workflowPartition: string | undefined;
+  private readonly features: ReadonlySet<string>;
   private seq = 0;
 
   constructor(runId: string, history: HistoryEvent[], opts: WorkflowContextOptions = {}) {
@@ -125,6 +142,12 @@ export class WorkflowContext implements WorkflowCtx {
     this.onStep = opts.onStep;
     this.isCancelled = opts.isCancelled;
     this.workflowPartition = opts.workflowPartition;
+    this.features = new Set(opts.features ?? []);
+  }
+
+  /** Fail the turn when the dispatching control plane cannot apply `feature` (see the options). */
+  private requireFeature(feature: RemoteWorkflowFeature, op: string): void {
+    if (!this.features.has(feature)) throw new UnsupportedByControlPlane(op, feature);
   }
 
   // -- internals -----------------------------------------------------------
@@ -238,17 +261,12 @@ export class WorkflowContext implements WorkflowCtx {
    * The decision's `group` field carries the WORKFLOW's own partition (or `''`) — see
    * {@link resolveCallGroup}; there is no per-call partition override in this surface.
    *
-   * **WARNING — retries/backoff/timeoutMs are accepted but NOT wire-expressible here.** `opts` also
-   * carries `retries`/`backoff`/`backoffMs`/`backoffMaxMs`/`jitter`/`timeoutMs` (and a `@Step`-stamped
-   * `handler` may carry the same policy via `stepConfigOf`) for `WorkflowCtx` type conformance with
-   * the engine's in-process `ctx.step` (see `workflow-ctx.ts`), which threads them into the dispatched
-   * `StepDef` and re-enables `callRemote`'s durable retry/backoff and liveness-timeout branches. The
-   * `call` decision this thin worker emits has never carried that policy (`name`/`group`/`input`/
-   * `parallelGroup` only, unchanged across this rename) — the cross-SDK decision shape is frozen, and
-   * this dispatch site's retry/timeout policy is silently NOT applied. A portable workflow body that
-   * depends on durable retry/backoff or a remote-liveness `timeoutMs` MUST run in-process on the
-   * engine instead — the same rule {@link localStep} already documents for `options.retries`/
-   * `options.backoff`/`options.compensate`.
+   * **Step policy.** `retries`/`backoff`/`backoffMs`/`backoffMaxMs`/`jitter`/`timeoutMs` — from
+   * `opts`, else from the `@Step`-stamped config (`stepConfigOf`), the in-process merge — ride the
+   * `call` as its `policy`, and the control plane enforces them as a standalone engine does: a failed
+   * attempt the policy retries (see core's `remoteCallRetries`) is re-emitted here instead of raised,
+   * and the control plane spaces it by the backoff; a `timeoutMs` step is re-dispatched when its
+   * window lapses. A control plane that cannot (no `callPolicy` feature) fails the turn instead.
    */
   async step<TInput, TOutput>(
     handler: StepRef<TInput, TOutput>,
@@ -263,7 +281,7 @@ export class WorkflowContext implements WorkflowCtx {
   async step(
     handlerOrName: StepRef | string,
     input: unknown,
-    _opts?: StepDispatchOpts,
+    opts?: StepDispatchOpts,
   ): Promise<unknown> {
     const name = typeof handlerOrName === 'string' ? handlerOrName : stepNameOf(handlerOrName);
     if (name === undefined) {
@@ -271,11 +289,27 @@ export class WorkflowContext implements WorkflowCtx {
         'ctx.step: handler is not a @Step reference (no stamped step name) — pass a @Step-decorated method or a step name string',
       );
     }
+    const config = typeof handlerOrName === 'string' ? undefined : stepConfigOf(handlerOrName);
+    const policy = remoteCallPolicyOf(config, opts);
     const seq = this.next('step');
-    const { found, output } = this.replay(seq, 'call', name);
-    if (found) return output;
+    const ev = this.replayEntry(seq, 'call', name);
+    if (ev !== null) {
+      if (ev.error == null) return ev.output;
+      // A failed attempt its policy retries is not the step's outcome yet: re-emit the call, and the
+      // control plane dispatches it again once the backoff has passed.
+      if (!remoteCallRetries(policy, ev.attempts ?? 1, ev.error)) throw new StepFailed(ev.error);
+    }
+    if (policy !== undefined)
+      this.requireFeature('callPolicy', 'step with retries/backoff/timeoutMs');
     const group = this.resolveCallGroup();
-    this.commands.push({ kind: 'call', seq, name, group, input });
+    this.commands.push({
+      kind: 'call',
+      seq,
+      name,
+      group,
+      input,
+      ...(policy !== undefined ? { policy } : {}),
+    });
     throw new Suspend();
   }
 
@@ -397,26 +431,36 @@ export class WorkflowContext implements WorkflowCtx {
    * Suspend until an external signal `token` is delivered to this run, then resume with its payload.
    * Mirrors Python `wait_signal`; renamed from the old `waitSignal` to match `WorkflowCtx.waitForSignal`.
    *
-   * **Unbounded** (`waitForSignal(token)` / no `timeoutMs`) works correctly on the thin worker:
-   * it consumes exactly ONE seq and emits a `waitSignal` command.
+   * **Unbounded** (no `timeoutMs`) consumes ONE seq and emits a `waitSignal` command.
    *
-   * **Bounded** (`opts.timeoutMs` set) throws {@link UnsupportedOnThinWorker} for two reasons:
-   * (a) The thin worker owns no timers — it cannot honour a deadline remotely.
-   * (b) The engine's bounded path consumes TWO seqs (a deadline seq + a wait seq), whereas the
-   *     worker's unbounded path consumes ONE. Silently proceeding would break seq parity when a
-   *     workflow is checkpointed on one runtime and resumed on the other, causing silent history
-   *     mis-alignment. Run such a workflow in-process on the engine instead.
+   * **Bounded** (`opts.timeoutMs` set) takes TWO seqs in the in-process order — the deadline, then the
+   * wait — so history lines up across runtimes, and emits a `waitSignalTimeout` command (feature
+   * `waitSignalTimeout`); the control plane owns the clock. A deadline that lapses first raises a
+   * {@link SignalTimeoutError}, as in-process. Adding or removing `timeoutMs` shifts every later seq,
+   * exactly as it does in-process.
    */
   async waitForSignal<TPayload>(token: string, opts?: { timeoutMs?: number }): Promise<TPayload> {
-    if (opts?.timeoutMs != null) {
-      return this.unsupported('waitForSignal with timeoutMs');
+    if (opts?.timeoutMs == null) {
+      const seq = this.next('waitForSignal');
+      const { found, output } = this.replay(seq, 'signal', token);
+      if (found) return output as TPayload;
+      const sig = this.signalsBySeq.get(seq);
+      if (sig !== undefined) return sig.payload as TPayload;
+      this.commands.push({ kind: 'waitSignal', seq, signal: token });
+      throw new Suspend();
     }
+    const timeoutMs = opts.timeoutMs;
+    const deadlineSeq = this.next('waitForSignal');
     const seq = this.next('waitForSignal');
     const { found, output } = this.replay(seq, 'signal', token);
     if (found) return output as TPayload;
     const sig = this.signalsBySeq.get(seq);
     if (sig !== undefined) return sig.payload as TPayload;
-    this.commands.push({ kind: 'waitSignal', seq, signal: token });
+    if (this.replayEntry(deadlineSeq, 'timer') !== null) {
+      throw new SignalTimeoutError(token, timeoutMs);
+    }
+    this.requireFeature('waitSignalTimeout', 'waitForSignal with timeoutMs');
+    this.commands.push({ kind: 'waitSignalTimeout', seq, deadlineSeq, signal: token, timeoutMs });
     throw new Suspend();
   }
 
@@ -750,22 +794,73 @@ export class WorkflowContext implements WorkflowCtx {
     return this.unsupported('signalEntity');
   }
 
-  /** UNSUPPORTED: continue-as-new is an engine lifecycle op (resets history, mints `<runId>~N`). */
-  async continueAsNew(_input?: unknown): Promise<never> {
-    return this.unsupported('continueAsNew');
+  /**
+   * End this run and hand off to a fresh execution (clean history) with `input` — `<runId>~N`, as
+   * in-process. Terminal: it always throws, so code after it is unreachable. Emits a `continueAsNew`
+   * command (feature `continueAsNew`) as the turn's last; the control plane completes this run and
+   * starts the continuation.
+   */
+  async continueAsNew(input?: unknown): Promise<never> {
+    this.raiseIfCancelled();
+    this.requireFeature('continueAsNew', 'continueAsNew');
+    this.commands.push({ kind: 'continueAsNew', seq: this.seq, input });
+    throw new ContinuedAsNew();
   }
 
-  /** UNSUPPORTED: absolute-deadline timers aren't expressible on the `sleep` (ms-duration) wire op. */
-  async sleepUntil(_when: Date | number): Promise<void> {
-    return this.unsupported('sleepUntil');
+  /**
+   * Durable sleep until an absolute deadline (`Date` or epoch ms): emits a `sleepUntil` command
+   * (feature `sleepUntil`) — one seq, recorded once, so a replay never moves the deadline.
+   */
+  async sleepUntil(when: Date | number): Promise<void> {
+    const seq = this.next('sleepUntil');
+    const { found } = this.replay(seq, 'timer');
+    if (found) return;
+    this.requireFeature('sleepUntil', 'sleepUntil');
+    this.commands.push({
+      kind: 'sleepUntil',
+      seq,
+      until: typeof when === 'number' ? when : when.getTime(),
+    });
+    throw new Suspend();
   }
 
-  /** UNSUPPORTED: named event pub/sub (`engine.publishEvent`) is an engine/store feature. */
+  /**
+   * Wait for a named event published with `engine.publishEvent(name, payload)` whose payload matches
+   * `opts.match` (buffered events included, tenant-scoped as in-process). Emits a `waitEvent` command
+   * (feature `waitEvent`). Bounded by `timeoutMs` like {@link waitForSignal}: two seqs, deadline first,
+   * and a lapsed deadline raises a {@link SignalTimeoutError} for `event:<name>`.
+   */
   async waitForEvent<TPayload>(
-    _name: string,
-    _opts?: { match?: Record<string, unknown>; timeoutMs?: number },
+    name: string,
+    opts?: { match?: Record<string, unknown>; timeoutMs?: number },
   ): Promise<TPayload> {
-    return this.unsupported('waitForEvent');
+    const match = opts?.match;
+    if (opts?.timeoutMs == null) {
+      const seq = this.next('waitForEvent');
+      const { found, output } = this.replay(seq, 'signal');
+      if (found) return output as TPayload;
+      this.requireFeature('waitEvent', 'waitForEvent');
+      this.commands.push({ kind: 'waitEvent', seq, name, ...(match ? { match } : {}) });
+      throw new Suspend();
+    }
+    const timeoutMs = opts.timeoutMs;
+    const deadlineSeq = this.next('waitForEvent');
+    const seq = this.next('waitForEvent');
+    const { found, output } = this.replay(seq, 'signal');
+    if (found) return output as TPayload;
+    if (this.replayEntry(deadlineSeq, 'timer') !== null) {
+      throw new SignalTimeoutError(`event:${name}`, timeoutMs);
+    }
+    this.requireFeature('waitEvent', 'waitForEvent');
+    this.commands.push({
+      kind: 'waitEvent',
+      seq,
+      name,
+      ...(match ? { match } : {}),
+      deadlineSeq,
+      timeoutMs,
+    });
+    throw new Suspend();
   }
 
   /** UNSUPPORTED: waiting on another run's settle is delivered by the engine from the store. */
@@ -787,9 +882,11 @@ export class WorkflowContext implements WorkflowCtx {
   }
 
   /**
-   * UNSUPPORTED: fire-and-forget child. The remote wire's `startChild` command is the AWAIT-a-child
-   * setup the engine resolves (see {@link child}); a non-suspending fire-forget that returns the
-   * child run id immediately isn't expressible remotely yet.
+   * Start a child workflow WITHOUT awaiting it and return its run id at once (the turn goes on).
+   * Emits a `spawnChild` command (feature `spawnChild`); the control plane starts the child once,
+   * idempotent by id, on the parent's partition and tenant, and journals `spawn:<childId>` here so a
+   * replay returns the same id. `options.childId` and `options.priority` apply; `version` and
+   * `parentClose` are not carried on the remote protocol yet and throw {@link UnsupportedOnThinWorker}.
    */
   startChild<C extends WorkflowClass>(
     workflow: C,
@@ -802,11 +899,29 @@ export class WorkflowContext implements WorkflowCtx {
     options?: string | ChildCallOptions,
   ): Promise<string>;
   async startChild(
-    _workflow: WorkflowRef,
-    _input: unknown,
-    _options?: string | ChildCallOptions,
+    workflow: WorkflowRef,
+    input: unknown,
+    options?: string | ChildCallOptions,
   ): Promise<string> {
-    return this.unsupported('startChild');
+    const opts: ChildCallOptions =
+      typeof options === 'string' ? { childId: options } : (options ?? {});
+    if (opts.version !== undefined) this.unsupported('startChild with version');
+    if (opts.parentClose !== undefined) this.unsupported('startChild with parentClose');
+    const name = workflowName(workflow);
+    const seq = this.next('startChild');
+    const childId = opts.childId ?? `${this.runId}.child.${seq}`;
+    const ev = this.replayEntry(seq, 'step', `spawn:${childId}`);
+    if (ev !== null) return (ev.output as string | undefined) ?? childId;
+    this.requireFeature('spawnChild', 'startChild');
+    this.commands.push({
+      kind: 'spawnChild',
+      seq,
+      workflow: name,
+      input,
+      childId,
+      ...(opts.priority !== undefined ? { priority: opts.priority } : {}),
+    });
+    return childId;
   }
 
   /** UNSUPPORTED: a breakpoint records a visible `pending` checkpoint the engine resumes. */
@@ -819,9 +934,25 @@ export class WorkflowContext implements WorkflowCtx {
     return this.unsupported('webhook');
   }
 
-  /** UNSUPPORTED: a queryable named value is read externally via `engine.getEvent` (store-backed). */
-  async setEvent<TValue>(_key: string, _value: TValue): Promise<void> {
-    return this.unsupported('setEvent');
+  /**
+   * Publish a queryable named value, read with `engine.getEvent(runId, key)`: recorded as the
+   * `event:<key>` step the in-process ctx writes (a `recordStep`, which every control plane applies,
+   * so this needs no feature). Replay-idempotent: a recorded position is skipped.
+   */
+  async setEvent<TValue>(key: string, value: TValue): Promise<void> {
+    const name = `event:${key}`;
+    const seq = this.next('setEvent');
+    const { found } = this.replay(seq, 'step', name);
+    if (found) return;
+    const at = Date.now();
+    this.commands.push({
+      kind: 'recordStep',
+      seq,
+      name,
+      output: value,
+      startedAt: at,
+      finishedAt: at,
+    });
   }
 
   /** UNSUPPORTED: update points are delivered + validated by the engine (`engine.update`). */

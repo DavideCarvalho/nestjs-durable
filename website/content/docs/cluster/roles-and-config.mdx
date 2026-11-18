@@ -300,6 +300,15 @@ basics behave as on a standalone app:
   dies holding the turn, the control plane sends the turn again once the deadline passes, to any live
   worker on the partition. `reconcileMs: 0` with `remoteAdvanceSilenceMs` unset keeps the old
   unbounded wait.
+- **Workflow code runs as it does standalone.** A `@Step({ retries, backoff, timeoutMs })` (or the
+  same options on `ctx.step`) is retried, backed off and timed out by the control plane with the
+  in-process rules, and `ctx.sleepUntil`, `ctx.waitForSignal(token, { timeoutMs })`,
+  `ctx.waitForEvent`, fire-and-forget `ctx.startChild`, `ctx.continueAsNew` and `ctx.setEvent` work
+  in tenant code. A child or continuation stays on the tenant's partition. See
+  [the worker ctx](/docs/cluster/js-worker#authoring-a-workflow-the-ctx) for the full list.
+- **Not yet in tenant code:** `ctx.patched`, `ctx.upsertSearchAttributes`, `ctx.waitForRun`,
+  `ctx.transaction`, entities, `ctx.task`, `ctx.breakpoint`, `ctx.webhook`, `ctx.onUpdate`, and
+  `startChild` with `version` or `parentClose`. Each throws `UnsupportedOnThinWorker` naming the op.
 
 ### Schedules on a tenant
 
@@ -394,6 +403,14 @@ Schedules follow it too. The announcement is an optional descriptor field.
 | --- | --- | --- |
 | this release | older | The old control plane ignores the field: the schedules do not fire, as before. Nothing breaks. |
 | older | this release | The old worker announces nothing, so nothing is adopted for it and nothing is withdrawn. While a rolling deploy runs old and new workers of one app side by side, the new workers' announcement is the one applied. |
+
+Workflow code follows feature negotiation: the control plane lists the decisions it applies on each
+workflow task it sends.
+
+| Tenant | Control plane | What happens to tenant workflow code |
+| --- | --- | --- |
+| this release | older | A step declared with retries, backoff or a timeout, and `sleepUntil`, a timed `waitForSignal`, `waitForEvent`, `startChild`, `continueAsNew`, fail the run with `error.code: 'control_plane_unsupported'` naming the op, instead of running without their semantics. Everything else runs as before. Upgrade the control plane first. |
+| older | this release | Unchanged: an older worker never sends the new decisions, and a step decision without a policy runs once, as before. |
 
 After a control plane answers that it does not know `getFanMembers` (or `getRun`), the proxy pages fans locally
 for the next minute before it asks again. The control plane can be several pods behind one queue,

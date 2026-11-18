@@ -96,6 +96,41 @@ export class Suspend extends Error {
 }
 
 /**
+ * Internal: `ctx.continueAsNew(input)` ended the turn. Like {@link Suspend} it is a control-flow
+ * signal a body's `catch` must rethrow untouched; `WorkflowWorker.processTask` turns it into a
+ * terminal decision whose last command is `continueAsNew`.
+ */
+export class ContinuedAsNew extends Error {
+  /** Marks this as a control-flow signal — see `isWorkflowControlFlowSignal` (durable-core). */
+  readonly [CONTROL_FLOW_SIGNAL] = true;
+  constructor() {
+    super('workflow continued as new');
+    this.name = 'ContinuedAsNew';
+  }
+}
+
+/**
+ * A `ctx` op needs a workflow-decision feature (see core's `REMOTE_WORKFLOW_FEATURES`) the control
+ * plane that dispatched this turn does not advertise — it runs an older `@dudousxd/nestjs-durable`.
+ * The op fails the turn with this error (code `control_plane_unsupported`) instead of emitting a
+ * command that control plane would reject or silently ignore. Upgrade the control plane.
+ */
+export class UnsupportedByControlPlane extends WorkflowError {
+  readonly code = 'control_plane_unsupported';
+  readonly op: string;
+  readonly feature: string;
+
+  constructor(op: string, feature: string) {
+    super(
+      `ctx.${op} needs the control plane to support the "${feature}" workflow command, and the control plane that dispatched this turn does not — upgrade @dudousxd/nestjs-durable on the control plane.`,
+    );
+    this.name = 'UnsupportedByControlPlane';
+    this.op = op;
+    this.feature = feature;
+  }
+}
+
+/**
  * Raised at an op boundary when the run was cancelled mid-turn (the control channel broadcast a
  * cancel for this run id). `processTask` maps it to a `cancelled` decision. Mirrors the Python
  * `Cancelled`. Deliberately NOT a control-flow signal — cancellation is a TERMINAL outcome a
@@ -113,9 +148,9 @@ export class Cancelled extends Error {
 }
 
 /**
- * A `WorkflowCtx` op was invoked on the thin worker that the remote wire protocol can't express
- * (it needs engine/store/transport features — transactions, entities, events, async tasks,
- * absolute timers, fire-and-forget children, breakpoints, webhooks, updates, patch markers). The
+ * A `WorkflowCtx` op was invoked on the thin worker that the remote wire protocol can't express yet
+ * (it needs engine/store/transport features — transactions, entities, async tasks, run waits,
+ * breakpoints, webhooks, updates, patch markers, search attributes). The
  * thin worker conforms to the full {@link WorkflowCtx} surface for portability, but these members
  * fail loudly instead of silently mis-behaving — run such a workflow in-process on the engine, or
  * rewrite it against a wire-expressible op. Mirrors the engine's "needs a real store" guards.
@@ -125,7 +160,7 @@ export class UnsupportedOnThinWorker extends WorkflowError {
 
   constructor(op: string) {
     super(
-      `ctx.${op}() is not supported on the thin worker — run this workflow in-process on the engine, or use a wire-expressible op.`,
+      `ctx.${op}() is not supported on the thin worker (a tenant or remote worker) yet — the remote workflow protocol has no command for it. Run this workflow in-process on the engine, or use a wire-expressible op.`,
     );
     this.name = 'UnsupportedOnThinWorker';
     this.op = op;

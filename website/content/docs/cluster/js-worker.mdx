@@ -104,26 +104,50 @@ The **wire-expressible** subset is supported:
 
 | Op | Meaning |
 | --- | --- |
-| `ctx.step(nameOrRef, input, opts?)` | Dispatch a durable step (routed by name, any language) and await it. Always engine-scheduled. |
+| `ctx.step(nameOrRef, input, opts?)` | Dispatch a durable step (routed by name, any language) and await it. Always engine-scheduled. Its `retries`/`backoff`/`timeoutMs` apply, see below. |
 | `ctx.sleep(duration)` | Durable timer (`'30s'`, `'2h'`, or ms) — the run suspends, the engine resumes it. |
-| `ctx.waitForSignal(token)` | Suspend until `engine.signal(token, payload)` arrives; returns the payload. |
+| `ctx.sleepUntil(when)` | Durable timer to an absolute `Date` or epoch ms. |
+| `ctx.waitForSignal(token, { timeoutMs? })` | Suspend until `engine.signal(token, payload)` arrives; returns the payload. With `timeoutMs`, throws `SignalTimeoutError` once the deadline passes, as in-process. |
+| `ctx.waitForEvent(name, { match?, timeoutMs? })` | Suspend until `engine.publishEvent(name, payload)` publishes a payload that matches (buffered events included). |
+| `ctx.waitForAny(name, conditions)` | Whichever signal, timer or child comes first. |
 | `ctx.child(workflow, input)` | Start a tracked child run and await its output. |
+| `ctx.startChild(workflow, input, opts?)` | Start a child run without awaiting it; returns its run id. `childId` and `priority` apply. |
 | `ctx.all(workflow, inputs)` | Start N children of the same workflow in parallel, await all. |
+| `ctx.continueAsNew(input)` | Complete this run and continue it as `<runId>~N` on a clean history. |
+| `ctx.setEvent(key, value)` | Publish a value `engine.getEvent(runId, key)` reads. |
 | `ctx.gather([[name, body], …])` | Run N local step bodies concurrently in one turn, await all (worker-only extension). |
 | `ctx.now()` / `ctx.sideEffect(fn)` | Deterministic capture — recorded once, replayed thereafter. |
 
-Everything else on `WorkflowCtx` — `transaction`, `callEntity`, `continueAsNew`, `sleepUntil`,
-`waitForEvent`, `task`, fire-and-forget `startChild`, `breakpoint`, `webhook`, `setEvent`, `onUpdate`,
-`patched` — needs engine/store/transport features the remote wire can't express, so each throws
-`UnsupportedOnThinWorker`. Run such a workflow **in-process on the engine** instead.
+Everything else on `WorkflowCtx` — `transaction`, `callEntity`, `signalEntity`, `waitForRun`, `task`,
+`breakpoint`, `webhook`, `onUpdate`, `patched`, `upsertSearchAttributes`, and `startChild` with a
+`version` or `parentClose` — has no command on the remote protocol yet, so each throws
+`UnsupportedOnThinWorker` naming the op. Run such a workflow **in-process on the engine** instead.
 
-<Callout type="warn" title="Retry/backoff/timeout policy isn't applied on the thin worker">
-`ctx.step` accepts `retries`/`backoff`/`timeoutMs` for `WorkflowCtx` conformance, but the `call`
-decision a thin worker emits has never carried that policy — durable retry/backoff and the
-remote-liveness timeout are **engine-side**, so a step dispatched from a thin-worker-authored workflow
-does not get them. A workflow body that depends on durable retry/backoff must run in-process on the
-engine. (The step's own `@Step({ retries })` policy still applies when the *engine* dispatches it.)
-</Callout>
+### Step policy
+
+`retries`, `backoff`, `backoffMs`, `backoffMaxMs`, `jitter` and `timeoutMs`, from the per-call
+`opts` or the `@Step({ ... })` declaration (the call wins field by field), travel on the step's
+`call` decision and the control plane applies them with the in-process rules:
+
+- without `timeoutMs`, a failed attempt is dispatched again after its backoff, up to `retries`
+  attempts in total, unless the handler marked the error non-retryable (`retryable: false`);
+- with `timeoutMs`, an attempt that returns no result within the window is dispatched again, up to
+  `retries` attempts, and then fails with `error.code: 'remote_step_timeout'`. A failure the handler
+  reports is final, as in-process.
+
+### Feature negotiation
+
+The newer decisions (`callPolicy`, `sleepUntil`, `waitSignalTimeout`, `waitEvent`, `spawnChild`,
+`continueAsNew`) are negotiated. A control plane lists the ones it applies on every workflow task it
+dispatches (`WorkflowTask.features`, exported as `REMOTE_WORKFLOW_FEATURES`). When a body reaches an
+op whose feature is missing (the control plane is older than the worker), the turn fails with
+`UnsupportedByControlPlane` (`error.code: 'control_plane_unsupported'`, naming the op and the
+feature) instead of sending a command that would be rejected or silently ignored. A step declared
+with a policy counts: on an older control plane it fails the turn rather than running without its
+retries. Upgrade the control plane first. An older worker against a newer control plane keeps
+working: it never sends the new commands, and a `call` without a policy behaves as before.
+
+`ctx.setEvent` needs no feature: it is recorded as an ordinary step every control plane applies.
 
 ## Concurrency: fixed or adaptive
 
