@@ -108,6 +108,67 @@ describe('DurableTelescopeWatcher on a control plane', () => {
     for (const r of records) expect(r.tags?.some((t) => t.startsWith('app:'))).toBe(false);
   });
 
+  describe("Telescope's tenant watchers", () => {
+    const RUNTIME = Symbol.for('@dudousxd/nestjs-telescope:runtime');
+    const slot = globalThis as Record<symbol, unknown>;
+    let saved: unknown;
+    beforeEach(() => {
+      saved = slot[RUNTIME];
+    });
+    afterEach(() => {
+      slot[RUNTIME] = saved;
+    });
+
+    it('a control plane names `durable` as a watcher it runs for its tenants, until unregistered', () => {
+      const tenantWatchers = new Map<string, number>();
+      slot[RUNTIME] = { tenantWatchers };
+      const watcher = new DurableTelescopeWatcher();
+      const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+      watcher.register(ctxFor(engine, [], { topology: 'control-plane' }));
+      expect([...tenantWatchers.keys()]).toEqual(['durable']);
+      // Registering again (a re-boot) does not hold it twice.
+      watcher.register(ctxFor(engine, [], { topology: 'control-plane' }));
+      expect(tenantWatchers.get('durable')).toBe(1);
+      watcher.unregister();
+      expect(tenantWatchers.has('durable')).toBe(false);
+    });
+
+    it('a runtime from a Telescope that predates the list gets one', () => {
+      const runtime: { tenantWatchers?: Map<string, number> } = {};
+      slot[RUNTIME] = runtime;
+      const watcher = new DurableTelescopeWatcher();
+      watcher.register(
+        ctxFor(new WorkflowEngine({ store: new InMemoryStateStore() }), [], {
+          topology: 'control-plane',
+        }),
+      );
+      expect(runtime.tenantWatchers?.has('durable')).toBe(true);
+      watcher.unregister();
+    });
+
+    it('standalone, or without Telescope in the process: nothing is named', () => {
+      const tenantWatchers = new Map<string, number>();
+      slot[RUNTIME] = { tenantWatchers };
+      const standalone = new DurableTelescopeWatcher();
+      standalone.register(
+        ctxFor(new WorkflowEngine({ store: new InMemoryStateStore() }), [], undefined),
+      );
+      expect(tenantWatchers.size).toBe(0);
+      standalone.unregister();
+
+      slot[RUNTIME] = undefined;
+      const alone = new DurableTelescopeWatcher();
+      expect(() =>
+        alone.register(
+          ctxFor(new WorkflowEngine({ store: new InMemoryStateStore() }), [], {
+            topology: 'control-plane',
+          }),
+        ),
+      ).not.toThrow();
+      alone.unregister();
+    });
+  });
+
   it('derives the same run trace id as core, so a tenant pod and the control plane join', () => {
     for (const id of ['r1', 'tenant-run', 'parent::fan:1']) {
       expect(runTraceId(id)).toBe(coreRunTraceId(id));

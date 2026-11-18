@@ -14,7 +14,7 @@ import {
 import type { Watcher, WatcherContext } from '@dudousxd/nestjs-telescope';
 import { SpanStatusCode, context, trace } from '@opentelemetry/api';
 import { durableExecutionScope } from './durable-execution-scope';
-import { runEventFamily } from './durable-run-family';
+import { runEventFamily, stepEventFamily } from './durable-run-family';
 import { runSpanContext, runTraceContext, runTraceId } from './durable-run-trace';
 
 /** An event another instance produced and the control plane re-delivered here (see the core's
@@ -71,6 +71,8 @@ export class DurableTelescopeWatcher implements Watcher {
   readonly type = 'durable';
   /** Removes the execution wrapper from the engine's process-level registry. */
   private disposeScope: (() => void) | undefined;
+  /** Takes `durable` off Telescope's tenant watchers again (a control plane only). */
+  private releaseTenantWatcher: (() => void) | undefined;
 
   register(ctx: WatcherContext): void {
     // Registered FIRST, and unconditionally: this is the half that works without a local engine. A
@@ -92,6 +94,10 @@ export class DurableTelescopeWatcher implements Watcher {
       engine.getRun(runId),
     );
     const stamper = attribution ? new RunAppStamper(attribution) : undefined;
+    // A control plane records every tenant's runs here, though no tenant instance reports this
+    // watcher: name it as one Telescope runs for its tenants, so the console counts it on.
+    this.releaseTenantWatcher?.();
+    this.releaseTenantWatcher = attribution ? registerTenantWatcher('durable') : undefined;
 
     engine.subscribe((event) => {
       // Every pod hears every event; the one that produced it records it.
@@ -107,12 +113,17 @@ export class DurableTelescopeWatcher implements Watcher {
     tracer: ReturnType<typeof trace.getTracer>,
     event: AttributedEngineEvent,
   ): void {
-    const family = runEventFamily(event.type);
+    const family =
+      runEventFamily(event.type) ?? stepEventFamily(event.type, event.name, event.kind);
+    // A step's outcome is timed as the entry's own duration, the column Telescope ranks by.
+    const durationMs =
+      family !== undefined && event.type.startsWith('step.') ? stepDurationOf(event) : undefined;
     const source = lifecycleSourceOfEvent(event);
     const record = () =>
       ctx.record({
         type: this.type,
         ...(family !== undefined ? { familyHash: family } : {}),
+        ...(durationMs !== undefined ? { durationMs } : {}),
         // Stated explicitly rather than left to the ambient span, and the Recorder honours an
         // explicit `traceId` above everything else. A lifecycle event is very often emitted
         // OUTSIDE any execution scope — a remote step's result lands in a transport callback, a
@@ -206,6 +217,8 @@ export class DurableTelescopeWatcher implements Watcher {
   unregister(): void {
     this.disposeScope?.();
     this.disposeScope = undefined;
+    this.releaseTenantWatcher?.();
+    this.releaseTenantWatcher = undefined;
   }
 
   private tags(event: AttributedEngineEvent): string[] {
@@ -218,7 +231,8 @@ export class DurableTelescopeWatcher implements Watcher {
     if (parent) tags.push(`parent:${parent}`);
     if (event.workflow) tags.push(`workflow:${event.workflow}`);
     if (event.kind) tags.push(`kind:${event.kind}`);
-    if (event.type === 'run.failed') tags.push('failed');
+    // A failed run, and a failed step: Telescope counts a step's failures by this tag.
+    if (event.type === 'run.failed' || event.type === 'step.failed') tags.push('failed');
     if (event.type === 'run.routed' || event.type === 'run.unrouted') {
       tags.push(event.type === 'run.routed' ? 'routed' : 'unrouted');
       tags.push(`onError:${event.error?.code ?? '*'}`);
@@ -238,6 +252,43 @@ export class DurableTelescopeWatcher implements Watcher {
     }
     return tags;
   }
+}
+
+/** A step outcome's measured duration, whole and non-negative, or `undefined` when unmeasured. */
+function stepDurationOf(event: EngineEvent): number | undefined {
+  const measured = event.durationMs;
+  return typeof measured === 'number' && Number.isFinite(measured)
+    ? Math.max(0, Math.round(measured))
+    : undefined;
+}
+
+/** Telescope's runtime slot (`@dudousxd/nestjs-telescope`), shared by every copy in the process. */
+const TELESCOPE_RUNTIME = Symbol.for('@dudousxd/nestjs-telescope:runtime');
+
+/**
+ * Name `name` among the watchers Telescope runs for its tenants (`tenantWatchers` in its runtime
+ * slot, counted per holder; `@dudousxd/nestjs-telescope` 5.15.0+ reads it). A no-op without a
+ * Telescope runtime in the process; an older Telescope never reads the list.
+ * Returns the idempotent release.
+ */
+function registerTenantWatcher(name: string): () => void {
+  const runtime = (globalThis as Record<symbol, unknown>)[TELESCOPE_RUNTIME] as
+    | { tenantWatchers?: unknown }
+    | undefined;
+  if (runtime === undefined) return () => {};
+  // A runtime another copy created before the list existed: an older Telescope never reads it.
+  runtime.tenantWatchers ??= new Map<string, number>();
+  if (!(runtime.tenantWatchers instanceof Map)) return () => {};
+  const counts = runtime.tenantWatchers as Map<string, number>;
+  counts.set(name, (counts.get(name) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const count = (counts.get(name) ?? 1) - 1;
+    if (count <= 0) counts.delete(name);
+    else counts.set(name, count);
+  };
 }
 
 /** The run whose settling started `event`'s run, for its `run.started`; undefined otherwise. */

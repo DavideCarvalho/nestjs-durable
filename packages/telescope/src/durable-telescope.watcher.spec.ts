@@ -66,7 +66,7 @@ describe('DurableTelescopeWatcher', () => {
     expect(records[0]?.tags).toContain('run:run1');
   });
 
-  it('gives run events a family the Workflows panels can read by, and step events none', async () => {
+  it("gives run events a family the Workflows panels can read by, and a step's outcome its own", async () => {
     const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
     const records: RecordInput[] = [];
     new DurableTelescopeWatcher().register(fakeCtx(engine, records));
@@ -81,9 +81,45 @@ describe('DurableTelescopeWatcher', () => {
     expect(records.map((r) => r.familyHash)).toEqual([
       'durable:run.started',
       undefined,
-      undefined,
+      'durable:step:charge',
       'durable:run.completed',
     ]);
+  });
+
+  it("times a step's outcome as the entry's duration, and tags a failed step `failed`", async () => {
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+    const records: RecordInput[] = [];
+    new DurableTelescopeWatcher().register(fakeCtx(engine, records));
+
+    engine.register('checkout', '1', async (ctx) => {
+      await ctx.localStep('charge', async () => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return 1;
+      });
+      await ctx.localStep('ship', async () => {
+        throw new FatalError('no address', 'no_address');
+      });
+      return 'ok';
+    });
+    await engine.start('checkout', {}, 'run1');
+    await engine.waitForRun('run1', { until: 'terminal' });
+
+    const byEvent = (event: string) =>
+      records.find((r) => (r.content as { event: string }).event === event);
+    const completed = byEvent('step.completed');
+    expect(completed?.familyHash).toBe('durable:step:charge');
+    expect(completed?.durationMs).toBeGreaterThanOrEqual(4);
+    expect(Number.isInteger(completed?.durationMs)).toBe(true);
+    expect(completed?.tags).not.toContain('failed');
+
+    const failed = byEvent('step.failed');
+    expect(failed?.familyHash).toBe('durable:step:ship');
+    expect(typeof failed?.durationMs).toBe('number');
+    expect(failed?.tags).toContain('failed');
+
+    // Untimed events keep no duration.
+    expect(byEvent('step.started')?.durationMs).toBeUndefined();
+    expect(byEvent('run.started')?.durationMs).toBeUndefined();
   });
 
   it('stamps every entry with the run trace, so a whole run is one trace', async () => {
