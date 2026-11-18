@@ -83,6 +83,10 @@ export class ApprovalController {
   filtering; `workflows.publishEvent(name, payload)` fans out to every run whose `match` the payload
   satisfies (and starts any `@OnDurableEvent` workflows whose `where` accepts the payload, with
   `input(payload)` as the run's input when the entry maps it). Returns how many runs it touched.
+  On a tenant (`connection`, no `store`) the fan-out is scoped to the tenant's partition — it starts
+  the app's own subscribers and resumes the partition's waiting runs, never buffers, and does not
+  apply `debounce`/`batch` (a coalescing subscriber starts once per event with a warning). Source:
+  packages/nestjs/src/durable-start-client.ts (`publishEvent`).
 
 ```ts
 const order = await ctx.waitForEvent<Order>('order.paid', { match: { orderId: id } });
@@ -131,7 +135,9 @@ const result = await wh.wait();                                  // resumes on t
 ### signalWithStart — the accumulator pattern
 
 `signalWithStart` ensures a run exists, then delivers a signal race-free — one long-lived run per key
-fed by many calls.
+fed by many calls. On a tenant (`connection`, no `store`) it is a control-plane run request scoped
+to the tenant's partition, and the signal is buffered only when the token contains the run id.
+Source: packages/nestjs/src/durable-start-client.ts (`signalWithStart`).
 
 ```ts
 await this.workflows.signalWithStart(
@@ -195,5 +201,8 @@ await this.workflows.signal(`approve:${order.id}`, body);
 ```
 
 `signal(token, payload)` resolves only the run waiting on that exact token; a mismatched token is
-buffered and the run never wakes. Source: packages/nestjs/src/workflow.service.ts (`signal`),
-packages/core/src/workflow-ctx.ts (`waitForSignal`).
+buffered and the run never wakes — except on a tenant (`connection`, no `store`), where the signal
+is a control-plane run request scoped to the tenant's partition: an unmatched signal resolves `null`
+and is never buffered. Source: packages/nestjs/src/workflow.service.ts (`signal`),
+packages/nestjs/src/proxy-run-gateway.ts (`signal`), packages/nestjs/src/durable-start-client.ts
+(`signal`), packages/core/src/workflow-ctx.ts (`waitForSignal`).
