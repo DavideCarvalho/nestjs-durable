@@ -1,6 +1,6 @@
 [project]
 name = "durable-worker"
-version = "0.27.0"
+version = "0.28.0"
 description = "Python worker SDK for nestjs-durable — run durable workflow steps in Python."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -24,15 +24,12 @@ Repository = "https://github.com/DavideCarvalho/nestjs-durable"
 Issues = "https://github.com/DavideCarvalho/nestjs-durable/issues"
 
 [project.optional-dependencies]
-# bullmq 2.18+ hard-pin the vulnerable msgpack==1.1.2 (GHSA-6v7p-g79w-8964,
-# use-after-free in the Unpacker, fixed in 1.2.1). bullmq 2.17.0 keeps a loose
-# `msgpack<2,>=1.0.0`, so capping bullmq <2.18 and requiring msgpack>=1.2.1 lets
-# pip resolve cleanly to the patched msgpack. We only use the stable
-# Queue/Worker/.add API, which is unchanged across 2.17.x. Lift the cap once
-# bullmq relaxes its exact msgpack pin upstream.
-redis = ["bullmq==2.17.0", "msgpack==1.2.2"]
-sqs = ["boto3==1.43.92"]
-postgres = ["asyncpg==0.31.0"]
+# bullmq pins its own msgpack and redis exactly. 3.6.2 pins msgpack==1.2.4, which has the fixes for
+# GHSA-6v7p-g79w-8964 and CVE-2026-114613, so consumers no longer need a msgpack override. The
+# msgpack pin here matches bullmq's; move both together.
+redis = ["bullmq==3.6.2", "msgpack==1.2.4"]
+sqs = ["boto3==1.44.5"]
+postgres = ["asyncpg==0.32.0"]
 mysql = ["aiomysql==0.3.2"]
 
 [build-system]

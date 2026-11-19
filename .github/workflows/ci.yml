@@ -136,9 +136,8 @@ jobs:
       matrix:
         # The version release-python.yml builds the wheel on, and the version the first
         # consumer (FLIP's flip-flask image) actually runs. `requires-python` says >=3.9, but
-        # the [redis] extra cannot resolve there: bullmq is capped <2.18 for the patched-msgpack
-        # reason in pyproject.toml, and no such bullmq supports 3.9. Testing a floor that cannot
-        # install the transport would just be a red job.
+        # the [redis] extra cannot resolve there: bullmq 3 requires Python >=3.10. Testing a floor
+        # that cannot install the transport would just be a red job.
         python-version: ["3.12", "3.14"]
     steps:
       - uses: actions/checkout@v7.0.1
