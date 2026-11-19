@@ -18,7 +18,6 @@ import socket
 import time
 from typing import Any, Callable, Dict, Optional
 
-from . import _bullmq_speedups
 from .adaptive import AdaptiveController, resolve_concurrency
 from .cancellation import CancellationRegistry
 from .result_publisher import ResultPublisher
@@ -390,8 +389,6 @@ async def run_redis_workflow_worker(
     from bullmq import Queue as BullQueue
     from bullmq import Worker as BullWorker
 
-    _bullmq_speedups.install()
-
     await _verify_connection(connection)
 
     # Fold the namespace into the prefix ONCE, then thread the effective prefix everywhere a name is
@@ -689,8 +686,6 @@ async def run_redis_worker(
 
     from bullmq import Queue as BullQueue  # imported lazily so the SDK works without bullmq
     from bullmq import Worker as BullWorker
-
-    _bullmq_speedups.install()
 
     await _verify_connection(connection)
 
