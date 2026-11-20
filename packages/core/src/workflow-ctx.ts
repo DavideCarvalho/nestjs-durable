@@ -1,6 +1,6 @@
 import { currentStepScope, runInStepScope } from './ambient-ctx';
 import { runInStepLogger } from './ambient-step';
-import { backoffDelay } from './backoff';
+import { retryLocalStep } from './backoff';
 import { instantCheckpoint } from './checkpoints';
 import { type Completion, childCompletion, completionError, unwrapCompletion } from './completion';
 import { parseDuration } from './duration';
@@ -317,7 +317,6 @@ export function createWorkflowCtx(
       if (options?.compensate) compensations.push({ name, fn: options.compensate });
       return existing.output as T;
     }
-    const maxAttempts = Math.max(1, options?.retries ?? 1);
     const startedAt = new Date();
     // Announce the body has begun (and, when enabled, checkpoint it `running`) so the step is
     // visible in flight — not only once it settles. Skipped on replay: a completed step returns
@@ -331,65 +330,61 @@ export function createWorkflowCtx(
       enqueuedAt: startedAt,
       startedAt,
     });
-    for (let attempt = 1; ; attempt += 1) {
-      // Events are scoped per attempt — a retry starts a clean log, so the checkpoint reflects
-      // only the attempt that actually completed (or the final failing one).
-      const events: StepEvent[] = [];
-      try {
-        const invocation: StepInvocation = {
-          runId,
-          workflow,
-          stepName: name,
-          seq: current,
-          attempt,
-        };
-        // The SAME logger goes to the body's argument and into the ambient storage, so code deep
-        // inside the step emits into this attempt's `events` without the handle being threaded
-        // down through every signature (see `ambient-step.ts`).
-        const body = () => {
-          const logger = createStepLogger(events, host.clock);
-          return runInStepScope(scopeOwner, name, () => runInStepLogger(logger, () => fn(logger)));
-        };
-        const output = host.interceptStep
-          ? await host.interceptStep(invocation, body)
-          : await body();
-        await host.completeStep({
-          runId,
-          seq: current,
-          name,
-          kind: 'local',
-          output,
-          events,
-          attempts: attempt,
-          enqueuedAt: startedAt,
-          startedAt,
-        });
-        if (options?.compensate) compensations.push({ name, fn: options.compensate });
-        return output;
-      } catch (err) {
-        if (err instanceof FatalError || attempt >= maxAttempts) {
-          await host.failStep({
-            runId,
-            seq: current,
-            name,
-            kind: 'local',
-            error: {
-              message: err instanceof Error ? err.message : String(err),
-              stack: err instanceof Error ? err.stack : undefined,
-              ...codeAndDetails(err),
-            },
-            events,
-            attempts: attempt,
-            enqueuedAt: startedAt,
-            startedAt,
-          });
-          throw err;
-        }
-        // Wait out the backoff before the next attempt (no-op when backoffMs is unset).
-        const wait = backoffDelay(attempt, options);
-        if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
-      }
+    // Events are scoped per attempt — a retry starts a clean log, so the checkpoint reflects only
+    // the attempt that actually completed (or the final failing one).
+    let events: StepEvent[] = [];
+    const outcome = await retryLocalStep(options, async (attempt) => {
+      const attemptEvents: StepEvent[] = [];
+      events = attemptEvents;
+      const invocation: StepInvocation = {
+        runId,
+        workflow,
+        stepName: name,
+        seq: current,
+        attempt,
+      };
+      // The SAME logger goes to the body's argument and into the ambient storage, so code deep
+      // inside the step emits into this attempt's `events` without the handle being threaded
+      // down through every signature (see `ambient-step.ts`).
+      const body = () => {
+        const logger = createStepLogger(attemptEvents, host.clock);
+        return runInStepScope(scopeOwner, name, () => runInStepLogger(logger, () => fn(logger)));
+      };
+      const output = host.interceptStep ? await host.interceptStep(invocation, body) : await body();
+      await host.completeStep({
+        runId,
+        seq: current,
+        name,
+        kind: 'local',
+        output,
+        events: attemptEvents,
+        attempts: attempt,
+        enqueuedAt: startedAt,
+        startedAt,
+      });
+      return output;
+    });
+    if (outcome.ok) {
+      if (options?.compensate) compensations.push({ name, fn: options.compensate });
+      return outcome.value;
     }
+    const err = outcome.error;
+    await host.failStep({
+      runId,
+      seq: current,
+      name,
+      kind: 'local',
+      error: {
+        message: err instanceof Error ? err.message : String(err),
+        stack: err instanceof Error ? err.stack : undefined,
+        ...codeAndDetails(err),
+      },
+      events,
+      attempts: outcome.attempts,
+      enqueuedAt: startedAt,
+      startedAt,
+    });
+    throw err;
   };
 
   // Exactly-once DB step: run the body and write the step checkpoint in ONE store transaction, so the

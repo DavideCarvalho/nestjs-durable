@@ -25,7 +25,14 @@ export interface ProcessTaskOptions {
 export class WorkflowWorker {
   private readonly workflows = new Map<string, WorkflowFn>();
 
-  constructor(readonly group = 'workflows') {}
+  /**
+   * `options.compensationRetries` is how many times each `localStep` `compensate` is tried when a
+   * failed turn unwinds its saga, as the engine's own `compensationRetries` (default 1).
+   */
+  constructor(
+    readonly group = 'workflows',
+    private readonly options: { compensationRetries?: number } = {},
+  ) {}
 
   /** Register `fn` as the workflow `name`. `fn(ctx, input)` (or `fn(ctx)`). */
   register(name: string, fn: WorkflowFn): this {
@@ -95,6 +102,7 @@ export class WorkflowWorker {
       onStep: opts.onStep,
       isCancelled: opts.isCancelled,
       features: task.features,
+      compensationRetries: this.options.compensationRetries,
     });
 
     try {
@@ -115,10 +123,12 @@ export class WorkflowWorker {
         // record partial progress; the engine already set status=cancelled.
         return { ...base, status: 'cancelled', commands: ctx.commands };
       }
-      if (err instanceof StepFailed) {
-        return { ...base, status: 'failed', commands: ctx.commands, error: err.error };
-      }
-      return { ...base, status: 'failed', commands: ctx.commands, error: toError(err) };
+      const error = err instanceof StepFailed ? err.error : toError(err);
+      // Saga: undo the completed local steps in reverse before reporting the failure, as the engine
+      // does in-process. The undo outcomes ride this decision as `compensate:<step>` records; the
+      // run's error stays the original failure.
+      await ctx.runCompensations();
+      return { ...base, status: 'failed', commands: ctx.commands, error };
     }
   }
 }

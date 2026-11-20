@@ -53,6 +53,7 @@ export {
   remoteCallPolicyOf,
   remoteCallRetries,
 } from './remote-call-policy';
+export { type LocalStepOutcome, retryLocalStep } from './backoff';
 export { createStepLogger } from './step-logger';
 export {
   DURABLE_STEP_CONFIG,

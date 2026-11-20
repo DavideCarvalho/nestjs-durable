@@ -108,6 +108,10 @@ compensation stack, exactly as it was the first time. That's what makes it crash
 level: after a mid-run crash, the resumed execution reconstructs the full stack of undos for every step that
 had actually completed, not just the ones this pass happened to run.
 
+A workflow whose turns are dispatched to a worker gets the same: the worker registers the closure the
+same way, and when a turn fails it runs the undos in reverse before reporting the failure, recording each
+as `compensate:<step>` (see [the JS worker's local step policy](/docs/cluster/js-worker#local-step-policy)).
+
 Its unwind is checkpointed too, the same as the dispatched form's: a crash mid-unwind no longer re-runs a
 local undo that already completed, and doesn't restart its retry budget from attempt 1 — the checkpoint at
 its negative seq is what a later re-drive checks before running it again.

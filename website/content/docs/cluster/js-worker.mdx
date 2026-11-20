@@ -117,6 +117,7 @@ The **wire-expressible** subset is supported:
 | `ctx.setEvent(key, value)` | Publish a value `engine.getEvent(runId, key)` reads. |
 | `ctx.gather([[name, body], …])` | Run N local step bodies concurrently in one turn, await all (worker-only extension). |
 | `ctx.now()` / `ctx.sideEffect(fn)` | Deterministic capture — recorded once, replayed thereafter. |
+| `ctx.localStep(name, fn, options?)` | Run `fn` on the worker and record its result once. `retries`, the backoff and `compensate` apply as in-process, see below. |
 
 Everything else on `WorkflowCtx` — `transaction`, `callEntity`, `signalEntity`, `waitForRun`, `task`,
 `breakpoint`, `webhook`, `onUpdate`, `patched`, `upsertSearchAttributes`, and `startChild` with a
@@ -134,6 +135,25 @@ Everything else on `WorkflowCtx` — `transaction`, `callEntity`, `signalEntity`
 - with `timeoutMs`, an attempt that returns no result within the window is dispatched again, up to
   `retries` attempts, and then fails with `error.code: 'remote_step_timeout'`. A failure the handler
   reports is final, as in-process.
+
+### Local step policy
+
+`ctx.localStep`'s `options` apply on the worker with the in-process rules, through the same retry
+loop the engine runs:
+
+- `retries` is the total number of attempts. A failed attempt waits its backoff (`backoff`,
+  `backoffMs`, `backoffMaxMs`, `jitter`) and runs again; a `FatalError` is never retried.
+- When the attempts run out, the step is recorded failed with the last attempt's error, its `code`
+  and `details` intact and the checkpoint's `attempts` set, and the run fails with that error.
+- The wait between attempts is an in-process sleep inside the turn, as it is in-process, not a
+  durable timer: a worker that dies mid-backoff has its turn replayed, and the step starts again from
+  attempt 1. Keep local-step backoffs short; a long wait belongs on a dispatched `ctx.step`.
+- A `compensate` closure is registered when its step completes, and again whenever a later turn
+  replays it. When a turn fails, the worker runs the registered undos in reverse before it reports
+  the failure, each tried up to `compensationRetries` times (a `DurableWorkerRuntime` and
+  `WorkflowWorker` option, default `1`), and records each as a `compensate:<step>` step, as the
+  engine does. A failing undo is recorded and skipped; the run keeps its original error. A cancelled
+  run does not unwind local compensations on the worker.
 
 ### Feature negotiation
 
