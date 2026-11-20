@@ -92,7 +92,7 @@ describe.each([
   ['dispatched to the workflow worker', true],
   ['inline', false],
 ])('requeue of a run failed by an exhausted step (%s)', (_label, dispatched) => {
-  it('re-runs the failed step and completes, without re-running the steps before it', async () => {
+  it('re-runs a failed step with a retry policy, without re-running the steps before it', async () => {
     let now = 1_000_000;
     const a = app(dispatched, () => now);
     let firstRuns = 0;
@@ -268,5 +268,57 @@ describe.each([
     expect(done.status).toBe('completed');
     expect(done.output).toBe('parent saw child-ok');
     expect(runs).toBe(2);
+  });
+  it('does not run a failed compensation again after requeue', async () => {
+    let now = 6_000_000;
+    const a = app(dispatched, () => now);
+    let undoRuns = 0;
+    a.serve('undo-fails', async (ctx) => {
+      await ctx.localStep('book', async () => 'booked', {
+        compensate: async () => {
+          undoRuns += 1;
+          throw new Error('undo failed');
+        },
+      });
+      return ctx.localStep('charge', async () => {
+        throw new Error('card declined');
+      });
+    });
+
+    await a.engine.start('undo-fails', {}, 'u1');
+    expect((await settle(a.store, 'u1')).status).toBe('failed');
+    expect(undoRuns).toBe(1);
+
+    now += 1;
+    await a.engine.requeue('u1');
+    expect((await settle(a.store, 'u1')).status).toBe('failed');
+    expect(undoRuns).toBe(1);
+  });
+
+  it('gives a requeued local step its full retry budget again', async () => {
+    let now = 7_000_000;
+    const a = app(dispatched, () => now);
+    let runs = 0;
+    a.serve('budget', async (ctx) =>
+      ctx.localStep(
+        'flaky',
+        async () => {
+          runs += 1;
+          throw new Error('down');
+        },
+        { retries: 3, backoffMs: 1 },
+      ),
+    );
+
+    await a.engine.start('budget', {}, 'b1');
+    expect((await settle(a.store, 'b1')).status).toBe('failed');
+    expect(runs).toBe(3);
+
+    now += 1;
+    await a.engine.requeue('b1');
+    expect((await settle(a.store, 'b1')).status).toBe('failed');
+    expect(runs).toBe(6);
+    const cp = (await a.store.listCheckpoints('b1')).find((c) => c.seq === 0);
+    expect(cp?.attempts).toBe(3);
   });
 });

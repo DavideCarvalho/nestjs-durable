@@ -365,18 +365,22 @@ export interface SingletonConfig<TInput = unknown> {
   maxQueueDepth?: number;
 }
 
-/** Union of a workflow's static tags and a run's start-time tags, de-duplicated, or undefined if none. */
 /**
  * A step failure `requeue` reset for another try: `requeue` sets a failed checkpoint's `attempts` to
  * 0, which no attempt that actually ran records. Only steps (`local`, `remote`) are matched; a
- * child's failure resets through its `signal:child:` placeholder instead.
+ * child's failure resets through its `signal:child:` placeholder instead. A failed compensation
+ * (negative seq) stays in the history, so the worker does not run that undo again, as inline does not.
  */
 function isRequeuedStepFailure(cp: StepCheckpoint): boolean {
   return (
-    cp.status === 'failed' && cp.attempts === 0 && (cp.kind === 'local' || cp.kind === 'remote')
+    cp.status === 'failed' &&
+    cp.attempts === 0 &&
+    cp.seq >= 0 &&
+    (cp.kind === 'local' || cp.kind === 'remote')
   );
 }
 
+/** Union of a workflow's static tags and a run's start-time tags, de-duplicated, or undefined if none. */
 function mergeTags(staticTags?: string[], runTags?: string[]): string[] | undefined {
   if (!staticTags?.length && !runTags?.length) return undefined;
   return [...new Set([...(staticTags ?? []), ...(runTags ?? [])])];
