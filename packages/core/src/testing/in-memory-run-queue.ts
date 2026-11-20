@@ -69,6 +69,8 @@ export class InMemoryRunQueue {
       if (waiting) {
         // A wake for a waiting start makes it a wake: a wake also runs a `pending` run.
         if (run.reason === 'wake') waiting.reason = 'wake';
+        // A merged wake is for whatever both were for: only a turn both name stays.
+        if (waiting.awaiting !== run.awaiting) waiting.awaiting = undefined;
         continue;
       }
       const entry = { ...run };

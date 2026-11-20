@@ -31,6 +31,7 @@ import {
   type WorkflowRegistration,
   type WorkflowStepEvent,
   type WorkflowTask,
+  type WorkflowTaskState,
   describeWorker,
   descriptorHash,
   negotiate,
@@ -49,6 +50,7 @@ import {
   WorkerRegistry,
   type WorkerRegistryOptions,
 } from './worker-registry';
+import { workflowTaskJobId } from './workflow-task-job-id';
 
 export type { WorkerRegistryOptions } from './worker-registry';
 
@@ -1067,11 +1069,29 @@ export class BullMQTransport implements Transport, ControlPlane {
    *  on `<prefix>-decisions`. */
   async dispatchWorkflowTask(task: WorkflowTask): Promise<void> {
     this.#assertRoutableToken(task.group);
-    await this.queue(this.tasksName(task.group)).add(
-      'workflow',
-      task,
-      this.jobOptions(task.priority),
-    );
+    await this.queue(this.tasksName(task.group)).add('workflow', task, {
+      ...this.jobOptions(task.priority),
+      // Keyed by the turn, so `workflowTaskState` can find the job again.
+      jobId: workflowTaskJobId(task.taskId),
+    });
+  }
+
+  /**
+   * Where BullMQ has the workflow task `taskId` dispatched on `group`: `'queued'` while it waits and
+   * no worker ever started it, `'taken'` once one did (active, or stalled back to the queue for
+   * redelivery), `'unknown'` once the job is gone (finished, failed, or never added here).
+   */
+  async workflowTaskState(group: string, taskId: string): Promise<WorkflowTaskState> {
+    this.#assertRoutableToken(group);
+    const job = await this.queue(this.tasksName(group)).getJob(workflowTaskJobId(taskId));
+    if (!job) return 'unknown';
+    const started =
+      job.processedOn != null || (job.attemptsStarted ?? 0) > 0 || (job.stalledCounter ?? 0) > 0;
+    if (started) return 'taken';
+    const state = await job.getState();
+    return state === 'waiting' || state === 'prioritized' || state === 'delayed'
+      ? 'queued'
+      : 'unknown';
   }
 
   /**

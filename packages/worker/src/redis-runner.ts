@@ -88,6 +88,11 @@ export function startRunHeartbeat(
 // and run the workflow twice. This is the lesson from Track A (the transport-side stall+redeliver).
 const DEFAULT_LOCK_DURATION_MS = 5 * 60_000;
 
+/** A positive finite millisecond value, or `undefined` for anything else (unset, 0, NaN, negative). */
+function positiveMs(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
 /** ioredis `ConnectionOptions` (or an IORedis instance), the same shape `BullMQTransport` accepts. */
 // We avoid a static import of ioredis/bullmq types so this file type-checks without those optional
 // peers installed; `unknown` is widened at the boundary and the lazy import provides the real ctor.
@@ -122,8 +127,24 @@ export interface RunRedisWorkerOptions {
    * reads the hash.
    */
   workerRegistry?: WorkerRegistryWriteOptions;
-  /** Override the Worker's job-lock duration (ms). Defaults to 5 min — see {@link DEFAULT_LOCK_DURATION_MS}. */
+  /**
+   * Override the Worker's job-lock duration (ms, BullMQ `lockDuration`). Defaults to 5 min — see
+   * {@link DEFAULT_LOCK_DURATION_MS}. It is also how long a task held by a worker that died waits
+   * before BullMQ can redeliver it, so a shorter lock recovers a crashed worker's task sooner; keep
+   * it well above the longest event-loop stall a healthy turn can cause, or a live turn is redelivered.
+   * Ignored unless a positive finite number.
+   */
   lockDuration?: number;
+  /**
+   * How often (ms) each Worker checks its queue for stalled jobs (BullMQ `stalledInterval`). Omitted:
+   * BullMQ's own default (30 s). Ignored unless a positive finite number.
+   */
+  stalledInterval?: number;
+  /**
+   * How many times a job may stall before BullMQ fails it for good (BullMQ `maxStalledCount`).
+   * Omitted: BullMQ's own default (1). Ignored unless a non-negative integer.
+   */
+  maxStalledCount?: number;
   /**
    * How many tasks this worker runs concurrently PER SUBSCRIBED QUEUE (BullMQ Worker concurrency —
    * the same limit is applied to every per-name `Worker` this runner starts). Defaults to 1. Raise
@@ -297,7 +318,13 @@ export function buildRunnerDescriptor(
 export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<RunningWorker> {
   const prefix = options.prefix ?? DEFAULT_PREFIX;
   const instanceId = options.instanceId ?? `ts-${hostname()}-${process.pid}`;
-  const lockDuration = options.lockDuration ?? DEFAULT_LOCK_DURATION_MS;
+  const lockDuration = positiveMs(options.lockDuration) ?? DEFAULT_LOCK_DURATION_MS;
+  // Stall settings reach the Worker only when given, so BullMQ's own defaults stay the default.
+  const stalledInterval = positiveMs(options.stalledInterval);
+  const maxStalledCount =
+    Number.isInteger(options.maxStalledCount) && (options.maxStalledCount as number) >= 0
+      ? (options.maxStalledCount as number)
+      : undefined;
   const deps = options.deps ?? (await loadDeps());
   const { runtime, partition } = options;
   // A `redis://` string becomes options: BullMQ would read a bare string as 127.0.0.1:6379.
@@ -389,6 +416,8 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       new deps.Worker(tasksName(prefix, token), processJob, {
         connection: workerConnection(connection),
         lockDuration,
+        ...(stalledInterval !== undefined ? { stalledInterval } : {}),
+        ...(maxStalledCount !== undefined ? { maxStalledCount } : {}),
         concurrency: controller.initialLimit,
       }),
   );

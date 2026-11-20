@@ -279,6 +279,13 @@ export class ThinWorkerBootstrap implements OnApplicationBootstrap, OnApplicatio
       ...(options.prefix !== undefined ? { prefix: options.prefix } : {}),
       ...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
       ...(options.concurrency !== undefined ? { concurrency: options.concurrency } : {}),
+      ...(options.lockDuration !== undefined ? { lockDuration: options.lockDuration } : {}),
+      ...(options.stalledInterval !== undefined
+        ? { stalledInterval: options.stalledInterval }
+        : {}),
+      ...(options.maxStalledCount !== undefined
+        ? { maxStalledCount: options.maxStalledCount }
+        : {}),
       // Announce the app's schedules (an empty list too) so the control plane adopts, updates and
       // withdraws them: a tenant has no store to fire them from.
       ...(await tenantScheduleAnnouncement(options, this.auth.tenantToken)),

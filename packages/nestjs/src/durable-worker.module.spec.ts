@@ -411,6 +411,33 @@ describe('DurableModule.forRoot({ connection }) — pure thin worker', () => {
     await moduleRef.close();
   });
 
+  it('passes lockDuration, stalledInterval and maxStalledCount to the runner', async () => {
+    const runner = fakeRunner();
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableModule.forRoot({
+          connection: 'redis://x',
+          lockDuration: 30_000,
+          stalledInterval: 10_000,
+          maxStalledCount: 2,
+        }),
+      ],
+      providers: [WWorkflow],
+    })
+      .overrideProvider(RUN_REDIS_WORKER)
+      .useValue(runner.runRedisWorker)
+      .compile();
+    await moduleRef.init();
+
+    expect(runner.calls).toHaveLength(1);
+    expect(runner.calls[0]).toMatchObject({
+      lockDuration: 30_000,
+      stalledInterval: 10_000,
+      maxStalledCount: 2,
+    });
+    await moduleRef.close();
+  });
+
   it('with no partition, the single call carries none', async () => {
     const runner = fakeRunner();
     const moduleRef = await Test.createTestingModule({
