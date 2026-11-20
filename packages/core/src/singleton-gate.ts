@@ -1,10 +1,11 @@
 import type { SingletonConfig } from './engine';
-import { SingletonQueueFullError } from './errors';
+import { SchemaValidationError, SingletonQueueFullError } from './errors';
 import type { StateStore, WorkflowRun } from './interfaces';
 import {
   SINGLETON_ACTIVE_STATUSES,
   SINGLETON_ADMITTED_TAG,
   SINGLETON_TRACKED_TAG,
+  singletonKeyTag,
 } from './singleton-admission';
 
 const SINGLETON_RETRY_MS = 1000;
@@ -57,12 +58,19 @@ export interface SingletonGateDeps {
   configFor: (run: WorkflowRun) => SingletonConfig | undefined;
 }
 
-const UNPARSEABLE: unique symbol = Symbol('unparseable');
+/**
+ * What {@link SingletonGate.admit} answers for a turn whose stored input no longer parses: the parse
+ * error as a {@link SchemaValidationError} coded `invalid_input`. The engine fails the turn with it
+ * before the body runs, so no user code runs without a slot.
+ */
+export class UnparseableStoredInput {
+  constructor(readonly error: SchemaValidationError) {}
+}
 
 /**
  * The input a turn's singleton key reads: the stored input as sent without `parseInput`, as it
- * always was; with it, the parsed value, or {@link UNPARSEABLE} when the stored input no longer
- * parses.
+ * always was; with it, the parsed value, or an {@link UnparseableStoredInput} when the stored input
+ * no longer parses.
  */
 async function admissionInput(
   run: WorkflowRun,
@@ -71,8 +79,16 @@ async function admissionInput(
   if (!parseInput) return run.input;
   try {
     return await parseInput(run.input);
-  } catch {
-    return UNPARSEABLE;
+  } catch (err) {
+    return new UnparseableStoredInput(
+      err instanceof SchemaValidationError && err.code === 'invalid_input'
+        ? err
+        : new SchemaValidationError(
+            `workflow "${run.workflow}" input`,
+            [{ message: err instanceof Error ? err.message : String(err) }],
+            'invalid_input',
+          ),
+    );
   }
 }
 
@@ -124,23 +140,25 @@ export class SingletonGate {
 
   /**
    * Preserve durable holders and atomically claim one of the remaining slots. With `parseInput` (the
-   * workflow's input schema), the key reads the parsed input, the value `run(ctx, input)` gets.
+   * workflow's input schema), the key reads the parsed input, the value `run(ctx, input)` gets; a
+   * stored input that no longer parses answers {@link UnparseableStoredInput}, which the caller
+   * must fail the turn with (never run it).
    */
   async admit(
     run: WorkflowRun,
     cfg: SingletonConfig,
     parseInput?: ((input: unknown) => unknown) | undefined,
-  ): Promise<boolean> {
+  ): Promise<boolean | UnparseableStoredInput> {
     if (!this.deps.store.tryAdmitSingleton) {
       throw new Error(
         'Singleton workflows require StateStore.tryAdmitSingleton for atomic durable admission',
       );
     }
     const keyInput = await admissionInput(run, parseInput);
-    // A stored input that no longer parses has no key. The body parses it before any of its code
-    // runs and fails the run with `invalid_input`, so the turn goes ahead without a slot: it does
-    // nothing the mutex guards, and parking it would leave it waiting on a slot it can never claim.
-    if (keyInput === UNPARSEABLE) return true;
+    // A stored input that no longer parses has no key, and parking it would leave it waiting on a
+    // slot it can never claim. The engine fails the turn with the parse error instead, before the
+    // body (or a remote dispatch) runs.
+    if (keyInput instanceof UnparseableStoredInput) return keyInput;
     const admitted = await this.claim(run, cfg, this.admissionTag(run, cfg, keyInput, parseInput));
     if (admitted && !run.tags?.includes(SINGLETON_ADMITTED_TAG)) {
       run.tags = [
@@ -166,15 +184,15 @@ export class SingletonGate {
     parseInput: ((input: unknown) => unknown) | undefined,
   ): string {
     const parsed = this.tag(cfg, keyInput);
-    if (!parseInput || run.tags?.includes(parsed)) return parsed;
-    if (!run.tags?.some((tag) => tag.startsWith('singleton:'))) return parsed;
+    const stamped = singletonKeyTag(run.tags);
+    if (!parseInput || stamped === undefined || stamped === parsed) return parsed;
     let raw: string;
     try {
       raw = this.tag(cfg, run.input);
     } catch {
       return parsed;
     }
-    return run.tags?.includes(raw) ? raw : parsed;
+    return stamped === raw ? raw : parsed;
   }
 
   /**
@@ -220,7 +238,7 @@ export class SingletonGate {
   async wakeNext(settled: WorkflowRun): Promise<void> {
     const cfg = this.deps.configFor(settled);
     if (!cfg) return;
-    const tag = settled.tags?.find((t) => t.startsWith('singleton:'));
+    const tag = singletonKeyTag(settled.tags);
     if (!tag) return;
     const gated = (
       await this.deps.store.listRuns({ tag, workflow: settled.workflow, statuses: ['suspended'] })

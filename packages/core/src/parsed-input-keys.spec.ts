@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
 import { FatalError } from './errors';
+import { singletonKeyTag } from './singleton-admission';
 import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
@@ -117,15 +118,17 @@ describe('the keys read the parsed input when the workflow registers parseInput'
     expect(run?.tags ?? []).not.toContain('durable:singleton:admitted');
   });
 
-  it('runs a turn whose stored input no longer parses without a slot, so the body can fail it', async () => {
+  it('fails a turn whose stored input no longer parses with invalid_input, before its body runs', async () => {
+    // A core-only registration: the body does NOT parse its input, so nothing but the engine stops
+    // it from running without a slot beside the holder.
     const { store, engine, seen } = setup();
+    const entered: string[] = [];
     engine.register(
       'job',
       '1',
-      async (_ctx, input) => {
-        // What the nestjs body wrapper does first: parse, failing the run on invalid input.
-        await parseInput(input);
-        return 'done';
+      async (ctx) => {
+        await ctx.localStep('enter', async () => void entered.push(ctx.runId));
+        await ctx.waitForSignal(`go:${ctx.runId}`);
       },
       {
         parseInput,
@@ -137,6 +140,8 @@ describe('the keys read the parsed input when the workflow registers parseInput'
         },
       },
     );
+    await startRun(engine, 'job', { c: 'acme' }, 'holder');
+    expect(entered).toEqual(['holder']);
     const now = new Date();
     await store.createRun({
       id: 'stale',
@@ -150,9 +155,13 @@ describe('the keys read the parsed input when the workflow registers parseInput'
     });
     await engine.runOne('stale');
     await engine.waitForRun('stale');
-    // The key is never called with the raw input, and the run settles instead of waiting forever.
-    expect(seen).toEqual([]);
-    expect((await store.getRun('stale'))?.status).toBe('failed');
+    expect(entered).toEqual(['holder']);
+    const stale = await store.getRun('stale');
+    expect(stale?.status).toBe('failed');
+    expect(stale?.error?.code).toBe('invalid_input');
+    // The key never sees the raw input; the holder is untouched.
+    for (const input of seen) expect(input).toEqual({ company: 'ACME' });
+    expect((await store.getRun('holder'))?.status).toBe('suspended');
   });
 
   it('a requeued run is admitted again under the key of its parsed input', async () => {
@@ -290,6 +299,39 @@ describe('caller tags never carry a singleton key', () => {
     expect((await store.getRun('b'))?.tags).not.toContain('singleton:elsewhere');
   });
 
+  it('an older run with a caller tag ahead of the engine one holds a slot under its real key only', async () => {
+    const { store, engine } = setup();
+    const entered: string[] = [];
+    engine.register(
+      'job',
+      '1',
+      async (ctx) => {
+        await ctx.localStep('enter', async () => void entered.push(ctx.runId));
+        await ctx.waitForSignal(`go:${ctx.runId}`);
+      },
+      { parseInput, singleton: { key: (input) => `company:${(input as Parsed).company}` } },
+    );
+    // Started by an engine older than 0.104.0: a caller tag sits ahead of the engine's own.
+    const now = new Date();
+    await store.createRun({
+      id: 'old-holder',
+      workflow: 'job',
+      workflowVersion: '1',
+      status: 'running',
+      input: { c: 'acme' },
+      tags: ['singleton:company:GLOBEX', 'singleton:company:ACME', 'durable:singleton:admitted'],
+      createdAt: now,
+      updatedAt: now,
+    });
+    // GLOBEX is free: the old run holds ACME's slot, not GLOBEX's.
+    await engine.start('job', { c: 'globex' }, 'globex');
+    // ACME is taken by the old run.
+    await engine.start('job', { c: 'acme' }, 'acme');
+    await engine.drain();
+    expect(entered).toEqual(['globex']);
+    expect((await store.getRun('acme'))?.status).toBe('suspended');
+  });
+
   it('a static @Workflow tag with the prefix is dropped too', async () => {
     const { store, engine } = setup();
     engine.register('job', '1', async () => 'done', {
@@ -315,5 +357,15 @@ describe('caller tags never carry a singleton key', () => {
     await engine.drain();
     const tags = (await store.getRun('r2'))?.tags ?? [];
     expect(tags.filter((t) => t.startsWith('singleton:'))).toEqual(['singleton:company:GLOBEX']);
+  });
+});
+
+describe('singletonKeyTag', () => {
+  it('reads the engine tag, the last `singleton:` one, never a marker', () => {
+    expect(
+      singletonKeyTag(['singleton:caller', 'x', 'singleton:engine', 'durable:singleton:admitted']),
+    ).toBe('singleton:engine');
+    expect(singletonKeyTag(['x', 'durable:singleton:tracked'])).toBeUndefined();
+    expect(singletonKeyTag(undefined)).toBeUndefined();
   });
 });

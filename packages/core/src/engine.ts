@@ -213,10 +213,11 @@ import {
   SINGLETON_ADMITTED_TAG,
   SINGLETON_RESERVED_TAGS,
   SINGLETON_TRACKED_TAG,
+  singletonKeyTag,
   withSingletonTracked,
   withoutSingletonMarkers,
 } from './singleton-admission';
-import { SingletonGate } from './singleton-gate';
+import { SingletonGate, UnparseableStoredInput } from './singleton-gate';
 import { DEFAULT_STALLED_AFTER_MS, type StalledRunInfo, findStalledRuns } from './stalled-runs';
 import { StickyCache, StickyContinuation } from './sticky-continuation';
 import {
@@ -435,6 +436,23 @@ function tenantScopedKey(namespace: string | undefined, key: string): string {
   return namespace && namespace !== 'default' ? `${namespace}/${key}` : key;
 }
 
+/** A workflow body that fails its turn with `error` before doing anything. */
+function failingBody(error: Error): WorkflowFn {
+  return async () => {
+    throw error;
+  };
+}
+
+/** The run error an {@link UnparseableStoredInput} settles a run with (code `invalid_input`). */
+function storedInputError(invalid: UnparseableStoredInput): StepError {
+  return {
+    message: invalid.error.message,
+    code: 'invalid_input',
+    retryable: false,
+    details: { issues: invalid.error.issues },
+  };
+}
+
 /**
  * A caller's start tags without any `singleton:<key>` tag: that prefix is the engine's (see
  * `ENGINE_MINTED_TAG_PREFIXES`), and admission, wake-ups and convention serving read a run's
@@ -449,13 +467,12 @@ function callerTags(tags: string[] | undefined): string[] | undefined {
 const SINGLETON_TAG_PREFIX = 'singleton:';
 
 /**
- * The `singleton:` key tag a run carries (never the engine's `durable:singleton:*` markers). Only
- * the engine writes one ({@link callerTags} drops a caller's at every start), so a run carries at
- * most one.
+ * The key of the `singleton:` tag the engine stamped on a run (never the `durable:singleton:*`
+ * markers): the last one, see {@link singletonKeyTag}. A run started since 0.104.0 carries one
+ * ({@link callerTags} drops a caller's); an older run may still carry a caller's ahead of it.
  */
 function singletonKeyOf(run: Pick<WorkflowRun, 'tags'>): string | undefined {
-  const tag = run.tags?.find((t) => t.startsWith('singleton:'));
-  return tag?.slice('singleton:'.length);
+  return singletonKeyTag(run.tags)?.slice('singleton:'.length);
 }
 
 /**
@@ -2162,9 +2179,9 @@ export class WorkflowEngine {
        * throwing on input that does not parse. When set, `start` parses the input once: a failure
        * rejects the start like a failed `validateInput`, and `validateInput` and the `singleton` and
        * `concurrency` keys receive the parsed value instead of the input as sent. Each turn's
-       * singleton admission parses the stored input again for its key (a turn whose stored input
-       * no longer parses runs without a slot, and the body fails it). The run still stores the input
-       * as sent. `@dudousxd/nestjs-durable` supplies it from `@Workflow({ input })`.
+       * singleton admission parses the stored input again for its key; a stored input that no
+       * longer parses fails the run with `invalid_input` (a `SchemaValidationError`) there, before
+       * the body runs or a turn is dispatched. The run still stores the input as sent. `@dudousxd/nestjs-durable` supplies it from `@Workflow({ input })`.
        */
       parseInput?: ((input: unknown) => unknown) | undefined;
       /** Typed/validated `searchAttributes` shape — see `RegisteredWorkflow.searchAttributesSchema`. */
@@ -8555,11 +8572,23 @@ export class WorkflowEngine {
         ...(await this.sourceTraceOf(run)),
       });
     }
-    if (
-      registered.singleton &&
-      !(await this.singletons.admit(run, registered.singleton, registered.parseInput))
-    ) {
-      return this.singletonWaitResult(run);
+    if (registered.singleton) {
+      const admission = await this.singletons.admit(
+        run,
+        registered.singleton,
+        registered.parseInput,
+      );
+      if (admission instanceof UnparseableStoredInput) {
+        // No slot and no key: fail the run here instead of dispatching a turn that would run the
+        // body beside the slot's holder.
+        const result = await this.settleRun(run, {
+          kind: 'failed',
+          error: storedInputError(admission),
+        });
+        await this.releaseLeaseBestEffort(run.id);
+        return result;
+      }
+      if (!admission) return this.singletonWaitResult(run);
     }
 
     // Capability/protocol routing guard for the remote workflow turn (handshake design §7.5): if
@@ -9857,12 +9886,17 @@ export class WorkflowEngine {
     // (suspend on a short timer) until a slot frees instead of running now. Re-checked on each resume.
     // A `cancelling` run skips the gate — it is tearing down, not competing for a slot, and suspending
     // it here would clobber the `cancelling` status.
-    if (
-      run.status !== 'cancelling' &&
-      registered?.singleton &&
-      !(await this.singletons.admit(run, registered.singleton, registered.parseInput))
-    ) {
-      return this.singletonWaitResult(run);
+    if (run.status !== 'cancelling' && registered?.singleton) {
+      const admission = await this.singletons.admit(
+        run,
+        registered.singleton,
+        registered.parseInput,
+      );
+      // A stored input that no longer parses: the turn runs a body that throws the parse error,
+      // so it fails through the ordinary failure path (no step ran, so nothing to compensate)
+      // and none of the workflow's own code runs without a slot.
+      if (admission instanceof UnparseableStoredInput) fn = failingBody(admission.error);
+      else if (!admission) return this.singletonWaitResult(run);
     }
     // A body this instance parked on dispatched steps in an earlier turn continues from there (see
     // `sticky-continuation.ts`), when nothing but this instance's own turn has settled the run since.
