@@ -126,6 +126,7 @@ import type {
   WorkflowExecutor,
   WorkflowRun,
   WorkflowStepEvent,
+  WorkflowTaskState,
 } from './interfaces';
 import type {
   BufferedSignalRow,
@@ -373,6 +374,10 @@ function mergeTags(staticTags?: string[], runTags?: string[]): string[] | undefi
 /** A breakpoint checkpoint's `name` is `breakpoint` (or `breakpoint:<label>`). This name — not the
  *  reused `signal` kind — is the explicit marker the dashboard and `continue()` detect it by. */
 const BREAKPOINT = 'breakpoint';
+
+/** Appended to `awaitingDecisionTaskId` once a lost dispatched turn was counted, so it is counted
+ *  once however long its re-drive waits; the next dispatch replaces the whole marker. */
+const LOST_TURN_SUFFIX = ':lost';
 /** Pending runs one {@link WorkflowEngine.runPending} poll takes at most. */
 const PENDING_POLL_BATCH = 100;
 /** Default size of the sticky continuation cache (see {@link WorkflowEngineDeps.stickyRuns}). */
@@ -1300,6 +1305,9 @@ export class WorkflowEngine {
    * `clock() + leaseMs`, so at or after it). See {@link orphanedRuns}.
    */
   private readonly ownLeaseCutoffMs: number;
+  /** When this engine was built (clock ms): {@link noteLapsedTurn} counts no lost turn within one
+   *  turn window of it, while live workers' beats catch up with deadlines that went stale. */
+  private readonly bootedAtMs: number;
   private readonly maxRecoveryAttempts?: number | undefined;
   private readonly unregisteredWorkflowGraceMs: number;
   private readonly remoteAdvanceSilenceMs?: number | undefined;
@@ -1545,6 +1553,7 @@ export class WorkflowEngine {
     // the prefix and once in the group suffix, and cross-runtime discovery silently failed.)
     this.leaseMs = deps.leaseMs ?? 30_000;
     this.ownLeaseCutoffMs = this.clock() + this.leaseMs;
+    this.bootedAtMs = this.clock();
     this.maxRecoveryAttempts = deps.maxRecoveryAttempts;
     const grace = deps.unregisteredWorkflowGraceMs;
     this.unregisteredWorkflowGraceMs =
@@ -2055,13 +2064,6 @@ export class WorkflowEngine {
         if (!(await this.store.tryLockRun(run.id, this.instanceId, nowMs + this.leaseMs, nowMs))) {
           continue;
         }
-        // A lapsed dispatched turn spends a recovery attempt here, before the lease-long `wakeAt`
-        // below hides that it lapsed from whichever instance takes the wake.
-        const dead = await this.countLapsedTurn(run.id, nowMs);
-        if (dead) {
-          settled?.set(run.id, dead);
-          continue;
-        }
         // Checked before the lease-long `wakeAt` below, which would keep the orphan from aging.
         // A registered run never awaits here, so its hand-off timing is unchanged.
         if (!this.isRegisteredHere(run) && !(await this.canResolveWorkflow(run))) {
@@ -2072,6 +2074,14 @@ export class WorkflowEngine {
           continue;
         }
         try {
+          // A lapsed dispatched turn is judged here, before the lease-long `wakeAt` below hides that
+          // it lapsed from whichever instance takes the wake: counted once (and dead-lettered past
+          // the limit), or left waiting when its worker may still answer.
+          const handled = await this.noteLapsedTurn(run.id, nowMs);
+          if (handled) {
+            if (handled.status === 'dead') settled?.set(run.id, handled);
+            continue;
+          }
           const patch = { wakeAt: nowMs + this.leaseMs };
           if (this.store.updateRunIf) {
             if (await this.store.updateRunIf(run.id, [run.status], patch)) claimed.push(run);
@@ -5585,22 +5595,40 @@ export class WorkflowEngine {
    * `maxRecoveryAttempts` — move a poison pill to the `dead` dead-letter state. Returns a terminal
    * result to skip the resume, or `undefined` to proceed.
    */
-  private async countRecovery(run: WorkflowRun): Promise<RunResult | undefined> {
+  private async countRecovery(
+    run: WorkflowRun,
+    extra: Partial<WorkflowRun> = {},
+  ): Promise<RunResult | undefined> {
     const attempts = (run.recoveryAttempts ?? 0) + 1;
+    // Both writes are conditional on the status the run was read in, so a cancel (or any settle)
+    // that lands meanwhile is never overwritten by `dead` or a stale count.
+    const updateIf = (patch: Partial<WorkflowRun>) =>
+      (this.store.updateRunIf ?? this.updateRunIfFallback).call(
+        this.store,
+        run.id,
+        [run.status],
+        patch,
+      );
+    const moved = async (): Promise<RunResult> => {
+      await this.store.releaseRunLock(run.id);
+      return this.echoCurrentStatus(run.id);
+    };
     if (this.maxRecoveryAttempts != null && attempts > this.maxRecoveryAttempts) {
       const error = {
         message: `run exceeded maxRecoveryAttempts (${this.maxRecoveryAttempts}) — moved to dead-letter`,
         code: 'max_recovery_attempts',
       };
-      await this.store.updateRun(
-        run.id,
+      const written = await updateIf(
         await this.withLifecycleMarker(run, { status: 'dead', error, updatedAt: new Date() }),
       );
+      if (!written) return moved();
       await this.store.releaseRunLock(run.id);
       return this.announceDead({ ...run, recoveryAttempts: attempts }, error);
     }
     // Count BEFORE resuming, so a crash mid-resume still advances the counter.
-    await this.store.updateRun(run.id, { recoveryAttempts: attempts, updatedAt: new Date() });
+    if (!(await updateIf({ ...extra, recoveryAttempts: attempts, updatedAt: new Date() }))) {
+      return moved();
+    }
     return undefined;
   }
 
@@ -5776,39 +5804,89 @@ export class WorkflowEngine {
       [...due, ...blocked],
       nowMs,
       async (run) =>
-        (await this.countLapsedTurn(run.id, nowMs)) ??
+        (await this.noteLapsedTurn(run.id, nowMs)) ??
         this.reconcileSignalWaiter(run, waiterByRun.get(run.id)),
     );
   }
 
   /**
-   * Called under the run's lease by the due-timer pass. A run suspended awaiting a DISPATCHED
-   * workflow turn's decision (`awaitingDecisionTaskId`) whose re-drive deadline (`wakeAt`) has
-   * passed lost that turn: no decision came back and the worker stopped beating (every beat pushes
-   * `wakeAt` forward, see {@link rearmDecisionDeadline}), so the worker running it died, or the task
-   * was lost with it. That is the dispatched form of a crashed inline turn, so it spends the same
-   * {@link maxRecoveryAttempts} budget through {@link countRecovery}: a turn that keeps killing its
-   * worker ends `dead` (with the same `run.failed` announcement) instead of being re-dispatched, and
-   * possibly redelivered by the broker, for ever.
+   * Called under the run's lease by the due-timer pass, for a run that THIS instance would re-drive.
+   * A run suspended awaiting a DISPATCHED workflow turn's decision (`awaitingDecisionTaskId`) whose
+   * re-drive deadline (`wakeAt`) has passed lost that turn: no decision came back and the worker
+   * stopped beating (every beat pushes `wakeAt` forward, see {@link rearmDecisionDeadline}), so the
+   * worker running it died, or the task was lost with it. That is the dispatched form of a crashed
+   * inline turn, so it spends the same {@link maxRecoveryAttempts} budget through
+   * {@link countRecovery}: a turn that keeps killing its worker ends `dead` (with the same
+   * `run.failed` announcement) instead of being re-dispatched, and redelivered, for ever.
    *
-   * Never counted: a decision that arrives (it clears the marker), a worker that keeps beating (the
-   * deadline never passes), and any write a healthy dispatch makes on its way (step checkpoints,
-   * progress, the result), because only a passed deadline on a still-awaited turn counts. Re-read
-   * under the lease: the listing may predate a decision that has since been applied. Returns a
-   * terminal result when the run was dead-lettered (the lease is released), else `undefined`.
+   * Counted at most once per awaited turn: the count rewrites the marker to its `:lost` form, which
+   * no later pass counts again however long the re-drive waits on the run queue, and the re-drive's
+   * dispatch replaces it with the next turn's id. Not counted, and the re-drive left for later:
+   *  - while the broker still holds the task unstarted (a backed-up queue, not a dead worker), or
+   *  - within one turn window of this engine's boot, when beats from live workers have not yet had
+   *    the chance to push a deadline that went stale while the engine was down.
+   * Never counted by an instance that cannot resolve the workflow (it re-drives nothing), nor for a
+   * decision that arrives, a worker that keeps beating, or any write a healthy turn makes on its way.
+   *
+   * Re-reads under the lease: the listing may predate a decision applied since. Returns a result when
+   * the run was dead-lettered or left waiting (the lease released either way), else `undefined` for
+   * the caller to re-drive as before. A decision that lands while this holds the lease and
+   * dead-letters the run is dropped with it (it cannot take the lease): a narrow race, accepted.
    */
-  private async countLapsedTurn(runId: string, nowMs: number): Promise<RunResult | undefined> {
+  private async noteLapsedTurn(runId: string, nowMs: number): Promise<RunResult | undefined> {
     const run = await this.store.getRun(runId);
+    const awaited = run?.awaitingDecisionTaskId;
     if (
       !run ||
       run.status !== 'suspended' ||
-      run.awaitingDecisionTaskId === undefined ||
+      awaited === undefined ||
+      awaited.endsWith(LOST_TURN_SUFFIX) ||
       run.wakeAt == null ||
       run.wakeAt > nowMs
     ) {
       return undefined;
     }
-    return this.countRecovery(run);
+    // Only an instance that re-drives the run judges it; one that cannot resolve the workflow leaves
+    // it untouched, so its unregistered grace clock keeps running.
+    if (!this.isRegisteredHere(run) && !(await this.canResolveWorkflow(run))) return undefined;
+    const windowMs = this.dispatchedTurnSilenceMs;
+    if (windowMs != null && nowMs < this.bootedAtMs + windowMs) {
+      return this.leaveTurnWaiting(run, this.bootedAtMs + windowMs);
+    }
+    const state = await this.dispatchedTurnState(run, awaited);
+    if (state === 'queued') return this.leaveTurnWaiting(run, nowMs + (windowMs ?? this.leaseMs));
+    // The broker could not say: re-drive as before, without counting a turn that may still be queued.
+    if (state === 'error') return undefined;
+    return this.countRecovery(run, { awaitingDecisionTaskId: `${awaited}${LOST_TURN_SUFFIX}` });
+  }
+
+  /** Where the broker has the task of a dispatched turn: see {@link WorkflowExecutor.taskState}. */
+  private async dispatchedTurnState(
+    run: WorkflowRun,
+    taskId: string,
+  ): Promise<WorkflowTaskState | 'error'> {
+    const executor = (
+      this.workflows.get(versionKey(run.workflow, run.workflowVersion)) ??
+      this.latest.get(run.workflow)
+    )?.remote?.executor;
+    if (!executor?.taskState) return 'unknown';
+    try {
+      return await executor.taskState(run, taskId);
+    } catch {
+      return 'error';
+    }
+  }
+
+  /** Push a lapsed turn's deadline to `until` without re-driving it, and give the lease back. */
+  private async leaveTurnWaiting(run: WorkflowRun, until: number): Promise<RunResult> {
+    await (this.store.updateRunIf ?? this.updateRunIfFallback).call(
+      this.store,
+      run.id,
+      ['suspended'],
+      { wakeAt: until, updatedAt: new Date() },
+    );
+    await this.store.releaseRunLock(run.id);
+    return { runId: run.id, status: 'suspended' };
   }
 
   /**
@@ -8536,6 +8614,10 @@ export class WorkflowEngine {
       await this.withRunTrace(run, {
         status: 'suspended',
         wakeAt: this.reconcileWakeAt(outcome.wakeAt),
+        // A turn that ran here suspended the run, so no dispatched turn is awaited any more: a marker
+        // left by an earlier dispatch (a re-drive that followed an onError handoff, say) would make
+        // this suspend read as a lost turn at its next reconcile wake.
+        ...(run.awaitingDecisionTaskId !== undefined ? { awaitingDecisionTaskId: undefined } : {}),
         updatedAt: stamp,
       }),
     );
@@ -11965,12 +12047,16 @@ export class WorkflowEngine {
       }
       // Clear the awaited-turn marker and the re-drive deadline: this turn is now being applied exactly
       // once. `applyDecision` resets `wakeAt` itself when it suspends on the turn's blocking ops.
+      // An applied decision is progress, so the recovery budget starts again: only turns lost in a
+      // row (with no decision between them) add up to `maxRecoveryAttempts`.
       await this.store.updateRun(decision.runId, {
         awaitingDecisionTaskId: undefined,
         wakeAt: undefined,
+        ...(fresh.recoveryAttempts ? { recoveryAttempts: 0 } : {}),
         updatedAt: new Date(),
       });
       fresh.awaitingDecisionTaskId = undefined;
+      if (fresh.recoveryAttempts) fresh.recoveryAttempts = 0;
       await this.applyDecision(fresh, decision);
     } finally {
       const fenced = held.lease.lost;

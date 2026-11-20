@@ -5,6 +5,7 @@ import {
   type WorkflowExecutor,
   type WorkflowRun,
   type WorkflowTask,
+  type WorkflowTaskState,
 } from './interfaces';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group';
 
@@ -72,5 +73,14 @@ export class RemoteWorkflowExecutor implements WorkflowExecutor {
       features: [...REMOTE_WORKFLOW_FEATURES],
     };
     await this.transport.dispatchWorkflowTask(task);
+  }
+
+  /** Where the broker has the task dispatched under `taskId`, when the transport can tell. */
+  async taskState(_run: WorkflowRun, taskId: string): Promise<WorkflowTaskState> {
+    if (!this.transport.workflowTaskState) return 'unknown';
+    return this.transport.workflowTaskState(
+      tenantGroup(sanitizeQueueToken(this.name), this.partition),
+      taskId,
+    );
   }
 }

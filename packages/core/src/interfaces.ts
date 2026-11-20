@@ -2022,7 +2022,21 @@ export interface WorkflowExecutor {
     taskId: string,
     pendingSignals?: WorkflowTask['pendingSignals'],
   ): Promise<void>;
+  /**
+   * Optional, for a {@link dispatch} executor: where the broker has the task dispatched for `run`
+   * under `taskId` (see {@link WorkflowTaskState}). The engine asks when the turn's re-drive deadline
+   * lapsed, and counts the turn as lost only when the task is not still waiting unstarted. Absent:
+   * `'unknown'`.
+   */
+  taskState?(run: WorkflowRun, taskId: string): Promise<WorkflowTaskState>;
 }
+
+/**
+ * Where the broker has a dispatched workflow task: `'queued'` while it waits and no worker has ever
+ * taken it (a backed-up queue); `'taken'` once a worker started it (running, stalled back to the
+ * queue, finished or failed); `'unknown'` when the broker has no record of it or cannot tell.
+ */
+export type WorkflowTaskState = 'queued' | 'taken' | 'unknown';
 
 /**
  * A transport in an ordered pool, identified by `id`. The engine dispatches on the first by default
@@ -2119,6 +2133,9 @@ export interface Transport {
   dispatchWorkflowTask?(task: WorkflowTask): Promise<void>;
   /** workflow worker → engine: a replayed turn's {@link WorkflowDecision}. Pair with dispatchWorkflowTask. */
   onDecision?(handler: (decision: WorkflowDecision) => Promise<void>): void;
+  /** Where the broker has the workflow task `taskId` dispatched on `group` (see
+   *  {@link WorkflowTaskState}). Optional; pair with {@link dispatchWorkflowTask}. */
+  workflowTaskState?(group: string, taskId: string): Promise<WorkflowTaskState>;
   /** workflow worker → engine: a LOCAL step's {@link WorkflowStepEvent}, streamed mid-turn so the
    *  engine can checkpoint it live. Point-to-point (a single engine instance consumes each event and
    *  persists it once — no cross-pod duplicate writes). Optional; only broker transports carry it. */

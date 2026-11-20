@@ -43,13 +43,28 @@ DurableModule.forRoot({
 ```
 
 A workflow turn **dispatched to a worker** (a co-located or remote worker over BullMQ) spends the same
-budget. While its turn is on the broker the run waits `suspended`, not `running`, so crash-recovery does
-not see it; instead, each time the turn's re-drive deadline (`remoteAdvanceSilenceMs`, else `reconcileMs`)
-passes with no decision and no heartbeat (its worker died, or the task was lost with it), the timer
-poller counts one recovery attempt before it dispatches the turn again. A turn that keeps killing its
-worker therefore ends `dead` with the same `max_recovery_attempts` error and the same announcement as an
-inline run. A decision that arrives, a worker that keeps beating, and the checkpoints a healthy turn
-writes never count.
+budget when it is lost. While its turn is on the broker the run waits `suspended`, not `running`, so
+crash-recovery does not see it; the timer poller judges it instead, once the turn's re-drive deadline
+(`remoteAdvanceSilenceMs`, else `reconcileMs`) has passed with no decision and no heartbeat:
+
+- **Counted once per turn.** The count marks the awaited turn as lost, so it is not counted again
+  however long the re-drive waits (on the run queue, say); the re-drive dispatches the next turn.
+- **Only after a worker took the task.** A task still waiting unstarted in the broker (a backed-up
+  queue) is not a lost turn: it is neither counted nor dispatched again, and its deadline is pushed out
+  one window. A task a worker started (running, or stalled back to the queue for redelivery), or one
+  the broker no longer has, counts. A transport that cannot tell counts every lapse.
+- **Only by an instance that re-drives it.** An instance that cannot resolve the workflow counts nothing
+  and leaves the run's unregistered grace clock running.
+- **Not right after a restart.** Within one turn window of an engine's boot, a deadline that went stale
+  while it was down is pushed out instead, so live workers' heartbeats can reach the new engine first.
+- **Turns lost in a row.** An applied decision resets `recoveryAttempts` to 0, so a long-lived run that
+  loses a turn now and then (a deploy, say) is not dead-lettered for losses spread over its life.
+
+Past the limit the run ends `dead` with the same `max_recovery_attempts` error and the same
+announcement as an inline run; the write is conditional on the run still being `suspended`, so a
+cancel that lands meanwhile wins. A decision that arrives while that pass holds the run's lease is
+dropped with it (a narrow race). A decision that arrives in time, a worker that keeps beating, and the
+checkpoints a healthy turn writes never count.
 
 If the dead run is a child, its parent is notified at once, as for a failed child: `ctx.child`
 throws, and `ctx.all` / `ctx.allSettled` record it as failed. The parent does not wait for its
