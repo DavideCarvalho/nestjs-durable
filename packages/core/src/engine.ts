@@ -213,10 +213,11 @@ import {
   SINGLETON_ADMITTED_TAG,
   SINGLETON_RESERVED_TAGS,
   SINGLETON_TRACKED_TAG,
+  singletonKeyTag,
   withSingletonTracked,
   withoutSingletonMarkers,
 } from './singleton-admission';
-import { SingletonGate } from './singleton-gate';
+import { SingletonGate, UnparseableStoredInput } from './singleton-gate';
 import { DEFAULT_STALLED_AFTER_MS, type StalledRunInfo, findStalledRuns } from './stalled-runs';
 import { StickyCache, StickyContinuation } from './sticky-continuation';
 import {
@@ -345,9 +346,13 @@ export interface StartOptions {
  * admission on a timer until a slot frees. The store atomically reserves durable slots before
  * ordering unadmitted waiters by `(createdAt, id)`, so later starts cannot displace a holder.
  */
-export interface SingletonConfig {
-  /** Derive the serialization key from the workflow input. */
-  key: (input: unknown) => string;
+export interface SingletonConfig<TInput = unknown> {
+  /**
+   * Derive the serialization key from the workflow input. When the workflow declares an input schema
+   * (`@Workflow({ input })`, or `register(..., { parseInput })`), it receives the PARSED input, the
+   * same value `run(ctx, input)` gets, and `@Workflow` types `TInput` from the schema.
+   */
+  key: (input: TInput) => string;
   /** Max concurrent runs sharing the key. Default 1 (a mutex). */
   limit?: number;
   /**
@@ -431,10 +436,43 @@ function tenantScopedKey(namespace: string | undefined, key: string): string {
   return namespace && namespace !== 'default' ? `${namespace}/${key}` : key;
 }
 
-/** The `singleton:` key tag a run carries (never the engine's `durable:singleton:*` markers). */
+/** A workflow body that fails its turn with `error` before doing anything. */
+function failingBody(error: Error): WorkflowFn {
+  return async () => {
+    throw error;
+  };
+}
+
+/** The run error an {@link UnparseableStoredInput} settles a run with (code `invalid_input`). */
+function storedInputError(invalid: UnparseableStoredInput): StepError {
+  return {
+    message: invalid.error.message,
+    code: 'invalid_input',
+    retryable: false,
+    details: { issues: invalid.error.issues },
+  };
+}
+
+/**
+ * A caller's start tags without any `singleton:<key>` tag: that prefix is the engine's (see
+ * `ENGINE_MINTED_TAG_PREFIXES`), and admission, wake-ups and convention serving read a run's
+ * key from it. A caller tag there would let a run queue or be admitted under a key its input does
+ * not have. Also drops one carried over from another run (`retryWithInput`), whose key is
+ * re-derived from the new input.
+ */
+function callerTags(tags: string[] | undefined): string[] | undefined {
+  return tags?.filter((tag) => !tag.startsWith(SINGLETON_TAG_PREFIX));
+}
+
+const SINGLETON_TAG_PREFIX = 'singleton:';
+
+/**
+ * The key of the `singleton:` tag the engine stamped on a run (never the `durable:singleton:*`
+ * markers): the last one, see {@link singletonKeyTag}. A run started since 0.104.0 carries one
+ * ({@link callerTags} drops a caller's); an older run may still carry a caller's ahead of it.
+ */
 function singletonKeyOf(run: Pick<WorkflowRun, 'tags'>): string | undefined {
-  const tag = run.tags?.find((t) => t.startsWith('singleton:'));
-  return tag?.slice('singleton:'.length);
+  return singletonKeyTag(run.tags)?.slice('singleton:'.length);
 }
 
 /**
@@ -521,6 +559,9 @@ interface RegisteredWorkflow {
   executionTimeoutMs?: number | undefined;
   /** Validate the input at start; throw to reject before a run is created. Validator-agnostic. */
   validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
+  /** The input as the body sees it (a schema's parsed value): what the `singleton` and `concurrency`
+   *  keys receive. Absent: they receive the input as sent. See {@link WorkflowEngine.register}. */
+  parseInput?: ((input: unknown) => unknown) | undefined;
   /** Typed/validated `searchAttributes` shape. When set, `ctx.upsertSearchAttributes` validates the
    *  merged result against it (see `createWorkflowCtx`). See `WorkflowMeta.searchAttributes`. */
   searchAttributesSchema?: SearchAttributesSchema | undefined;
@@ -2133,6 +2174,16 @@ export class WorkflowEngine {
       concurrency?: ConcurrencyConfig | undefined;
       executionTimeout?: string | number | undefined;
       validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
+      /**
+       * The input as the body sees it: a schema's parsed (coerced/transformed) value, sync or async,
+       * throwing on input that does not parse. When set, `start` parses the input once: a failure
+       * rejects the start like a failed `validateInput`, and `validateInput` and the `singleton` and
+       * `concurrency` keys receive the parsed value instead of the input as sent. Each turn's
+       * singleton admission parses the stored input again for its key; a stored input that no
+       * longer parses fails the run with `invalid_input` (a `SchemaValidationError`) there, before
+       * the body runs or a turn is dispatched. The run still stores the input as sent. `@dudousxd/nestjs-durable` supplies it from `@Workflow({ input })`.
+       */
+      parseInput?: ((input: unknown) => unknown) | undefined;
       /** Typed/validated `searchAttributes` shape — see `RegisteredWorkflow.searchAttributesSchema`. */
       searchAttributesSchema?: SearchAttributesSchema | undefined;
       onEvent?: OnEventEntry[] | undefined;
@@ -2175,6 +2226,7 @@ export class WorkflowEngine {
       executionTimeoutMs:
         opts?.executionTimeout != null ? parseDuration(opts.executionTimeout) : undefined,
       validateInput: opts?.validateInput,
+      parseInput: opts?.parseInput,
       searchAttributesSchema: opts?.searchAttributesSchema,
       onEvent: opts?.onEvent,
       eventBatch: opts?.eventBatch,
@@ -4057,16 +4109,25 @@ export class WorkflowEngine {
           : `workflow ${versionKey(name, pinned)} is not registered — a pinned start never falls back to the newest version (registered: ${this.registeredVersions(name)})`,
       );
     }
-    // Validate the input up front — a bad payload is rejected before any run is created.
-    if (parkUnroutable && registered.validateInput) {
+    // Validate the input up front — a bad payload is rejected before any run is created. With
+    // `parseInput` the input is parsed ONCE here: a parse failure rejects the start like a failed
+    // `validateInput`, `validateInput` checks the parsed value, and the keys below read it too.
+    const check = registered;
+    const parseAndValidate = async (): Promise<unknown> => {
+      const parsed = check.parseInput ? await check.parseInput(input) : input;
+      await check.validateInput?.(parsed);
+      return parsed;
+    };
+    let keyInput: unknown;
+    if (parkUnroutable && (registered.validateInput || registered.parseInput)) {
       // A tenant start: a rejected input is an answer to store, not a failure to redeliver.
       try {
-        await registered.validateInput(input);
+        keyInput = await parseAndValidate();
       } catch (err) {
         throw new TenantStartInvalid(err);
       }
     } else {
-      await registered.validateInput?.(input);
+      keyInput = await parseAndValidate();
     }
     // Idempotent by run id: a redelivered trigger (at-least-once queues) or a scheduler re-tick for
     // the same id is a no-op, returning the existing run's state instead of starting a duplicate.
@@ -4074,7 +4135,8 @@ export class WorkflowEngine {
     if (prior) return this.existingStartResult(prior);
     // Start-time concurrency quota (per-start override, else the workflow's): reject BEFORE creating
     // anything when the key's in-flight runs already reach the limit. See {@link ConcurrencyQuota}.
-    const quota = await resolveConcurrency(opts?.concurrency, registered.concurrency, input);
+    // The keys read `keyInput`: the input as the body will see it (a schema's parsed value).
+    const quota = await resolveConcurrency(opts?.concurrency, registered.concurrency, keyInput);
     if (quota) await assertConcurrency(this.store, name, quota);
     const now = new Date();
     // A singleton workflow stamps a `singleton:<key>` tag so the admission gate (in execute) can find
@@ -4082,19 +4144,19 @@ export class WorkflowEngine {
     // whose version nobody declared stamps `version:undeclared` on the same principle: the fact has
     // to travel WITH the run, because whoever checks a pin later reads the run row and nothing else.
     const stampedTags = [
-      ...(opts?.tags ?? []),
-      ...(registered.singleton ? [this.singletons.tag(registered.singleton, input)] : []),
+      ...(callerTags(opts?.tags) ?? []),
+      ...(registered.singleton ? [this.singletons.tag(registered.singleton, keyInput)] : []),
       ...(quota ? [concurrencyTag(quota.key)] : []),
       ...(registered.versionDeclared === false ? [VERSION_UNDECLARED_TAG] : []),
     ];
     // Admission is owned by the store, never supplied or inherited by a fresh run.
-    const tags = mergeTags(registered.tags, stampedTags)?.filter(
+    const tags = mergeTags(callerTags(registered.tags), stampedTags)?.filter(
       (tag) => !SINGLETON_RESERVED_TAGS.includes(tag),
     );
     // Singleton back-pressure: reject a start that would grow the same-key backlog past
     // `limit + maxQueueDepth` (no-op when no maxQueueDepth is configured).
     if (registered.singleton) {
-      await this.singletons.assertCapacity(name, registered.singleton, input);
+      await this.singletons.assertCapacity(name, registered.singleton, keyInput);
     }
     // Delayed start: park the run on its durable wake timer instead of dispatching it now (see
     // StartOptions.startAt). Compared against the ENGINE clock, the one the timer poller uses.
@@ -4194,7 +4256,7 @@ export class WorkflowEngine {
     };
     const now = new Date();
     const tags = mergeTags(undefined, [
-      ...(opts?.tags ?? []),
+      ...(callerTags(opts?.tags) ?? []),
       ...(singleton ? [this.singletons.tag(singleton, input)] : []),
       ...(quota ? [concurrencyTag(quota.key)] : []),
       ...(pinned === undefined ? [VERSION_UNDECLARED_TAG] : []),
@@ -4368,7 +4430,7 @@ export class WorkflowEngine {
       namespace: poolNamespace(opts.namespace) ?? this.namespace,
       input,
       // The same derived tags an admitted or parked start carries, so quota-key queries find it.
-      tags: mergeTags(opts.tags, [
+      tags: mergeTags(callerTags(opts.tags), [
         ...(opts.concurrency ? [concurrencyTag(opts.concurrency.key)] : []),
         ...(opts.version === undefined ? [VERSION_UNDECLARED_TAG] : []),
       ])?.filter((tag) => !SINGLETON_RESERVED_TAGS.includes(tag)),
@@ -8510,8 +8572,23 @@ export class WorkflowEngine {
         ...(await this.sourceTraceOf(run)),
       });
     }
-    if (registered.singleton && !(await this.singletons.admit(run, registered.singleton))) {
-      return this.singletonWaitResult(run);
+    if (registered.singleton) {
+      const admission = await this.singletons.admit(
+        run,
+        registered.singleton,
+        registered.parseInput,
+      );
+      if (admission instanceof UnparseableStoredInput) {
+        // No slot and no key: fail the run here instead of dispatching a turn that would run the
+        // body beside the slot's holder.
+        const result = await this.settleRun(run, {
+          kind: 'failed',
+          error: storedInputError(admission),
+        });
+        await this.releaseLeaseBestEffort(run.id);
+        return result;
+      }
+      if (!admission) return this.singletonWaitResult(run);
     }
 
     // Capability/protocol routing guard for the remote workflow turn (handshake design §7.5): if
@@ -9780,9 +9857,11 @@ export class WorkflowEngine {
 
   private async runExecutionTurn(
     run: WorkflowRun,
-    fn: WorkflowFn,
+    registeredFn: WorkflowFn,
     registered: RegisteredWorkflow | undefined,
   ): Promise<RunResult> {
+    // The body this turn runs: the registered one, unless admission replaces it (see below).
+    let fn = registeredFn;
     // A run persisted as `cancelling` is a compensating cancel in flight — possibly re-driven by
     // recovery after a crash that lost the in-memory cancel flag. Re-derive the intent from the status
     // so the replay below reaches the WorkflowSuspended + cancelRequested branch and compensates →
@@ -9809,12 +9888,17 @@ export class WorkflowEngine {
     // (suspend on a short timer) until a slot frees instead of running now. Re-checked on each resume.
     // A `cancelling` run skips the gate — it is tearing down, not competing for a slot, and suspending
     // it here would clobber the `cancelling` status.
-    if (
-      run.status !== 'cancelling' &&
-      registered?.singleton &&
-      !(await this.singletons.admit(run, registered.singleton))
-    ) {
-      return this.singletonWaitResult(run);
+    if (run.status !== 'cancelling' && registered?.singleton) {
+      const admission = await this.singletons.admit(
+        run,
+        registered.singleton,
+        registered.parseInput,
+      );
+      // A stored input that no longer parses: the turn runs a body that throws the parse error,
+      // so it fails through the ordinary failure path (no step ran, so nothing to compensate)
+      // and none of the workflow's own code runs without a slot.
+      if (admission instanceof UnparseableStoredInput) fn = failingBody(admission.error);
+      else if (!admission) return this.singletonWaitResult(run);
     }
     // A body this instance parked on dispatched steps in an earlier turn continues from there (see
     // `sticky-continuation.ts`), when nothing but this instance's own turn has settled the run since.

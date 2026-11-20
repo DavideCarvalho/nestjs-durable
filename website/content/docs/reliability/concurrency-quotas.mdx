@@ -24,6 +24,24 @@ On the workflow, deriving the key from the input:
 export class ChatTurnWorkflow { /* … */ }
 ```
 
+With an `input` schema on the workflow, `key` is typed from the schema's parsed type and receives
+the parsed value (the one `run` gets), so the annotation above is unnecessary:
+
+```ts
+const TurnInput = z.object({ tenantId: z.string(), message: z.string() });
+
+@Workflow({
+  name: 'chat.turn',
+  input: TurnInput,
+  concurrency: { key: (input) => `tenant:${input.tenantId}`, limit: 8 },
+})
+export class ChatTurnWorkflow {
+  async run(ctx: WorkflowCtx, input: InferWorkflowInput<typeof TurnInput>) { /* … */ }
+}
+```
+
+Without a schema, `key` takes `unknown` and receives the input as sent.
+
 Or per start (overrides the workflow's config for that start):
 
 ```ts

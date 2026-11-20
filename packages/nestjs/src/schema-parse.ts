@@ -17,6 +17,31 @@ export type DtoClass = new (...args: any[]) => object;
  */
 export type IoSchema = StandardSchemaV1 | DtoClass | z.ZodType;
 
+/**
+ * The value a schema parses to, which is what `run(ctx, input)`, `validateInput` and the `singleton`
+ * / `concurrency` keys receive: a Standard Schema's output type (`z.output` for zod), a DTO class's
+ * instance, `unknown` without a schema. Use it to type `run`'s input from the same schema:
+ *
+ * ```ts
+ * const Input = z.object({ companyId: z.string() });
+ *
+ * @Workflow({ name: 'sync', input: Input, singleton: { key: (input) => input.companyId } })
+ * class SyncWorkflow {
+ *   async run(ctx: WorkflowCtx, input: InferWorkflowInput<typeof Input>) {}
+ * }
+ * ```
+ */
+export type InferWorkflowInput<S> = [S] extends [undefined]
+  ? unknown
+  : [S] extends [StandardSchemaV1]
+    ? StandardSchemaV1.InferOutput<S>
+    : [S] extends [z.ZodType]
+      ? z.output<S>
+      : [S] extends [DtoClass]
+        ? InstanceType<S>
+        : // A union of schema kinds (`WorkflowOptions` written without a type argument): unknown.
+          unknown;
+
 /** Parses a value against a schema: resolves the schema's output (coerced/transformed), or throws. */
 export type Parser = (value: unknown) => Promise<unknown>;
 

@@ -32,6 +32,20 @@ const LEGACY_SCAN_STATUSES: RunStatus[] = ['running', 'suspended', 'cancelling']
 const byAdmissionOrder = (a: WorkflowRun, b: WorkflowRun) =>
   a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id);
 
+/**
+ * The `singleton:<key>` tag the ENGINE stamped on a run: the last tag with that prefix. A start
+ * appends it after the caller's tags, and since 0.104.0 a caller's `singleton:` tags are dropped,
+ * but a run started earlier can still carry one ahead of the engine's; reading the last one keeps
+ * such a run under its real key until it settles. Never one of the `durable:singleton:*` markers.
+ */
+export function singletonKeyTag(tags: readonly string[] | undefined): string | undefined {
+  if (!tags) return undefined;
+  for (let i = tags.length - 1; i >= 0; i -= 1) {
+    if ((tags[i] as string).startsWith('singleton:')) return tags[i];
+  }
+  return undefined;
+}
+
 /** `tags` without the engine's singleton admission metadata. */
 export function withoutSingletonMarkers(tags: string[] | undefined): string[] | undefined {
   return tags?.filter((tag) => !SINGLETON_RESERVED_TAGS.includes(tag));
@@ -119,7 +133,7 @@ export function singletonAdmissionTags(
     (run) =>
       run.workflow === workflow &&
       SINGLETON_ACTIVE_STATUSES.includes(run.status) &&
-      run.tags?.includes(tag),
+      singletonKeyTag(run.tags) === tag,
   );
   const candidate = active.find((run) => run.id === runId);
   if (!candidate) return null;
@@ -164,7 +178,7 @@ export function singletonAdmissionDenialPatch(
     (run) =>
       run.id === runId &&
       run.workflow === workflow &&
-      run.tags?.includes(tag) &&
+      singletonKeyTag(run.tags) === tag &&
       SINGLETON_ACTIVE_STATUSES.includes(run.status),
   );
   if (!candidate || candidate.status === 'cancelling') return undefined;

@@ -149,8 +149,10 @@ export class ThinWorkflowRegistrar implements OnModuleInit {
       // own starts: the input schema, the singleton key, the default quota, the event subscriptions.
       const declare = (starter as unknown as Partial<DurableStartClient>).declareWorkflow;
       if (typeof declare === 'function') {
+        const io = workflowIo(meta);
         const policy: TenantWorkflowStartPolicy = {
-          validateInput: workflowIo(meta).validateAtStart,
+          validateInput: io.validateParsed,
+          parseInput: io.parseInput,
           singleton: meta.singleton,
           concurrency: meta.concurrency,
           onEvent: getOnEvents(meta, instance.constructor),
@@ -314,10 +316,30 @@ export async function tenantScheduleAnnouncement(
     );
     return {};
   }
-  return { schedules: { tenant, items: (options.schedules ?? []).map(announcedSchedule) } };
+  return {
+    schedules: {
+      tenant,
+      items: await Promise.all((options.schedules ?? []).map(announcedSchedule)),
+    },
+  };
 }
 
-function announcedSchedule(s: ScheduledWorkflow): AnnouncedSchedule {
+/** A schedule's input as its singleton key reads it: parsed when the workflow has an `input` schema.
+ *  A fixed input that does not parse keeps the input as written (each fire is then rejected at start,
+ *  where the error is reported), so one bad schedule does not keep the worker from announcing. */
+async function scheduleKeyInput(
+  parseInput: ((input: unknown) => Promise<unknown>) | undefined,
+  input: unknown,
+): Promise<unknown> {
+  if (!parseInput) return input;
+  try {
+    return await parseInput(input);
+  } catch {
+    return input;
+  }
+}
+
+async function announcedSchedule(s: ScheduledWorkflow): Promise<AnnouncedSchedule> {
   const item: AnnouncedSchedule = { key: s.key, workflow: workflowName(s.workflow) };
   if (s.input !== undefined) item.input = s.input;
   if (s.everyMs !== undefined) item.everyMs = s.everyMs;
@@ -327,12 +349,14 @@ function announcedSchedule(s: ScheduledWorkflow): AnnouncedSchedule {
   if (s.overlap !== undefined) item.overlap = s.overlap;
   if (s.jitter !== undefined && s.jitter > 0) item.jitterMs = s.jitter;
   // A singleton workflow's key is a function of the input, so it is evaluated here, once, against
-  // the schedule's fixed input (by class only: a name gives no `@Workflow` metadata to read).
-  const singleton =
-    typeof s.workflow === 'function' ? getWorkflowMeta(s.workflow)?.singleton : undefined;
-  if (singleton) {
+  // the schedule's fixed input (by class only: a name gives no `@Workflow` metadata to read). Like
+  // every key, it reads the input as `run` will: parsed by the workflow's `input` schema.
+  const meta = typeof s.workflow === 'function' ? getWorkflowMeta(s.workflow) : undefined;
+  const singleton = meta?.singleton;
+  if (meta && singleton) {
+    const parseInput = workflowIo(meta).parseInput;
     item.singleton = {
-      key: singleton.key(s.input),
+      key: singleton.key(await scheduleKeyInput(parseInput, s.input)),
       ...(singleton.limit !== undefined ? { limit: singleton.limit } : {}),
       ...(singleton.maxQueueDepth !== undefined ? { maxQueueDepth: singleton.maxQueueDepth } : {}),
     };

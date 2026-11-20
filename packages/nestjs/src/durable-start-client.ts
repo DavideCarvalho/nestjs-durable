@@ -31,7 +31,11 @@ import { startRun } from './worker-sdk';
  * alone) cannot evaluate. Declared by `ThinWorkflowRegistrar` for every `@Workflow` it discovers.
  */
 export interface TenantWorkflowStartPolicy {
-  /** `@Workflow({ input, validateInput })`: rejects the start (throws) before anything is published. */
+  /** `@Workflow({ input })`: parses the input once (throwing rejects the start before anything is
+   *  published); `validateInput` and the singleton and concurrency keys read the parsed value. */
+  parseInput?: ((input: unknown) => unknown) | undefined;
+  /** `@Workflow({ validateInput })`: rejects the start (throws) before anything is published. It
+   *  receives the value `parseInput` returned, or the input as sent without one. */
   validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
   /** `@Workflow({ singleton })`: its key is evaluated here and carried on the start-run. */
   singleton?: SingletonConfig | undefined;
@@ -100,7 +104,7 @@ export class DurableStartClient {
 
   /**
    * The start-run fields a declared policy adds for `input`: it validates the input (throwing), and
-   * evaluates the singleton key and the default quota. A per-start `concurrency` wins over the
+   * evaluates the singleton key and the default quota against the parsed input. A per-start `concurrency` wins over the
    * workflow's.
    */
   private async applyPolicy(
@@ -110,11 +114,13 @@ export class DurableStartClient {
   ): Promise<{ singleton?: StartRunSingleton; concurrency?: StartOptions['concurrency'] }> {
     const policy = this.policies.get(workflow);
     if (!policy) return opts?.concurrency !== undefined ? { concurrency: opts.concurrency } : {};
-    await policy.validateInput?.(input);
-    const concurrency = await resolveConcurrency(opts?.concurrency, policy.concurrency, input);
+    // Parsed once, as on a local start: `validateInput` and the keys read the input as `run` will.
+    const keyInput = policy.parseInput ? await policy.parseInput(input) : input;
+    await policy.validateInput?.(keyInput);
+    const concurrency = await resolveConcurrency(opts?.concurrency, policy.concurrency, keyInput);
     const singleton = policy.singleton
       ? {
-          key: policy.singleton.key(input),
+          key: policy.singleton.key(keyInput),
           ...(policy.singleton.limit !== undefined ? { limit: policy.singleton.limit } : {}),
           ...(policy.singleton.maxQueueDepth !== undefined
             ? { maxQueueDepth: policy.singleton.maxQueueDepth }

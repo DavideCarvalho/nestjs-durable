@@ -21,7 +21,7 @@ import {
 } from '@dudousxd/nestjs-durable-core';
 import 'reflect-metadata';
 import { declaringFile, rememberDeclaringFile } from './origin';
-import type { IoSchema } from './schema-parse';
+import type { InferWorkflowInput, IoSchema } from './schema-parse';
 
 export const WORKFLOW_METADATA = Symbol('nestjs-durable:workflow');
 
@@ -60,7 +60,14 @@ export interface WorkflowMeta {
   requires?: string[] | undefined;
 }
 
-export interface WorkflowOptions {
+/**
+ * `@Workflow` options. `S` is the `input` schema's type, inferred from the option: the `singleton`
+ * and `concurrency` keys and `validateInput` then take the schema's parsed type (see
+ * {@link InferWorkflowInput}); without an `input` schema they take `unknown`, as they always did.
+ * Written without a type argument (`const opts: WorkflowOptions = …`, an interface extending it),
+ * it accepts any `input` schema and the callbacks take `unknown`, as before.
+ */
+export interface WorkflowOptions<S extends IoSchema | undefined = IoSchema | undefined> {
   name: string;
   version?: string;
   /**
@@ -87,18 +94,20 @@ export interface WorkflowOptions {
    * Serialize runs of this workflow that share a key — a durable FIFO mutex. e.g.
    * `singleton: { key: (input) => `base:${input.baseId}` }` runs at most one pipeline per base at a
    * time; same-key runs queue (suspended) and admit in creation order as slots free. `limit` (default
-   * 1) raises the concurrency.
+   * 1) raises the concurrency. With an `input` schema, `key` receives the parsed input (typed from
+   * the schema, the same value `run` gets); without one, the input as sent (`unknown`).
    */
-  singleton?: SingletonConfig;
+  singleton?: SingletonConfig<InferWorkflowInput<S>>;
   /**
    * A start-time concurrency QUOTA: at most `limit` runs sharing a key in flight, and a start over it
    * is REJECTED (`ConcurrencyLimitError`, nothing created) rather than queued. e.g.
    * `concurrency: { key: (input) => `tenant:${input.tenantId}`, limit: 8 }` caps what one tenant can
    * have executing at once. The key is shared across workflows; `limit` may be a (async) function of
    * the key for per-plan limits; `countStatuses` narrows what occupies a slot (default: every
-   * non-terminal status). Use `singleton` instead when excess runs should wait their turn.
+   * non-terminal status). Use `singleton` instead when excess runs should wait their turn. With an
+   * `input` schema, `key` receives the parsed input, typed from the schema, like `singleton`'s.
    */
-  concurrency?: ConcurrencyConfig;
+  concurrency?: ConcurrencyConfig<InferWorkflowInput<S>>;
   /**
    * Max wall-clock lifetime for a run of this workflow (e.g. `'2h'`, `'7 days'`, or ms), counted from
    * the run's creation. A run that outlives it is moved to `cancelled` (`execution_timeout`) by the
@@ -129,9 +138,10 @@ export interface WorkflowOptions {
    * workflow — bump `version`. A stored input that no longer parses fails the run with
    * `code: 'invalid_input'`.
    *
-   * `@Workflow({ name: 'checkout', input: CheckoutInput })` or `input: z.object({ … })`.
+   * `@Workflow({ name: 'checkout', input: CheckoutInput })` or `input: z.object({ … })`. Type `run`'s
+   * input from the same schema with `InferWorkflowInput<typeof CheckoutInput>`.
    */
-  input?: IoSchema;
+  input?: S;
   /**
    * The run's output schema (same forms as {@link input}). The value `run()` returns is parsed before
    * the run completes, and the parsed value is what the run stores as its output. A mismatch fails the
@@ -141,9 +151,9 @@ export interface WorkflowOptions {
   /**
    * A custom check at `start` (throw to reject) for a rule a schema can't express — a cross-field
    * invariant, an async lookup. It runs after `input` parses and receives the parsed value (the input
-   * as sent when there is no `input` schema).
+   * as sent when there is no `input` schema), typed from the schema.
    */
-  validateInput?: (input: unknown) => void | Promise<void>;
+  validateInput?: (input: InferWorkflowInput<S>) => void | Promise<void>;
   /**
    * Validate this workflow's {@link WorkflowCtx.upsertSearchAttributes} writes against a **Standard
    * Schema** (https://standardschema.dev — zod 3.24+, valibot, arktype, …). `ctx.upsertSearchAttributes`
@@ -196,7 +206,9 @@ export interface WorkflowOptions {
  * Marks a provider class as a durable workflow. Its `run(ctx, input)` method becomes the
  * workflow function the engine executes and replays.
  */
-export function Workflow(options: WorkflowOptions): ClassDecorator {
+export function Workflow<S extends IoSchema | undefined = undefined>(
+  options: WorkflowOptions<S>,
+): ClassDecorator {
   // Captured HERE, in the factory, because this is the one moment we are provably executing inside
   // the module that declares the workflow — by the time a registrar scans providers, the only thing
   // left of that module is a class object with no file on it. The path is resolved to the owning
@@ -211,12 +223,14 @@ export function Workflow(options: WorkflowOptions): ClassDecorator {
       deadLetterWorkflow: options.deadLetterWorkflow,
       onError: options.onError,
       tags: options.tags,
-      singleton: options.singleton,
-      concurrency: options.concurrency,
+      // The typed callbacks are stored erased: the engine calls them with the parsed input, which is
+      // exactly the type `S` gave them (see `workflowIo`).
+      singleton: options.singleton as SingletonConfig | undefined,
+      concurrency: options.concurrency as ConcurrencyConfig | undefined,
       executionTimeout: options.executionTimeout,
       input: options.input,
       output: options.output,
-      validateInput: options.validateInput,
+      validateInput: options.validateInput as WorkflowMeta['validateInput'],
       searchAttributes: options.searchAttributes,
       onEvent: options.onEvent,
       debounce: options.debounce,
