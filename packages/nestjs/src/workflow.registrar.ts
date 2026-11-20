@@ -142,7 +142,7 @@ export class WorkflowRegistrar
         concurrency: meta.concurrency,
         executionTimeout: meta.executionTimeout,
         requires: meta.requires,
-        validateInput: io.validateAtStart,
+        validateInput: io.validateParsed,
         parseInput: io.parseInput,
         searchAttributesSchema: meta.searchAttributes,
         onEvent: getOnEvents(meta, workflowCtor),

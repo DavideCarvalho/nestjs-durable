@@ -1,6 +1,6 @@
 import type { WorkflowCtx } from '@dudousxd/nestjs-durable-core';
 import { z } from 'zod';
-import { Workflow } from './decorators';
+import { Workflow, type WorkflowOptions } from './decorators';
 import type { InferWorkflowInput } from './schema-parse';
 
 // Compile-time only: with `@Workflow({ input })`, the `singleton` and `concurrency` keys and
@@ -113,5 +113,47 @@ export class UntypedNoAccess {
   singleton: { key: (input: { companyId: string }) => input.companyId },
 })
 export class Annotated {
+  async run() {}
+}
+
+// `WorkflowOptions` written without a type argument accepts any `input` schema, as before, and its
+// callbacks take `unknown` (the schema is not tracked through an annotation).
+const annotated: WorkflowOptions = {
+  name: 'annotated-options',
+  input: SyncInput,
+  singleton: {
+    key: (input) => {
+      assertType<Equals<typeof input, unknown>>(true);
+      return 'k';
+    },
+  },
+};
+assertType<Equals<Parameters<NonNullable<typeof annotated.validateInput>>[0], unknown>>(true);
+
+@Workflow(annotated)
+export class FromAnnotatedOptions {
+  async run() {}
+}
+
+// An interface that extends it, as an app's own options type might.
+interface AppWorkflowOptions extends WorkflowOptions {
+  team: string;
+}
+const extended: AppWorkflowOptions = { name: 'extended-options', team: 'ops', input: SyncInput };
+
+@Workflow(extended)
+export class FromExtendedOptions {
+  async run() {}
+}
+
+// With an explicit type argument the callbacks are typed again.
+const explicit: WorkflowOptions<typeof SyncInput> = {
+  name: 'explicit-options',
+  input: SyncInput,
+  singleton: { key: (input) => input.companyId },
+};
+
+@Workflow(explicit)
+export class FromExplicitOptions {
   async run() {}
 }

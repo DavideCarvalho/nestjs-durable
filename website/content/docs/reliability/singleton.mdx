@@ -70,9 +70,24 @@ export class SyncInventoryWorkflow {
 ```
 
 A wrong property (`input.storeID`) is a compile error. Without an `input` schema, `key` takes
-`unknown` and receives the input as sent, as before; a key written with a cast keeps compiling either
-way. The run still stores the input as sent, so the schema must be deterministic (see
-[Guard the run](/docs/production#14-guard-the-run-input-validation--a-lifetime-cap)).
+`unknown` and receives the input as sent, as before. A key that casts its input keeps compiling with
+a schema only when the cast type overlaps the parsed type; otherwise go through `unknown`
+(`input as unknown as LegacyInput`), or better, drop the cast. The run still stores the input as
+sent, so the schema must be deterministic (see
+[Guard the run](/docs/production#14-guard-the-run-input-validation--a-lifetime-cap)): each turn's
+admission parses the stored input again for its key. A turn whose stored input no longer parses
+runs without a slot, and the body fails it with `invalid_input` before any of its code runs.
+
+**Upgrading.** If the schema transforms or coerces the value (`.transform()`, `z.coerce.*`, a DTO),
+the key a new start computes can differ from the one a run queued before the upgrade carries. Until
+those older runs settle, an old run and a new start of the same entity hold separate slots, so they
+can run side by side. Drain the singleton workflow's backlog before upgrading if that matters. An
+older run still waiting is admitted under the key it was stamped with: the engine computes it the
+way the older engine did, from the stored input as sent, so a key that relies on parsed fields
+should tolerate the raw shape until those runs are gone (one that throws leaves the run waiting).
+
+The `singleton:` tag prefix belongs to the engine. A `singleton:` tag passed in a start's `tags` or a
+workflow's static `tags` is dropped, so a run can only ever queue under the key its input has.
 
 ## What happens when a second start arrives
 

@@ -64,8 +64,10 @@ export interface WorkflowMeta {
  * `@Workflow` options. `S` is the `input` schema's type, inferred from the option: the `singleton`
  * and `concurrency` keys and `validateInput` then take the schema's parsed type (see
  * {@link InferWorkflowInput}); without an `input` schema they take `unknown`, as they always did.
+ * Written without a type argument (`const opts: WorkflowOptions = …`, an interface extending it),
+ * it accepts any `input` schema and the callbacks take `unknown`, as before.
  */
-export interface WorkflowOptions<S extends IoSchema | undefined = undefined> {
+export interface WorkflowOptions<S extends IoSchema | undefined = IoSchema | undefined> {
   name: string;
   version?: string;
   /**

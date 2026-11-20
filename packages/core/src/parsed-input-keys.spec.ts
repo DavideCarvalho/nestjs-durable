@@ -83,9 +83,21 @@ describe('the keys read the parsed input when the workflow registers parseInput'
     for (const input of seen) expect(input).toEqual({ company: 'ACME' });
   });
 
-  it('admits a run that carries no key tag (singleton added later) under its parsed input', async () => {
+  it('does not admit a run that carries no key tag (a singleton added later): it never runs', async () => {
+    // Pre-existing: the store admits only a run that carries the tag it is claimed under, and a run
+    // created before the workflow became a singleton carries none. The key is still computed from
+    // the parsed input, never the raw one.
     const { store, engine, seen, key } = setup();
-    engine.register('job', '1', async () => 'done', { parseInput, singleton: { key } });
+    let ran = false;
+    engine.register(
+      'job',
+      '1',
+      async () => {
+        ran = true;
+        return 'done';
+      },
+      { parseInput, singleton: { key } },
+    );
     const now = new Date();
     await store.createRun({
       id: 'legacy',
@@ -99,19 +111,32 @@ describe('the keys read the parsed input when the workflow registers parseInput'
     await engine.runOne('legacy');
     await engine.drain();
     expect(seen).toEqual([{ company: 'ACME' }]);
+    expect(ran).toBe(false);
+    const run = await store.getRun('legacy');
+    expect(run?.status).not.toBe('completed');
+    expect(run?.tags ?? []).not.toContain('durable:singleton:admitted');
   });
 
-  it('falls back to the stored input when it no longer parses (the body then fails the run)', async () => {
+  it('runs a turn whose stored input no longer parses without a slot, so the body can fail it', async () => {
     const { store, engine, seen } = setup();
-    engine.register('job', '1', async () => 'done', {
-      parseInput,
-      singleton: {
-        key: (input) => {
-          seen.push(input);
-          return 'k';
+    engine.register(
+      'job',
+      '1',
+      async (_ctx, input) => {
+        // What the nestjs body wrapper does first: parse, failing the run on invalid input.
+        await parseInput(input);
+        return 'done';
+      },
+      {
+        parseInput,
+        singleton: {
+          key: (input) => {
+            seen.push(input);
+            return 'k';
+          },
         },
       },
-    });
+    );
     const now = new Date();
     await store.createRun({
       id: 'stale',
@@ -119,12 +144,15 @@ describe('the keys read the parsed input when the workflow registers parseInput'
       workflowVersion: '1',
       status: 'pending',
       input: { other: true },
+      tags: ['singleton:k'],
       createdAt: now,
       updatedAt: now,
     });
     await engine.runOne('stale');
-    await engine.drain();
-    expect(seen).toEqual([{ other: true }]);
+    await engine.waitForRun('stale');
+    // The key is never called with the raw input, and the run settles instead of waiting forever.
+    expect(seen).toEqual([]);
+    expect((await store.getRun('stale'))?.status).toBe('failed');
   });
 
   it('a requeued run is admitted again under the key of its parsed input', async () => {
@@ -166,5 +194,126 @@ describe('the keys read the parsed input when the workflow registers parseInput'
     expect((await store.getRun('r1'))?.tags).toEqual(
       expect.arrayContaining(['singleton:c:acme', 'concurrency:c:acme']),
     );
+  });
+
+  it('admits a run queued before the upgrade under the raw-input key it was stamped with', async () => {
+    const { store, engine } = setup();
+    let ran = false;
+    engine.register(
+      'job',
+      '1',
+      async () => {
+        ran = true;
+        return 'done';
+      },
+      {
+        parseInput,
+        // Written for either shape, as a key that worked before the upgrade still does.
+        singleton: {
+          key: (input) =>
+            `company:${(input as Partial<Parsed>).company ?? (input as Partial<Raw>).c}`,
+        },
+      },
+    );
+    const now = new Date();
+    await store.createRun({
+      id: 'queued-before',
+      workflow: 'job',
+      workflowVersion: '1',
+      status: 'pending',
+      input: { c: 'acme' },
+      tags: ['singleton:company:acme'],
+      createdAt: now,
+      updatedAt: now,
+    });
+    await engine.runOne('queued-before');
+    await engine.waitForRun('queued-before');
+    expect(ran).toBe(true);
+    expect((await store.getRun('queued-before'))?.status).toBe('completed');
+  });
+
+  it('parses the input once at start and hands the parsed value to validateInput', async () => {
+    const { engine } = setup();
+    let parses = 0;
+    const validated: unknown[] = [];
+    engine.register('job', '1', async () => 'done', {
+      parseInput: async (input) => {
+        parses += 1;
+        return parseInput(input);
+      },
+      validateInput: (input) => void validated.push(input),
+      singleton: { key: () => 'k' },
+      concurrency: { key: () => 'q', limit: 5 },
+    });
+    await engine.start('job', { c: 'acme' }, 'r1');
+    expect(parses).toBe(1);
+    expect(validated).toEqual([{ company: 'ACME' }]);
+    await engine.drain();
+  });
+
+  it('a tenant start whose input does not parse is recorded as rejected, not thrown', async () => {
+    const { store, engine, seen, key } = setup();
+    engine.register('job', '1', async () => 'done', { parseInput, singleton: { key } });
+    const result = await engine.startForTenant(
+      { tenant: 'acme', workflow: 'job', input: { nope: 1 }, runId: 'bad' },
+      'acme',
+      {},
+    );
+    expect(result.status).toBe('failed');
+    expect((await store.getRun('bad'))?.status).toBe('failed');
+    expect(seen).toEqual([]);
+  });
+});
+
+describe('caller tags never carry a singleton key', () => {
+  it('drops a caller `singleton:` tag, so a run cannot queue or be admitted under a key it lacks', async () => {
+    const { store, engine } = setup();
+    const entered: string[] = [];
+    engine.register(
+      'job',
+      '1',
+      async (ctx) => {
+        await ctx.localStep('enter', async () => void entered.push(ctx.runId));
+        await ctx.waitForSignal(`go:${ctx.runId}`);
+      },
+      { parseInput, singleton: { key: (input) => `company:${(input as Parsed).company}` } },
+    );
+    await engine.start('job', { c: 'acme' }, 'a', { tags: ['singleton:other', 'mine'] });
+    await engine.start('job', { c: 'acme' }, 'b', { tags: ['singleton:elsewhere'] });
+    await engine.drain();
+    // One logical key, one slot: the second run waits behind the first.
+    expect(entered).toEqual(['a']);
+    expect((await store.getRun('b'))?.status).toBe('suspended');
+    const a = await store.getRun('a');
+    expect(a?.tags).toEqual(expect.arrayContaining(['mine', 'singleton:company:ACME']));
+    expect(a?.tags).not.toContain('singleton:other');
+    expect((await store.getRun('b'))?.tags).not.toContain('singleton:elsewhere');
+  });
+
+  it('a static @Workflow tag with the prefix is dropped too', async () => {
+    const { store, engine } = setup();
+    engine.register('job', '1', async () => 'done', {
+      tags: ['singleton:static', 'billing'],
+      singleton: { key: () => 'k' },
+    });
+    await engine.start('job', {}, 'r1');
+    await engine.drain();
+    const tags = (await store.getRun('r1'))?.tags ?? [];
+    expect(tags.filter((t) => t.startsWith('singleton:'))).toEqual(['singleton:k']);
+    expect(tags).toContain('billing');
+  });
+
+  it('retryWithInput re-derives the key from the new input instead of keeping the old tag', async () => {
+    const { store, engine } = setup();
+    engine.register('job', '1', async () => 'done', {
+      parseInput,
+      singleton: { key: (input) => `company:${(input as Parsed).company}` },
+    });
+    await startRun(engine, 'job', { c: 'acme' }, 'r1');
+    const retried = await engine.retryWithInput('r1', { c: 'globex' }, 'r2');
+    expect(retried).toEqual({ runId: 'r2' });
+    await engine.drain();
+    const tags = (await store.getRun('r2'))?.tags ?? [];
+    expect(tags.filter((t) => t.startsWith('singleton:'))).toEqual(['singleton:company:GLOBEX']);
   });
 });

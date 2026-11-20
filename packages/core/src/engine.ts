@@ -435,7 +435,24 @@ function tenantScopedKey(namespace: string | undefined, key: string): string {
   return namespace && namespace !== 'default' ? `${namespace}/${key}` : key;
 }
 
-/** The `singleton:` key tag a run carries (never the engine's `durable:singleton:*` markers). */
+/**
+ * A caller's start tags without any `singleton:<key>` tag: that prefix is the engine's (see
+ * `ENGINE_MINTED_TAG_PREFIXES`), and admission, wake-ups and convention serving read a run's
+ * key from it. A caller tag there would let a run queue or be admitted under a key its input does
+ * not have. Also drops one carried over from another run (`retryWithInput`), whose key is
+ * re-derived from the new input.
+ */
+function callerTags(tags: string[] | undefined): string[] | undefined {
+  return tags?.filter((tag) => !tag.startsWith(SINGLETON_TAG_PREFIX));
+}
+
+const SINGLETON_TAG_PREFIX = 'singleton:';
+
+/**
+ * The `singleton:` key tag a run carries (never the engine's `durable:singleton:*` markers). Only
+ * the engine writes one ({@link callerTags} drops a caller's at every start), so a run carries at
+ * most one.
+ */
 function singletonKeyOf(run: Pick<WorkflowRun, 'tags'>): string | undefined {
   const tag = run.tags?.find((t) => t.startsWith('singleton:'));
   return tag?.slice('singleton:'.length);
@@ -2142,10 +2159,12 @@ export class WorkflowEngine {
       validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
       /**
        * The input as the body sees it: a schema's parsed (coerced/transformed) value, sync or async,
-       * throwing on input that does not parse. When set, the `singleton` and `concurrency` keys
-       * receive this value instead of the input as sent, at `start` and at each turn's singleton
-       * admission, so a key reads the same value `run(ctx, input)` does. The run still stores the
-       * input as sent. `@dudousxd/nestjs-durable` supplies it from `@Workflow({ input })`.
+       * throwing on input that does not parse. When set, `start` parses the input once: a failure
+       * rejects the start like a failed `validateInput`, and `validateInput` and the `singleton` and
+       * `concurrency` keys receive the parsed value instead of the input as sent. Each turn's
+       * singleton admission parses the stored input again for its key (a turn whose stored input
+       * no longer parses runs without a slot, and the body fails it). The run still stores the input
+       * as sent. `@dudousxd/nestjs-durable` supplies it from `@Workflow({ input })`.
        */
       parseInput?: ((input: unknown) => unknown) | undefined;
       /** Typed/validated `searchAttributes` shape — see `RegisteredWorkflow.searchAttributesSchema`. */
@@ -4073,16 +4092,25 @@ export class WorkflowEngine {
           : `workflow ${versionKey(name, pinned)} is not registered — a pinned start never falls back to the newest version (registered: ${this.registeredVersions(name)})`,
       );
     }
-    // Validate the input up front — a bad payload is rejected before any run is created.
-    if (parkUnroutable && registered.validateInput) {
+    // Validate the input up front — a bad payload is rejected before any run is created. With
+    // `parseInput` the input is parsed ONCE here: a parse failure rejects the start like a failed
+    // `validateInput`, `validateInput` checks the parsed value, and the keys below read it too.
+    const check = registered;
+    const parseAndValidate = async (): Promise<unknown> => {
+      const parsed = check.parseInput ? await check.parseInput(input) : input;
+      await check.validateInput?.(parsed);
+      return parsed;
+    };
+    let keyInput: unknown;
+    if (parkUnroutable && (registered.validateInput || registered.parseInput)) {
       // A tenant start: a rejected input is an answer to store, not a failure to redeliver.
       try {
-        await registered.validateInput(input);
+        keyInput = await parseAndValidate();
       } catch (err) {
         throw new TenantStartInvalid(err);
       }
     } else {
-      await registered.validateInput?.(input);
+      keyInput = await parseAndValidate();
     }
     // Idempotent by run id: a redelivered trigger (at-least-once queues) or a scheduler re-tick for
     // the same id is a no-op, returning the existing run's state instead of starting a duplicate.
@@ -4090,12 +4118,7 @@ export class WorkflowEngine {
     if (prior) return this.existingStartResult(prior);
     // Start-time concurrency quota (per-start override, else the workflow's): reject BEFORE creating
     // anything when the key's in-flight runs already reach the limit. See {@link ConcurrencyQuota}.
-    // The keys read the input as the body will (a schema's parsed value), not the input as sent.
-    // Parsed AFTER validation, so input that does not parse was already rejected above.
-    const keyInput =
-      registered.parseInput && (registered.singleton || registered.concurrency)
-        ? await registered.parseInput(input)
-        : input;
+    // The keys read `keyInput`: the input as the body will see it (a schema's parsed value).
     const quota = await resolveConcurrency(opts?.concurrency, registered.concurrency, keyInput);
     if (quota) await assertConcurrency(this.store, name, quota);
     const now = new Date();
@@ -4104,13 +4127,13 @@ export class WorkflowEngine {
     // whose version nobody declared stamps `version:undeclared` on the same principle: the fact has
     // to travel WITH the run, because whoever checks a pin later reads the run row and nothing else.
     const stampedTags = [
-      ...(opts?.tags ?? []),
+      ...(callerTags(opts?.tags) ?? []),
       ...(registered.singleton ? [this.singletons.tag(registered.singleton, keyInput)] : []),
       ...(quota ? [concurrencyTag(quota.key)] : []),
       ...(registered.versionDeclared === false ? [VERSION_UNDECLARED_TAG] : []),
     ];
     // Admission is owned by the store, never supplied or inherited by a fresh run.
-    const tags = mergeTags(registered.tags, stampedTags)?.filter(
+    const tags = mergeTags(callerTags(registered.tags), stampedTags)?.filter(
       (tag) => !SINGLETON_RESERVED_TAGS.includes(tag),
     );
     // Singleton back-pressure: reject a start that would grow the same-key backlog past
@@ -4216,7 +4239,7 @@ export class WorkflowEngine {
     };
     const now = new Date();
     const tags = mergeTags(undefined, [
-      ...(opts?.tags ?? []),
+      ...(callerTags(opts?.tags) ?? []),
       ...(singleton ? [this.singletons.tag(singleton, input)] : []),
       ...(quota ? [concurrencyTag(quota.key)] : []),
       ...(pinned === undefined ? [VERSION_UNDECLARED_TAG] : []),
@@ -4390,7 +4413,7 @@ export class WorkflowEngine {
       namespace: poolNamespace(opts.namespace) ?? this.namespace,
       input,
       // The same derived tags an admitted or parked start carries, so quota-key queries find it.
-      tags: mergeTags(opts.tags, [
+      tags: mergeTags(callerTags(opts.tags), [
         ...(opts.concurrency ? [concurrencyTag(opts.concurrency.key)] : []),
         ...(opts.version === undefined ? [VERSION_UNDECLARED_TAG] : []),
       ])?.filter((tag) => !SINGLETON_RESERVED_TAGS.includes(tag)),

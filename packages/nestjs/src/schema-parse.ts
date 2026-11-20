@@ -33,13 +33,14 @@ export type IoSchema = StandardSchemaV1 | DtoClass | z.ZodType;
  */
 export type InferWorkflowInput<S> = [S] extends [undefined]
   ? unknown
-  : S extends StandardSchemaV1
+  : [S] extends [StandardSchemaV1]
     ? StandardSchemaV1.InferOutput<S>
-    : S extends z.ZodType
+    : [S] extends [z.ZodType]
       ? z.output<S>
-      : S extends DtoClass
+      : [S] extends [DtoClass]
         ? InstanceType<S>
-        : unknown;
+        : // A union of schema kinds (`WorkflowOptions` written without a type argument): unknown.
+          unknown;
 
 /** Parses a value against a schema: resolves the schema's output (coerced/transformed), or throws. */
 export type Parser = (value: unknown) => Promise<unknown>;

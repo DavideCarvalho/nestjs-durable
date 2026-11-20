@@ -151,7 +151,7 @@ export class ThinWorkflowRegistrar implements OnModuleInit {
       if (typeof declare === 'function') {
         const io = workflowIo(meta);
         const policy: TenantWorkflowStartPolicy = {
-          validateInput: io.validateAtStart,
+          validateInput: io.validateParsed,
           parseInput: io.parseInput,
           singleton: meta.singleton,
           concurrency: meta.concurrency,

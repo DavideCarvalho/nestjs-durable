@@ -21,8 +21,12 @@ import { type InferWorkflowInput, Workflow } from './index';
  * upper-cases `company`, so a key handed the raw input would see a string and a lower-case name.
  */
 
+let parses = 0;
 const SyncInput = z.object({
-  company: z.string().transform((s) => s.toUpperCase()),
+  company: z.string().transform((s) => {
+    parses += 1;
+    return s.toUpperCase();
+  }),
   at: z.coerce.date(),
 });
 
@@ -59,6 +63,7 @@ function expectParsed(values: unknown[]): void {
 }
 
 afterEach(() => {
+  parses = 0;
   seen.length = 0;
   ran.length = 0;
 });
@@ -143,7 +148,10 @@ describe('a tenant evaluates @Workflow({ input }) keys against the parsed input'
     );
     const policies = (real as unknown as { policies: Map<string, unknown> }).policies;
     for (const [name, policy] of policies) facade.declareWorkflow(name, policy as never);
+    parses = 0;
     await facade.start('typed-key-sync', RAW, 'r1');
+    // Parsed once for validation and both keys.
+    expect(parses).toBe(1);
     expect(sink[0]?.data).toMatchObject({
       input: RAW,
       singleton: { key: 'company:ACME:2026' },

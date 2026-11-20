@@ -31,10 +31,12 @@ import { startRun } from './worker-sdk';
  * alone) cannot evaluate. Declared by `ThinWorkflowRegistrar` for every `@Workflow` it discovers.
  */
 export interface TenantWorkflowStartPolicy {
-  /** `@Workflow({ input, validateInput })`: rejects the start (throws) before anything is published. */
-  validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
-  /** `@Workflow({ input })`: the parser whose value the singleton and concurrency keys read. */
+  /** `@Workflow({ input })`: parses the input once (throwing rejects the start before anything is
+   *  published); `validateInput` and the singleton and concurrency keys read the parsed value. */
   parseInput?: ((input: unknown) => unknown) | undefined;
+  /** `@Workflow({ validateInput })`: rejects the start (throws) before anything is published. It
+   *  receives the value `parseInput` returned, or the input as sent without one. */
+  validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
   /** `@Workflow({ singleton })`: its key is evaluated here and carried on the start-run. */
   singleton?: SingletonConfig | undefined;
   /** `@Workflow({ concurrency })`: the default quota, evaluated here unless the start passes one. */
@@ -112,12 +114,9 @@ export class DurableStartClient {
   ): Promise<{ singleton?: StartRunSingleton; concurrency?: StartOptions['concurrency'] }> {
     const policy = this.policies.get(workflow);
     if (!policy) return opts?.concurrency !== undefined ? { concurrency: opts.concurrency } : {};
-    await policy.validateInput?.(input);
-    // The keys read the input as `run` will (parsed by the `input` schema), as on a local start.
-    const keyInput =
-      policy.parseInput && (policy.singleton || policy.concurrency)
-        ? await policy.parseInput(input)
-        : input;
+    // Parsed once, as on a local start: `validateInput` and the keys read the input as `run` will.
+    const keyInput = policy.parseInput ? await policy.parseInput(input) : input;
+    await policy.validateInput?.(keyInput);
     const concurrency = await resolveConcurrency(opts?.concurrency, policy.concurrency, keyInput);
     const singleton = policy.singleton
       ? {
