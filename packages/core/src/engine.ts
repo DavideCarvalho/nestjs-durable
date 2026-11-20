@@ -9857,9 +9857,11 @@ export class WorkflowEngine {
 
   private async runExecutionTurn(
     run: WorkflowRun,
-    fn: WorkflowFn,
+    registeredFn: WorkflowFn,
     registered: RegisteredWorkflow | undefined,
   ): Promise<RunResult> {
+    // The body this turn runs: the registered one, unless admission replaces it (see below).
+    let fn = registeredFn;
     // A run persisted as `cancelling` is a compensating cancel in flight — possibly re-driven by
     // recovery after a crash that lost the in-memory cancel flag. Re-derive the intent from the status
     // so the replay below reaches the WorkflowSuspended + cancelRequested branch and compensates →
