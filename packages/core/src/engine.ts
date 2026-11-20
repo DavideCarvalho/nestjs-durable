@@ -378,6 +378,27 @@ const BREAKPOINT = 'breakpoint';
 /** Appended to `awaitingDecisionTaskId` once a lost dispatched turn was counted, so it is counted
  *  once however long its re-drive waits; the next dispatch replaces the whole marker. */
 const LOST_TURN_SUFFIX = ':lost';
+/** Appended to `awaitingDecisionTaskId` when a turn's lapsed deadline was pushed out once after an
+ *  engine boot, so a fleet that keeps restarting cannot postpone the same turn again. */
+const GRACED_TURN_SUFFIX = ':grace';
+
+/**
+ * Whether `run` still awaits the turn `decision` answers: its marker, with or without the markers
+ * {@link noteLapsedTurn} appends. A late decision of a turn counted as lost but not yet re-dispatched is
+ * still that turn's answer; once the re-drive dispatches, the marker names the next turn instead.
+ */
+function awaitsDecision(run: WorkflowRun, decision: { taskId: string }): boolean {
+  const marker = run.awaitingDecisionTaskId;
+  return marker !== undefined && awaitedTaskId(marker) === decision.taskId;
+}
+
+/** The turn's own task id, without the markers {@link noteLapsedTurn} appends to it. */
+function awaitedTaskId(marker: string): string {
+  let id = marker;
+  if (id.endsWith(LOST_TURN_SUFFIX)) id = id.slice(0, -LOST_TURN_SUFFIX.length);
+  if (id.endsWith(GRACED_TURN_SUFFIX)) id = id.slice(0, -GRACED_TURN_SUFFIX.length);
+  return id;
+}
 /** Pending runs one {@link WorkflowEngine.runPending} poll takes at most. */
 const PENDING_POLL_BATCH = 100;
 /** Default size of the sticky continuation cache (see {@link WorkflowEngineDeps.stickyRuns}). */
@@ -5824,7 +5845,10 @@ export class WorkflowEngine {
    * dispatch replaces it with the next turn's id. Not counted, and the re-drive left for later:
    *  - while the broker still holds the task unstarted (a backed-up queue, not a dead worker), or
    *  - within one turn window of this engine's boot, when beats from live workers have not yet had
-   *    the chance to push a deadline that went stale while the engine was down.
+   *    the chance to push a deadline that went stale while the engine was down. Once per turn (the
+   *    `:grace` marker): a lapse after that takes the normal path, whichever instance judges it.
+   * A late decision of a counted turn is still applied while the re-drive has not dispatched yet
+   * (see `awaitsDecision`), and gives the attempt back.
    * Never counted by an instance that cannot resolve the workflow (it re-drives nothing), nor for a
    * decision that arrives, a worker that keeps beating, or any write a healthy turn makes on its way.
    *
@@ -5850,10 +5874,18 @@ export class WorkflowEngine {
     // it untouched, so its unregistered grace clock keeps running.
     if (!this.isRegisteredHere(run) && !(await this.canResolveWorkflow(run))) return undefined;
     const windowMs = this.dispatchedTurnSilenceMs;
-    if (windowMs != null && nowMs < this.bootedAtMs + windowMs) {
-      return this.leaveTurnWaiting(run, this.bootedAtMs + windowMs);
+    // Once per turn: an instance that restarts again inside its own window finds the marker and takes
+    // the normal path, so restarts cannot postpone a lost turn for ever.
+    if (
+      windowMs != null &&
+      nowMs < this.bootedAtMs + windowMs &&
+      !awaited.endsWith(GRACED_TURN_SUFFIX)
+    ) {
+      return this.leaveTurnWaiting(run, this.bootedAtMs + windowMs, {
+        awaitingDecisionTaskId: `${awaited}${GRACED_TURN_SUFFIX}`,
+      });
     }
-    const state = await this.dispatchedTurnState(run, awaited);
+    const state = await this.dispatchedTurnState(run, awaitedTaskId(awaited));
     if (state === 'queued') return this.leaveTurnWaiting(run, nowMs + (windowMs ?? this.leaseMs));
     // The broker could not say: re-drive as before, without counting a turn that may still be queued.
     if (state === 'error') return undefined;
@@ -5878,12 +5910,16 @@ export class WorkflowEngine {
   }
 
   /** Push a lapsed turn's deadline to `until` without re-driving it, and give the lease back. */
-  private async leaveTurnWaiting(run: WorkflowRun, until: number): Promise<RunResult> {
+  private async leaveTurnWaiting(
+    run: WorkflowRun,
+    until: number,
+    extra: Partial<WorkflowRun> = {},
+  ): Promise<RunResult> {
     await (this.store.updateRunIf ?? this.updateRunIfFallback).call(
       this.store,
       run.id,
       ['suspended'],
-      { wakeAt: until, updatedAt: new Date() },
+      { ...extra, wakeAt: until, updatedAt: new Date() },
     );
     await this.store.releaseRunLock(run.id);
     return { runId: run.id, status: 'suspended' };
@@ -12018,7 +12054,7 @@ export class WorkflowEngine {
     // (and not already terminal) is a candidate. A re-driven turn has a different taskId, so a late
     // decision for the prior turn is dropped here.
     const run = await this.store.getRun(decision.runId);
-    if (!run || run.awaitingDecisionTaskId !== decision.taskId) return;
+    if (!run || !awaitsDecision(run, decision)) return;
     if (run.status === 'cancelled' || run.status === 'completed' || run.status === 'dead') return;
     if (
       this.namespace !== undefined &&
@@ -12041,7 +12077,7 @@ export class WorkflowEngine {
       // Re-read under the lease and re-check the marker — it may have changed (a re-drive applied
       // first, or another decision raced in) between the unlocked pre-check and acquiring the lease.
       const fresh = await this.store.getRun(decision.runId);
-      if (!fresh || fresh.awaitingDecisionTaskId !== decision.taskId) return;
+      if (!fresh || !awaitsDecision(fresh, decision)) return;
       if (fresh.status === 'cancelled' || fresh.status === 'completed' || fresh.status === 'dead') {
         return;
       }

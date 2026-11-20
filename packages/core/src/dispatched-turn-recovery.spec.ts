@@ -462,3 +462,46 @@ describe('dead-lettering a lost turn', () => {
     expect(h.worker.tasks).toHaveLength(1);
   });
 });
+
+describe('a lost dispatched turn and restarts or late answers', () => {
+  it('is re-dispatched even when every engine restarts within its own boot window', async () => {
+    const store = new InMemoryStateStore();
+    const worker = new Worker();
+    const clock = { now: Date.now() };
+    await started({ store, worker, clock });
+
+    // The worker died with the turn. Ten engines in a row each live one pass, a window apart: each
+    // boots, polls once and goes down again before its own boot window ends.
+    for (let i = 0; i < 10; i += 1) {
+      clock.now += SILENCE_MS + 1;
+      const engine = harness({ store, worker, clock });
+      await engine.tick();
+    }
+    // The first restart pushed the deadline out once; the next one re-dispatched the turn.
+    expect(worker.tasks.length).toBeGreaterThan(1);
+    expect((await store.getRun(RUN_ID))?.recoveryAttempts).toBeGreaterThanOrEqual(1);
+  });
+
+  it("applies a counted turn's late decision that arrives before the re-dispatch, and gives the attempt back", async () => {
+    const h = await started({ mode: 'hands due runs to the run queue' });
+    h.held.wakes = true;
+
+    h.advance(SILENCE_MS + 1);
+    await h.tick();
+    expect(await h.attempts()).toBe(1);
+    expect(h.worker.tasks).toHaveLength(1);
+
+    // The worker was only slow: its decision lands while the re-drive still waits on the run queue.
+    await h.worker.answer({ status: 'completed', commands: [], output: 'late but right' });
+    await until(async () => (await h.run())?.status === 'completed');
+    const run = await h.run();
+    expect(run?.output).toBe('late but right');
+    expect(run?.recoveryAttempts ?? 0).toBe(0);
+
+    // The held wake, when it finally runs, finds nothing to do.
+    h.held.wakes = false;
+    h.advance(LEASE_MS + 1);
+    await h.tick();
+    expect(h.worker.tasks).toHaveLength(1);
+  });
+});

@@ -43,11 +43,6 @@ import {
 import { type ConnectionOptions, DelayedError, type Job, Queue, Worker } from 'bullmq';
 import { Redis, type RedisOptions } from 'ioredis';
 import { HandlerLimiter } from './handler-limiter';
-
-/** BullMQ job id of a workflow task: its `taskId`, with the `:` BullMQ refuses in a custom id swapped. */
-function workflowTaskJobId(taskId: string): string {
-  return `wf-${taskId.replace(/:/g, '_')}`;
-}
 import {
   REGISTRY_READ_MAX_AGE_MS,
   type RegistryEntry,
@@ -55,6 +50,20 @@ import {
   WorkerRegistry,
   type WorkerRegistryOptions,
 } from './worker-registry';
+
+/**
+ * BullMQ job id of a workflow task, so `workflowTaskState` can find the job again. BullMQ refuses a
+ * `:` in a custom id, so the `taskId` is escaped one-to-one (`_` to `_u`, then `:` to `_c`): two task
+ * ids never share a job id.
+ *
+ * BullMQ silently ignores an `add` whose id an existing job already holds. That is safe only because
+ * the engine mints a fresh `taskId` for every dispatch and a workflow-task job is removed once it
+ * completes or fails (`removeOnComplete` and `removeOnFail` true in `jobOptions`): keep both, or a
+ * dispatch could be dropped.
+ */
+function workflowTaskJobId(taskId: string): string {
+  return `wf-${taskId.replace(/_/g, '_u').replace(/:/g, '_c')}`;
+}
 
 export type { WorkerRegistryOptions } from './worker-registry';
 
