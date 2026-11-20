@@ -44,6 +44,36 @@ has three fields:
 - `limit` — max concurrent runs sharing the key. Defaults to `1` (a true mutex, one at a time).
 - `maxQueueDepth` — caps the same-key *backlog* (see below). Omit for the old unbounded-queue behavior.
 
+### A key typed from the input schema
+
+When the workflow declares an `input` schema, `key` is typed from the schema's **parsed** type, so it
+needs no cast, and at runtime it receives that parsed value: the same one `run(ctx, input)` gets, at
+start, on every turn's admission, for a schedule and for a tenant start. `InferWorkflowInput` types
+`run`'s input from the same schema:
+
+```ts
+import { InferWorkflowInput, Workflow } from '@dudousxd/nestjs-durable';
+import { z } from 'zod';
+
+const SyncInput = z.object({ storeId: z.string(), since: z.coerce.date() });
+
+@Workflow({
+  name: 'sync-inventory',
+  input: SyncInput,
+  singleton: { key: (input) => `store:${input.storeId}` }, // input: { storeId: string; since: Date }
+})
+export class SyncInventoryWorkflow {
+  async run(ctx: WorkflowCtx, input: InferWorkflowInput<typeof SyncInput>) {
+    // input.since is a Date here, as it is in `key`
+  }
+}
+```
+
+A wrong property (`input.storeID`) is a compile error. Without an `input` schema, `key` takes
+`unknown` and receives the input as sent, as before; a key written with a cast keeps compiling either
+way. The run still stores the input as sent, so the schema must be deterministic (see
+[Guard the run](/docs/production#14-guard-the-run-input-validation--a-lifetime-cap)).
+
 ## What happens when a second start arrives
 
 A singleton run is tagged `singleton:<key>` at start time. Before its body executes, the store

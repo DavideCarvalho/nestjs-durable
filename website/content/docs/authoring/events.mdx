@@ -416,7 +416,10 @@ export class RefreshSummariesWorkflow {
 }
 ```
 
-`key` is typed with the subscriber's input. With `batch`, the subscriber's `run` takes
+`key` is typed with the subscriber's input: the return type of `input`, so it needs no cast. It runs
+when the event is routed, before any run exists, so it receives exactly what `input` builds, not what
+the subscriber's own `@Workflow({ input })` schema parses that to (unlike the `singleton` and
+`concurrency` keys, which read the parsed value). With `batch`, the subscriber's `run` takes
 `{ events: TInput[] }`, which the decorator type-checks. The option sets the workflow's coalescing,
 so it applies to every event the workflow subscribes to. A subscription takes `debounce` or `batch`,
 not both, and a workflow whose `@Workflow({ debounce | batch })` says something different fails at

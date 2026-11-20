@@ -103,14 +103,21 @@ export class SingletonGate {
     }
   }
 
-  /** Preserve durable holders and atomically claim one of the remaining slots. */
-  async admit(run: WorkflowRun, cfg: SingletonConfig): Promise<boolean> {
+  /**
+   * Preserve durable holders and atomically claim one of the remaining slots. With `parseInput` (the
+   * workflow's input schema), the key reads the parsed input, the value `run(ctx, input)` gets.
+   */
+  async admit(
+    run: WorkflowRun,
+    cfg: SingletonConfig,
+    parseInput?: ((input: unknown) => unknown) | undefined,
+  ): Promise<boolean> {
     if (!this.deps.store.tryAdmitSingleton) {
       throw new Error(
         'Singleton workflows require StateStore.tryAdmitSingleton for atomic durable admission',
       );
     }
-    const admitted = await this.claim(run, cfg);
+    const admitted = await this.claim(run, cfg, await this.admissionTag(run, cfg, parseInput));
     if (admitted && !run.tags?.includes(SINGLETON_ADMITTED_TAG)) {
       run.tags = [
         ...(run.tags ?? []).filter((tag) => tag !== SINGLETON_TRACKED_TAG),
@@ -127,14 +134,38 @@ export class SingletonGate {
    * during the claim, and another instance may now hold the run, its slot and newer tags. A later
    * sweep re-drives the run: recovery once it is unleased, or its timer if it is parked.
    */
-  private async claim(run: WorkflowRun, cfg: SingletonConfig): Promise<boolean> {
+  /**
+   * The key tag a turn's admission claims under. Without a schema it is the key of the stored input,
+   * as it always was. With one, it is the key of the PARSED input, which is what `start` stamped on
+   * the run (`singleton:<key>`); the stamped tag is reused when present, so a turn neither re-parses
+   * nor runs the key callback. A stored input that no longer parses falls back to the key of the
+   * input as stored (the body then fails the run with `invalid_input`).
+   */
+  private async admissionTag(
+    run: WorkflowRun,
+    cfg: SingletonConfig,
+    parseInput: ((input: unknown) => unknown) | undefined,
+  ): Promise<string> {
+    if (!parseInput) return this.tag(cfg, run.input);
+    const stamped = run.tags?.find((t) => t.startsWith('singleton:'));
+    if (stamped) return stamped;
+    let parsed: unknown;
+    try {
+      parsed = await parseInput(run.input);
+    } catch {
+      return this.tag(cfg, run.input);
+    }
+    return this.tag(cfg, parsed);
+  }
+
+  private async claim(run: WorkflowRun, cfg: SingletonConfig, tag: string): Promise<boolean> {
     const admit = this.deps.store.tryAdmitSingleton as NonNullable<StateStore['tryAdmitSingleton']>;
     for (let attempt = 1; ; attempt += 1) {
       try {
         return await admit.call(
           this.deps.store,
           run.id,
-          this.tag(cfg, run.input),
+          tag,
           run.workflow,
           cfg.limit ?? 1,
           this.retryWakeAt(),

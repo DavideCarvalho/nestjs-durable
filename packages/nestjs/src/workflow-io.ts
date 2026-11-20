@@ -7,6 +7,8 @@ type WorkflowBody = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
 /**
  * The `@Workflow({ input, output, validateInput })` contract, split into the two places it applies.
  *
+ * - `parseInput` is handed to the engine too: the `singleton` and `concurrency` keys read the
+ *   parsed input through it (at start and at each turn's singleton admission), never the raw one.
  * - `validateAtStart` is handed to the engine, which calls it in `start` before any run is created:
  *   the input schema must parse, then `validateInput` must not throw on the parsed value. The parsed
  *   value is then discarded — the run stores the input as it was sent.
@@ -18,6 +20,9 @@ type WorkflowBody = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
  */
 export function workflowIo(meta: WorkflowMeta): {
   validateAtStart: ((input: unknown) => Promise<void>) | undefined;
+  /** The input schema's parser, or undefined without one: what the engine hands the `singleton`
+   *  and `concurrency` key callbacks, so they read the same parsed value `run(ctx, input)` gets. */
+  parseInput: ((input: unknown) => Promise<unknown>) | undefined;
   wrap(body: WorkflowBody): WorkflowBody;
 } {
   const parseInput =
@@ -33,6 +38,7 @@ export function workflowIo(meta: WorkflowMeta): {
             await validateInput?.(parsed);
           }
         : undefined,
+    parseInput: parseInput || undefined,
     wrap: (body) =>
       !parseInput && !parseOutput
         ? body

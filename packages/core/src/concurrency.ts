@@ -28,9 +28,14 @@ export interface ConcurrencyQuota {
  * / `@Workflow({ concurrency })`): the key is derived from each start's input, and the limit may be a
  * function of the key (per-tenant plans). A `StartOptions.concurrency` on one start overrides it.
  */
-export interface ConcurrencyConfig {
-  /** Derive the quota key from the input. Return `undefined` to leave this start unlimited. */
-  key: (input: unknown) => string | undefined;
+export interface ConcurrencyConfig<TInput = unknown> {
+  /**
+   * Derive the quota key from the input. Return `undefined` to leave this start unlimited. When the
+   * workflow declares an input schema (`@Workflow({ input })`, or `register(..., { parseInput })`),
+   * it receives the PARSED input, the same value `run(ctx, input)` gets, and `@Workflow` types
+   * `TInput` from the schema.
+   */
+  key: (input: TInput) => string | undefined;
   /** Max in-flight runs per key — a number, or resolved per key (e.g. from the tenant's plan). */
   limit: number | ((key: string) => number | Promise<number>);
   /** Which statuses occupy a slot. See {@link ConcurrencyQuota.countStatuses}. */

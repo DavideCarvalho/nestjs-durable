@@ -143,6 +143,7 @@ export class WorkflowRegistrar
         executionTimeout: meta.executionTimeout,
         requires: meta.requires,
         validateInput: io.validateAtStart,
+        parseInput: io.parseInput,
         searchAttributesSchema: meta.searchAttributes,
         onEvent: getOnEvents(meta, workflowCtor),
         eventBatch,
