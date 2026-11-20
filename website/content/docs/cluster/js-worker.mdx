@@ -154,7 +154,8 @@ loop the engine runs:
   `WorkflowWorker` option, default `1`), and records each as a `compensate:<step>` step, as the
   engine does. A failing undo is recorded and skipped; the run keeps its original error. A cancelled
   run does not unwind local compensations on the worker. Under NestJS the worker takes the module's
-  `compensationRetries`.
+  `compensationRetries`, with a `@dudousxd/durable-worker` from this release on; an older one ignores
+  it and tries each undo once.
 - The undo records reach the engine only with the failed turn's decision, so on the worker an unwind
   is at least once: a crash mid-unwind or a lost decision redelivers the turn, and every undo runs
   again. Write compensations to be idempotent.
