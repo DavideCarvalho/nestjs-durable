@@ -288,6 +288,44 @@ describe('runRedisWorker — run-scoped liveness heartbeat during a workflow tur
     expect(beats().length).toBe(settled);
   });
 
+  it('keeps beating while a localStep waits its retry backoff, so the engine never reads the turn as lost', async () => {
+    const fake = makeFakeDeps({ withRedis: true });
+    const runtime = new DurableWorkerRuntime();
+    let calls = 0;
+    runtime.registerWorkflow('wf', async (ctx) =>
+      ctx.localStep(
+        'flaky',
+        async () => {
+          calls += 1;
+          if (calls === 1) throw new Error('transient');
+          return 'ok';
+        },
+        // One backoff of 30 s: six run-beat intervals with no other activity in the turn.
+        { retries: 2, backoffMs: 30_000 },
+      ),
+    );
+    await runRedisWorker({ runtime, connection: {}, deps: fake.deps });
+    const beats = () => fake.published.filter((p) => p.channel === 'durable-heartbeat').length;
+
+    const turn = fake.run('durable-tasks-wf', {
+      data: workflowTask({ runId: 'run-7', group: 'wf' }),
+    });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(calls).toBe(1);
+    const atFailure = beats();
+
+    // Midway through the backoff the step has not run again, yet the turn kept beating.
+    await vi.advanceTimersByTimeAsync(25_000);
+    expect(calls).toBe(1);
+    expect(beats() - atFailure).toBeGreaterThanOrEqual(5);
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    await turn;
+    expect(calls).toBe(2);
+    const decision = fake.added.find((a) => a.queue === 'durable-decisions');
+    expect((decision?.data as { status: string }).status).toBe('completed');
+  });
+
   it('does not run-beat for a remote step task (only workflow turns beat)', async () => {
     const fake = makeFakeDeps({ withRedis: true });
     const runtime = new DurableWorkerRuntime();
