@@ -60,16 +60,24 @@ crash-recovery does not see it; the timer poller judges it instead, once the tur
 - **Not right after a restart.** Within one turn window of an engine's boot, a deadline that went stale
   while it was down is pushed out instead, so live workers' heartbeats can reach the new engine first.
   Once per turn: if the fleet restarts again before then, the next lapse is judged normally, so restarts
-  cannot postpone a lost turn for ever.
+  cannot postpone a lost turn for ever. A heartbeat from the turn's worker gives the grace back, so a
+  long turn that stays alive across several deploys is graced at each one instead of counted.
 - **Turns lost in a row.** An applied decision resets `recoveryAttempts` to 0, so a long-lived run that
   loses a turn now and then (a deploy, say) is not dead-lettered for losses spread over its life.
 
 Past the limit the run ends `dead` with the same `max_recovery_attempts` error and the same
 announcement as an inline run; the write is conditional on the run still being `suspended`, so a
 cancel that lands meanwhile wins. A turn counted as lost whose decision arrives late, before the
-re-drive dispatches the next turn, is still applied, and gives the attempt back. A decision that arrives while that pass holds the run's lease is
-dropped with it (a narrow race). A decision that arrives in time, a worker that keeps beating, and the
-checkpoints a healthy turn writes never count.
+re-drive dispatches the next turn, is still applied, and gives the attempt back; a re-drive wake
+still waiting on the run queue then does nothing. A decision that arrives while a pass holds the run's
+lease (to count, grace or leave a queued turn waiting) is dropped (a narrow race): the next lapse
+counts the turn and runs it again. A decision that arrives in time, a worker that keeps beating, and
+the checkpoints a healthy turn writes never count.
+
+The awaited-turn marker is the dispatched task id (`<runId>:wf:<8 hex>`) plus up to 11 characters
+(`:grace:lost`), so `runId` plus 23 in all. With a store that bounds the column, such as TypeORM's
+`varchar(191)`, a run whose id is 169 to 179 characters long is dispatched but cannot be graced or
+counted.
 
 If the dead run is a child, its parent is notified at once, as for a failed child: `ctx.child`
 throws, and `ctx.all` / `ctx.allSettled` record it as failed. The parent does not wait for its

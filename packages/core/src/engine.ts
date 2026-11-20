@@ -2017,6 +2017,16 @@ export class WorkflowEngine {
         return;
       }
       if (dispatch.reason !== 'wake' || TERMINAL_RUN_STATUSES.includes(run.status)) return;
+      // A wake handed off for a lapsed dispatched turn is stale once the run awaits another turn (or
+      // none): the turn's decision landed, maybe dispatching the next one, while the wake waited.
+      // Running it would re-drive the run once more and drop the newer turn's answer.
+      if (
+        dispatch.awaiting !== undefined &&
+        (run.awaitingDecisionTaskId === undefined ||
+          awaitedTaskId(run.awaitingDecisionTaskId) !== dispatch.awaiting)
+      ) {
+        return;
+      }
       const nowMs = this.clock();
       if (run.wakeAt !== undefined && run.wakeAt <= nowMs) {
         // A due timer's wake also pairs a stranded waiter, as the due-timer poll does.
@@ -2077,6 +2087,9 @@ export class WorkflowEngine {
     settled?: Map<string, RunResult>,
   ): Promise<boolean> {
     const claimed: WorkflowRun[] = [];
+    // The dispatched turn each claimed run was awaiting when claimed, so its wake can be skipped once
+    // the run awaits another turn, or none (see `RunDispatch.awaiting`).
+    const awaiting = new Map<string, string>();
     for (const run of runs) {
       if (this.draining) break;
       // Marked before the lock, so no turn of this instance can take this claim for its own lease.
@@ -2098,17 +2111,22 @@ export class WorkflowEngine {
           // A lapsed dispatched turn is judged here, before the lease-long `wakeAt` below hides that
           // it lapsed from whichever instance takes the wake: counted once (and dead-lettered past
           // the limit), or left waiting when its worker may still answer.
-          const handled = await this.noteLapsedTurn(run.id, nowMs);
+          const seen: { marker?: string | undefined } = {};
+          const handled = await this.noteLapsedTurn(run.id, nowMs, seen);
           if (handled) {
             if (handled.status === 'dead') settled?.set(run.id, handled);
             continue;
           }
           const patch = { wakeAt: nowMs + this.leaseMs };
+          let won = true;
           if (this.store.updateRunIf) {
-            if (await this.store.updateRunIf(run.id, [run.status], patch)) claimed.push(run);
+            won = await this.store.updateRunIf(run.id, [run.status], patch);
           } else {
             await this.store.updateRun(run.id, patch);
+          }
+          if (won) {
             claimed.push(run);
+            if (seen.marker !== undefined) awaiting.set(run.id, awaitedTaskId(seen.marker));
           }
         } finally {
           await this.store.releaseRunLock(run.id, this.instanceId);
@@ -2120,11 +2138,15 @@ export class WorkflowEngine {
     try {
       for (let at = 0; at < claimed.length; at += RUN_DISPATCH_BATCH) {
         await this.pool.dispatchRuns(
-          claimed.slice(at, at + RUN_DISPATCH_BATCH).map((run) => ({
-            runId: run.id,
-            reason: 'wake' as const,
-            ...(run.priority !== undefined ? { priority: run.priority } : {}),
-          })),
+          claimed.slice(at, at + RUN_DISPATCH_BATCH).map((run) => {
+            const turn = awaiting.get(run.id);
+            return {
+              runId: run.id,
+              reason: 'wake' as const,
+              ...(run.priority !== undefined ? { priority: run.priority } : {}),
+              ...(turn !== undefined ? { awaiting: turn } : {}),
+            };
+          }),
           { namespace: this.namespace },
         );
       }
@@ -5854,12 +5876,25 @@ export class WorkflowEngine {
    *
    * Re-reads under the lease: the listing may predate a decision applied since. Returns a result when
    * the run was dead-lettered or left waiting (the lease released either way), else `undefined` for
-   * the caller to re-drive as before. A decision that lands while this holds the lease and
-   * dead-letters the run is dropped with it (it cannot take the lease): a narrow race, accepted.
+   * the caller to re-drive as before. A decision that lands while this holds the lease is dropped (it
+   * cannot take the lease), whichever way this pass goes: with a run it dead-letters, or with one it
+   * graces or leaves waiting on a `queued` task, whose next lapse then counts the turn and runs it
+   * again. A narrow race, accepted.
+   *
+   * The marker grows by up to 11 characters (`:grace:lost`) beyond the dispatched id, which is
+   * `<runId>:wf:<8 hex>`: `runId` plus 23 in all. A store that bounds the column (TypeORM's
+   * `varchar(191)`) therefore dispatches a run whose id is 169 to 179 characters long, then refuses
+   * the grace or lost write for it.
    */
-  private async noteLapsedTurn(runId: string, nowMs: number): Promise<RunResult | undefined> {
+  private async noteLapsedTurn(
+    runId: string,
+    nowMs: number,
+    /** Filled with the awaited-turn marker the run is left with when this returns `undefined`. */
+    seen?: { marker?: string | undefined },
+  ): Promise<RunResult | undefined> {
     const run = await this.store.getRun(runId);
     const awaited = run?.awaitingDecisionTaskId;
+    if (seen) seen.marker = awaited;
     if (
       !run ||
       run.status !== 'suspended' ||
@@ -12136,6 +12171,15 @@ export class WorkflowEngine {
         this.decisionDeadlineRearms.delete(runId);
         return;
       }
+      // A beat proves the turn's worker is alive, so a boot grace given to it is spent on nothing: give
+      // it back, or a later boot would find the turn graced already and count a live turn as lost.
+      // Until that write lands, the throttle mark stays where it was, so the next beat retries.
+      if (
+        run.awaitingDecisionTaskId.endsWith(GRACED_TURN_SUFFIX) &&
+        !(await this.clearTurnGrace(runId, run.awaitingDecisionTaskId, now))
+      ) {
+        return;
+      }
       const halfWindow = Math.ceil(silenceMs / 2);
       // More than half the window left: nothing to buy, and nothing to look at until it is half spent.
       if (run.wakeAt != null && run.wakeAt > now + halfWindow) {
@@ -12148,6 +12192,30 @@ export class WorkflowEngine {
       this.decisionDeadlineRearms.set(runId, renewed - halfWindow);
     } catch {
       // Best-effort liveness: a store blip costs one skipped renewal, never the beat loop.
+    }
+  }
+
+  /**
+   * Write a graced turn's marker back to its bare task id (see {@link GRACED_TURN_SUFFIX}), under the
+   * run's lease and only while the marker is still `marker`: a decision and a re-dispatch both write
+   * the marker under that lease, so this never puts back the id of a turn they already replaced.
+   * False when the lease was busy or the write failed; the caller's next beat tries again.
+   */
+  private async clearTurnGrace(runId: string, marker: string, nowMs: number): Promise<boolean> {
+    if (!(await this.store.tryLockRun(runId, this.instanceId, nowMs + this.leaseMs, nowMs))) {
+      return false;
+    }
+    try {
+      const fresh = await this.store.getRun(runId);
+      if (fresh?.awaitingDecisionTaskId === marker) {
+        await this.store.updateRun(runId, {
+          awaitingDecisionTaskId: marker.slice(0, -GRACED_TURN_SUFFIX.length),
+          updatedAt: new Date(),
+        });
+      }
+      return true;
+    } finally {
+      await this.store.releaseRunLock(runId);
     }
   }
 

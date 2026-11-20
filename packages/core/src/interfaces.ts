@@ -2082,6 +2082,12 @@ export interface RunDispatch {
    * nor a wake. Absent on a wake.
    */
   key?: string | undefined;
+  /**
+   * On a wake handed off for a run awaiting a dispatched workflow turn: that turn's task id. The
+   * engine taking the wake skips it once the run awaits another turn, or none. A transport passes it
+   * through unchanged; one that merges two wakes of a run must drop it unless both carry the same.
+   */
+  awaiting?: string | undefined;
 }
 
 /**

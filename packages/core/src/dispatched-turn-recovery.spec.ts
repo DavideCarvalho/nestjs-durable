@@ -54,9 +54,24 @@ class Worker {
   }
 }
 
-/** Adds the workflow-task half (decisions, run-scoped beats) to a base transport; `held` swallows
- *  run-queue wakes, as a backed-up or lost run queue does. */
-function withWorker(base: Transport, worker: Worker, held: { wakes: boolean }): Transport {
+/** Run-queue wakes held back while `wakes` is set (a backed-up or lost run queue), kept in `kept`
+ *  so a test can deliver them late. */
+interface Held {
+  wakes: boolean;
+  kept: Array<{
+    runs: readonly RunDispatch[];
+    opts: Parameters<NonNullable<Transport['dispatchRuns']>>[1];
+  }>;
+  deliver?: () => Promise<void>;
+}
+
+/** Adds the workflow-task half (decisions, run-scoped beats) to a base transport; `held` holds
+ *  run-queue wakes back (see {@link Held}). */
+function withWorker(base: Transport, worker: Worker, held: Held): Transport {
+  held.deliver = async () => {
+    const kept = held.kept.splice(0);
+    for (const { runs, opts } of kept) await base.dispatchRuns?.(runs, opts);
+  };
   return {
     ...base,
     dispatch: base.dispatch.bind(base),
@@ -64,7 +79,10 @@ function withWorker(base: Transport, worker: Worker, held: { wakes: boolean }): 
     ...(base.dispatchRuns
       ? {
           dispatchRuns: async (runs: readonly RunDispatch[], opts) => {
-            if (held.wakes) return;
+            if (held.wakes) {
+              held.kept.push({ runs, opts });
+              return;
+            }
             await base.dispatchRuns?.(runs, opts);
           },
         }
@@ -111,7 +129,7 @@ function harness(opts: Options = {}) {
   const clock = opts.clock ?? { now: Date.now() };
   const store = opts.store ?? new InMemoryStateStore();
   const worker = opts.worker ?? new Worker();
-  const held = { wakes: false };
+  const held: Held = { wakes: false, kept: [] };
   const queue = new InMemoryRunQueue();
   const base = mode === 'resumes due runs itself' ? new InMemoryTransport() : queue.transport();
   const engine = new WorkflowEngine({
@@ -503,5 +521,81 @@ describe('a lost dispatched turn and restarts or late answers', () => {
     h.advance(LEASE_MS + 1);
     await h.tick();
     expect(h.worker.tasks).toHaveLength(1);
+  });
+});
+
+describe('a long live turn across restarts', () => {
+  it('is not counted when it spans two deploys that each keep the engine down past a window', async () => {
+    const store = new InMemoryStateStore();
+    const worker = new Worker();
+    const clock = { now: Date.now() };
+    await started({ store, worker, clock });
+    await worker.heartbeat();
+
+    // Deploy 1: the engine is down for ten windows while the worker keeps working.
+    clock.now += SILENCE_MS * 10;
+    const second = harness({ store, worker, clock });
+    await second.tick();
+    expect((await store.getRun(RUN_ID))?.awaitingDecisionTaskId).toMatch(/:grace$/);
+    // The worker's beats reach the new engine: alive, so the grace is given back.
+    for (let i = 0; i < 3; i += 1) {
+      second.advance(SILENCE_MS / 2 + 1);
+      await worker.heartbeat();
+      await second.tick();
+    }
+    expect((await store.getRun(RUN_ID))?.awaitingDecisionTaskId).not.toMatch(/:grace$/);
+
+    // Deploy 2, same again: still graced, not counted, not dispatched twice.
+    clock.now += SILENCE_MS * 10;
+    const third = harness({ store, worker, clock });
+    await third.tick();
+    for (let i = 0; i < 3; i += 1) {
+      third.advance(SILENCE_MS / 2 + 1);
+      await worker.heartbeat();
+      await third.tick();
+    }
+    expect(await third.attempts()).toBe(0);
+    expect(worker.tasks).toHaveLength(1);
+
+    await worker.answer({ status: 'completed', commands: [], output: 'long but alive' });
+    await until(async () => (await third.run())?.status === 'completed');
+    expect((await third.run())?.output).toBe('long but alive');
+  });
+});
+
+describe('a wake held for a lost turn', () => {
+  it('is skipped when it is delivered after the late decision moved the run on to its next turn', async () => {
+    const h = await started({ mode: 'hands due runs to the run queue' });
+    h.held.wakes = true;
+
+    // Counted as lost; the wake that would re-drive it is held back.
+    h.advance(SILENCE_MS + 1);
+    await h.tick();
+    expect(await h.attempts()).toBe(1);
+    expect(h.held.kept).toHaveLength(1);
+    h.held.wakes = false;
+
+    // The turn's late decision lands and sleeps; the timer dispatches the next turn.
+    await h.worker.answer({
+      status: 'suspended',
+      commands: [{ kind: 'sleep', seq: 0, ms: 1_000 }],
+    });
+    await drain();
+    h.advance(1_001);
+    await h.tick(2);
+    const nextTurn = h.worker.tasks[1]?.taskId;
+    expect((await h.run())?.awaitingDecisionTaskId).toBe(nextTurn);
+
+    // Only now is the held wake delivered: it is for the old turn, so it runs nothing.
+    await h.held.deliver?.();
+    await drain();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(h.worker.tasks).toHaveLength(2);
+    expect((await h.run())?.awaitingDecisionTaskId).toBe(nextTurn);
+
+    // And the next turn's answer still lands.
+    await h.worker.answer({ status: 'completed', commands: [], output: 'next turn' });
+    await until(async () => (await h.run())?.status === 'completed');
+    expect((await h.run())?.output).toBe('next turn');
   });
 });
