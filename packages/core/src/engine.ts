@@ -366,6 +366,17 @@ export interface SingletonConfig<TInput = unknown> {
 }
 
 /** Union of a workflow's static tags and a run's start-time tags, de-duplicated, or undefined if none. */
+/**
+ * A step failure `requeue` reset for another try: `requeue` sets a failed checkpoint's `attempts` to
+ * 0, which no attempt that actually ran records. Only steps (`local`, `remote`) are matched; a
+ * child's failure resets through its `signal:child:` placeholder instead.
+ */
+function isRequeuedStepFailure(cp: StepCheckpoint): boolean {
+  return (
+    cp.status === 'failed' && cp.attempts === 0 && (cp.kind === 'local' || cp.kind === 'remote')
+  );
+}
+
 function mergeTags(staticTags?: string[], runTags?: string[]): string[] | undefined {
   if (!staticTags?.length && !runTags?.length) return undefined;
   return [...new Set([...(staticTags ?? []), ...(runTags ?? [])])];
@@ -6107,6 +6118,7 @@ export class WorkflowEngine {
           continue;
         }
         if (cp.status === 'failed') {
+          // `attempts: 0` is the mark a dispatched turn reads (see isRequeuedStepFailure).
           await this.store.saveCheckpoint({
             ...cp,
             attempts: 0,
@@ -9349,6 +9361,9 @@ export class WorkflowEngine {
     };
     const events: HistoryEvent[] = [];
     for (const cp of checkpoints) {
+      // A failed step that `requeue` reset is not an outcome any more: left out, the worker's replay
+      // runs the step again (a `call` is dispatched afresh, see applyCommands), as the inline path does.
+      if (isRequeuedStepFailure(cp)) continue;
       if (cp.status === 'completed' || cp.status === 'failed') {
         // A child run resolves THROUGH the signal machinery (a `child:<id>` waiter notified on the
         // child's terminal state), so its checkpoint is kind `signal` with a `signal:child:` name and
@@ -9455,7 +9470,9 @@ export class WorkflowEngine {
         // `pending`. Skipping such a command forever is how a fan-out orphans its run (see
         // {@link redriveLostCall}, which owns that decision; a settled checkpoint always wins).
         const existing = await this.store.getCheckpoint(run.id, cmd.seq);
-        if (existing) {
+        // A step failure `requeue` reset is not in the history the worker replayed, so this `call` is
+        // the step's first attempt again: dispatch it fresh over the old record.
+        if (existing && !isRequeuedStepFailure(existing)) {
           // A `call` that carries its step's policy is retried / timed out under it, exactly as the
           // in-process `ctx.step` would be (see {@link applyCallPolicy}); without one (or for a
           // pending step with no liveness window) the lost-dispatch self-heal decides, as before.
