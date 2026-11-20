@@ -140,6 +140,46 @@ describe('runRedisWorker wiring (faked bullmq, no Redis)', () => {
     }
   });
 
+  it('passes lockDuration, stalledInterval and maxStalledCount to every Worker', async () => {
+    const fake = makeFakeDeps();
+    const runtime = new DurableWorkerRuntime();
+    runtime.registerWorkflow('pipeline', async () => 1);
+    runtime.registerStep<number, number>('charge', (n) => n);
+    await runRedisWorker({
+      runtime,
+      connection: {},
+      lockDuration: 45_000,
+      stalledInterval: 15_000,
+      maxStalledCount: 3,
+      deps: fake.deps,
+    });
+    expect(fake.workerQueueNames).toHaveLength(2);
+    for (const name of fake.workerQueueNames) {
+      expect(fake.workerOptsFor(name)).toMatchObject({
+        lockDuration: 45_000,
+        stalledInterval: 15_000,
+        maxStalledCount: 3,
+      });
+    }
+  });
+
+  it('keeps the 5 min lock and BullMQ stall defaults when unset or invalid', async () => {
+    for (const extra of [
+      {},
+      { lockDuration: 0, stalledInterval: -1, maxStalledCount: 1.5 },
+      { lockDuration: Number.NaN, stalledInterval: Number.POSITIVE_INFINITY, maxStalledCount: -1 },
+    ]) {
+      const fake = makeFakeDeps();
+      const runtime = new DurableWorkerRuntime();
+      runtime.registerStep<number, number>('charge', (n) => n);
+      await runRedisWorker({ runtime, connection: {}, ...extra, deps: fake.deps });
+      const opts = fake.workerOptsFor('durable-tasks-charge');
+      expect(opts?.lockDuration).toBe(5 * 60_000);
+      expect(opts && 'stalledInterval' in opts).toBe(false);
+      expect(opts && 'maxStalledCount' in opts).toBe(false);
+    }
+  });
+
   it('suffixes every subscribed queue with `partition` when set', async () => {
     const fake = makeFakeDeps();
     const runtime = new DurableWorkerRuntime();

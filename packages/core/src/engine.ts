@@ -1017,7 +1017,10 @@ export interface WorkflowEngineDeps {
   /**
    * Cap how many times crash-recovery may pick up the same still-`running` run before giving up and
    * moving it to the `dead` dead-letter state (a poison pill that crashes the process every boot).
-   * Omit for unlimited (the default — recovery always retries).
+   * A workflow turn dispatched to a worker spends the same budget each time it is lost: its
+   * re-drive deadline passes with no decision and no heartbeat (its worker died, or the task with
+   * it), so a turn that keeps killing its worker also ends `dead` instead of being re-dispatched
+   * for ever. Omit for unlimited (the default — recovery always retries).
    */
   maxRecoveryAttempts?: number | undefined;
   /**
@@ -2050,6 +2053,13 @@ export class WorkflowEngine {
       this.markClaim(run.id);
       try {
         if (!(await this.store.tryLockRun(run.id, this.instanceId, nowMs + this.leaseMs, nowMs))) {
+          continue;
+        }
+        // A lapsed dispatched turn spends a recovery attempt here, before the lease-long `wakeAt`
+        // below hides that it lapsed from whichever instance takes the wake.
+        const dead = await this.countLapsedTurn(run.id, nowMs);
+        if (dead) {
+          settled?.set(run.id, dead);
           continue;
         }
         // Checked before the lease-long `wakeAt` below, which would keep the orphan from aging.
@@ -5762,9 +5772,43 @@ export class WorkflowEngine {
         [...due, ...blocked].map((run) => run.id),
       ),
     );
-    return this.resumeLeased([...due, ...blocked], nowMs, (run) =>
-      this.reconcileSignalWaiter(run, waiterByRun.get(run.id)),
+    return this.resumeLeased(
+      [...due, ...blocked],
+      nowMs,
+      async (run) =>
+        (await this.countLapsedTurn(run.id, nowMs)) ??
+        this.reconcileSignalWaiter(run, waiterByRun.get(run.id)),
     );
+  }
+
+  /**
+   * Called under the run's lease by the due-timer pass. A run suspended awaiting a DISPATCHED
+   * workflow turn's decision (`awaitingDecisionTaskId`) whose re-drive deadline (`wakeAt`) has
+   * passed lost that turn: no decision came back and the worker stopped beating (every beat pushes
+   * `wakeAt` forward, see {@link rearmDecisionDeadline}), so the worker running it died, or the task
+   * was lost with it. That is the dispatched form of a crashed inline turn, so it spends the same
+   * {@link maxRecoveryAttempts} budget through {@link countRecovery}: a turn that keeps killing its
+   * worker ends `dead` (with the same `run.failed` announcement) instead of being re-dispatched, and
+   * possibly redelivered by the broker, for ever.
+   *
+   * Never counted: a decision that arrives (it clears the marker), a worker that keeps beating (the
+   * deadline never passes), and any write a healthy dispatch makes on its way (step checkpoints,
+   * progress, the result), because only a passed deadline on a still-awaited turn counts. Re-read
+   * under the lease: the listing may predate a decision that has since been applied. Returns a
+   * terminal result when the run was dead-lettered (the lease is released), else `undefined`.
+   */
+  private async countLapsedTurn(runId: string, nowMs: number): Promise<RunResult | undefined> {
+    const run = await this.store.getRun(runId);
+    if (
+      !run ||
+      run.status !== 'suspended' ||
+      run.awaitingDecisionTaskId === undefined ||
+      run.wakeAt == null ||
+      run.wakeAt > nowMs
+    ) {
+      return undefined;
+    }
+    return this.countRecovery(run);
   }
 
   /**

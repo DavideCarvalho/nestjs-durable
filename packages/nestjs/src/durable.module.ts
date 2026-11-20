@@ -583,6 +583,19 @@ export interface DurableModuleSharedOptions {
    * single call — reserved here for when per-name concurrency lands there.
    */
   concurrencyByHandler?: Record<string, ConcurrencyOption>;
+  /**
+   * BullMQ `lockDuration` (ms) of a worker role's consumer (co-located or thin). Defaults to 5 min.
+   * It also bounds how soon a task held by a worker that died can be redelivered (BullMQ redelivers
+   * only once the lock lapses), so lower it to recover a crashed worker's turn sooner; keep it well
+   * above the longest event-loop stall a healthy turn can cause. Ignored for a plain operator.
+   */
+  lockDuration?: number;
+  /** BullMQ `stalledInterval` (ms) of a worker role's consumer: how often it checks for stalled jobs.
+   *  Omitted: BullMQ's default (30 s). Ignored for a plain operator. */
+  stalledInterval?: number;
+  /** BullMQ `maxStalledCount` of a worker role's consumer: how often a job may stall before BullMQ
+   *  fails it for good. Omitted: BullMQ's default (1). Ignored for a plain operator. */
+  maxStalledCount?: number;
   /** Timeout for a thin worker's `RunGateway` round-trip over `transport` before it rejects. Defaults
    *  to 10_000ms inside `ProxyRunGateway`. Ignored for an operator (bound to `StoreRunGateway`). */
   runGatewayTimeoutMs?: number;

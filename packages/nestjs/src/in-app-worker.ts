@@ -131,6 +131,13 @@ export class InAppWorkerBootstrap
       ...(options.prefix !== undefined ? { prefix: options.prefix } : {}),
       ...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
       ...(options.concurrency !== undefined ? { concurrency: options.concurrency } : {}),
+      ...(options.lockDuration !== undefined ? { lockDuration: options.lockDuration } : {}),
+      ...(options.stalledInterval !== undefined
+        ? { stalledInterval: options.stalledInterval }
+        : {}),
+      ...(options.maxStalledCount !== undefined
+        ? { maxStalledCount: options.maxStalledCount }
+        : {}),
     });
     this.runners.push(handle);
     this.runnersSink.push(handle);

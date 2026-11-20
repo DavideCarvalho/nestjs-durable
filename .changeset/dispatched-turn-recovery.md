@@ -1,0 +1,10 @@
+---
+"@dudousxd/nestjs-durable-core": minor
+"@dudousxd/nestjs-durable": minor
+"@dudousxd/durable-worker": minor
+---
+
+A dispatched workflow turn that keeps killing its worker now ends `dead`, and a worker role's BullMQ lock and stall settings are configurable.
+
+- **Lost dispatched turns spend the recovery budget.** `maxRecoveryAttempts` used to count only runs left `running` by a crashed process. A turn dispatched to a worker waits `suspended`, so one that killed its worker every time was re-dispatched by the timer poller (and redelivered by the broker) for ever. Now, each time a dispatched turn's re-drive deadline (`remoteAdvanceSilenceMs`, else `reconcileMs`) passes with no decision and no heartbeat, the due-timer pass counts one recovery attempt on the run's `recoveryAttempts` before re-dispatching it, both when the engine resumes due runs itself and when it hands them to the run queue. Past the limit the run is written `dead` with code `max_recovery_attempts` and announced like an inline run (`onDead`, `run.failed`, `@OnWorkflowFailed`, a waiting parent). A decision that arrives, a worker that keeps beating, and the checkpoints a healthy turn writes never count. Without `maxRecoveryAttempts` (the default) nothing is ever dead-lettered, as before; the count still rises. An engine that is down longer than the window counts one attempt for a turn whose decision was still queued when it came back.
+- **Lock and stall settings.** `runRedisWorker` takes `stalledInterval` and `maxStalledCount` beside `lockDuration`, and `DurableModule.forRoot` takes all three for the co-located and thin worker consumers and passes them to every BullMQ `Worker`. `lockDuration` still defaults to 5 minutes; `stalledInterval` and `maxStalledCount` are sent only when set, so BullMQ's defaults (30 s, 1) apply otherwise. A shorter `lockDuration` lets BullMQ redeliver a crashed worker's task sooner; keep it well above the longest event-loop stall a healthy turn can cause. With an older `@dudousxd/durable-worker`, the module's new options are ignored.

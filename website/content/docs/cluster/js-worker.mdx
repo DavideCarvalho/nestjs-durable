@@ -232,7 +232,9 @@ directly if you're building your own runner loop.
 | `partition` | none | Isolation suffix — every per-name queue token becomes `<name>@<partition>`, so an operator can route a tenant's runs to this worker. Distinct from `prefix`. Omit / `''` / `'default'` = a bare, byte-identical single-tenant token. |
 | `instanceId` | `ts-<hostname>-<pid>` | Stable id for this process in heartbeats/control keys. |
 | `concurrency` | `1` | Tasks per subscribed queue — a number, `'adaptive'`, or `{ mode: 'adaptive', … }` (above). |
-| `lockDuration` | `5 min` | BullMQ job-lock duration. Generous by design so a long workflow turn never lapses its lock mid-run and gets redelivered. |
+| `lockDuration` | `5 min` | BullMQ job-lock duration. Generous by design so a long workflow turn never lapses its lock mid-run and gets redelivered. It is also how long a task held by a worker that died waits before BullMQ can redeliver it, so lower it to recover sooner. |
+| `stalledInterval` | BullMQ's (`30 s`) | How often each Worker checks its queue for stalled jobs. Sent only when set. |
+| `maxStalledCount` | BullMQ's (`1`) | How many times a job may stall before BullMQ fails it for good. Sent only when set. |
 
 ```ts
 await runRedisWorker({

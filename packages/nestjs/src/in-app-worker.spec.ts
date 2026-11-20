@@ -86,7 +86,15 @@ class InProcessOnlyTransport implements Transport {
 }
 
 interface FakeRunner {
-  calls: Array<{ connection: unknown; prefix?: string; instanceId?: string; partition?: string }>;
+  calls: Array<{
+    connection: unknown;
+    prefix?: string;
+    instanceId?: string;
+    partition?: string;
+    lockDuration?: number;
+    stalledInterval?: number;
+    maxStalledCount?: number;
+  }>;
   handles: Array<{ closed: boolean }>;
   runRedisWorker: RunRedisWorkerFn;
 }
@@ -103,6 +111,9 @@ function fakeRunner(): FakeRunner {
         ...(opts.prefix !== undefined ? { prefix: opts.prefix } : {}),
         ...(opts.instanceId !== undefined ? { instanceId: opts.instanceId } : {}),
         ...(opts.partition !== undefined ? { partition: opts.partition } : {}),
+        ...(opts.lockDuration !== undefined ? { lockDuration: opts.lockDuration } : {}),
+        ...(opts.stalledInterval !== undefined ? { stalledInterval: opts.stalledInterval } : {}),
+        ...(opts.maxStalledCount !== undefined ? { maxStalledCount: opts.maxStalledCount } : {}),
       });
       const handle = { closed: false };
       handles.push(handle);
@@ -191,6 +202,37 @@ describe('DurableModule co-located worker (store + connection)', () => {
 
     await moduleRef.close();
     expect(runner.handles.every((h) => h.closed)).toBe(true);
+  });
+
+  it('passes lockDuration, stalledInterval and maxStalledCount to the co-located consumer', async () => {
+    const runner = fakeRunner();
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableModule.forRoot({
+          store: new InMemoryStateStore(),
+          transport: new WorkflowTaskTransport(),
+          autoSchema: false,
+          connection: 'redis://x',
+          lockDuration: 30_000,
+          stalledInterval: 10_000,
+          maxStalledCount: 2,
+        }),
+      ],
+      providers: [GreetWorkflow, Emails],
+    })
+      .overrideProvider(IN_APP_RUN_REDIS_WORKER)
+      .useValue(runner.runRedisWorker)
+      .compile();
+    await moduleRef.init();
+    expect(runner.calls).toEqual([
+      {
+        connection: 'redis://x',
+        lockDuration: 30_000,
+        stalledInterval: 10_000,
+        maxStalledCount: 2,
+      },
+    ]);
+    await moduleRef.close();
   });
 
   it('announces the co-located bodies from the CONSUMER, not from the engine sharing its process', async () => {

@@ -42,6 +42,15 @@ DurableModule.forRoot({
 });
 ```
 
+A workflow turn **dispatched to a worker** (a co-located or remote worker over BullMQ) spends the same
+budget. While its turn is on the broker the run waits `suspended`, not `running`, so crash-recovery does
+not see it; instead, each time the turn's re-drive deadline (`remoteAdvanceSilenceMs`, else `reconcileMs`)
+passes with no decision and no heartbeat (its worker died, or the task was lost with it), the timer
+poller counts one recovery attempt before it dispatches the turn again. A turn that keeps killing its
+worker therefore ends `dead` with the same `max_recovery_attempts` error and the same announcement as an
+inline run. A decision that arrives, a worker that keeps beating, and the checkpoints a healthy turn
+writes never count.
+
 If the dead run is a child, its parent is notified at once, as for a failed child: `ctx.child`
 throws, and `ctx.all` / `ctx.allSettled` record it as failed. The parent does not wait for its
 reconcile wake.
