@@ -42,7 +42,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "peerDependencies": {
-    "@dudousxd/nestjs-durable-core": ">=0.103.0 <1.0.0",
+    "@dudousxd/nestjs-durable-core": ">=0.105.0 <1.0.0",
     "bullmq": "^5.0.0 || ^6.0.0",
     "ioredis": "^5.0.0 || ^6.0.0"
   },

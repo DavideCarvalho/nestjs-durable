@@ -258,6 +258,87 @@ describe('ctx.localStep options on the worker runtime match the inline engine', 
         expect(undo?.status).toBe('failed');
         expect(undo?.error?.message).toBe('refund down');
       });
+
+      it('does not retry a workflow primitive called inside the step body', async () => {
+        let calls = 0;
+        const out = await run(async (ctx) =>
+          ctx.localStep(
+            'nested',
+            async () => {
+              calls += 1;
+              await ctx.sideEffect(() => 1);
+            },
+            { retries: 4, backoffMs: 1 },
+          ),
+        );
+        expect(calls).toBe(1);
+        expect(out.run.status).toBe('failed');
+        expect(out.run.error?.code).toBe('nested_workflow_call');
+      });
     });
   }
+});
+
+describe('worker saga unwind', () => {
+  function task(history: WorkflowTask['history'] = []): WorkflowTask {
+    return {
+      taskId: 't1',
+      runId: 'r1',
+      workflow: 'saga',
+      workflowVersion: '1',
+      input: null,
+      history,
+      pendingSignals: [],
+      group: 'saga',
+      attempt: 1,
+    };
+  }
+
+  it('skips an undo the history already records', async () => {
+    let undone = 0;
+    const worker = new WorkflowWorker();
+    worker.register('saga', async (ctx) => {
+      await ctx.localStep('reserve', async () => 'r', {
+        compensate: async () => {
+          undone += 1;
+        },
+      });
+      await ctx.localStep('charge', async () => {
+        throw new Error('declined');
+      });
+    });
+    const decision = await worker.processTask(
+      task([
+        { seq: 0, kind: 'step', name: 'reserve', output: 'r' },
+        { seq: 1, kind: 'step', name: 'charge', error: { message: 'declined' } },
+        { seq: -1, kind: 'step', name: 'compensate:reserve', output: null },
+      ]),
+    );
+    expect(decision.status).toBe('failed');
+    expect(decision.error?.message).toBe('declined');
+    expect(undone).toBe(0);
+    expect(decision.commands.filter((c) => c.seq < 0)).toEqual([]);
+  });
+
+  it('tries an undo up to compensationRetries times and records the attempts', async () => {
+    let tries = 0;
+    const worker = new WorkflowWorker('workflows', { compensationRetries: 3 });
+    worker.register('saga', async (ctx) => {
+      await ctx.localStep('reserve', async () => 'r', {
+        compensate: async () => {
+          tries += 1;
+          if (tries < 3) throw new Error('refund hiccup');
+        },
+      });
+      await ctx.localStep('charge', async () => {
+        throw new Error('declined');
+      });
+    });
+    const decision = await worker.processTask(task());
+    expect(decision.status).toBe('failed');
+    expect(tries).toBe(3);
+    const undo = decision.commands.find((c) => c.seq === -1);
+    expect(undo).toMatchObject({ kind: 'recordStep', name: 'compensate:reserve', attempts: 3 });
+    expect(undo).not.toHaveProperty('error');
+  });
 });

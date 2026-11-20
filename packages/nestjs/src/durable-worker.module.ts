@@ -389,7 +389,14 @@ export function thinWorkerProviders(): Provider[] {
       // reach this branch at all.
       useFactory: (options: DurableModuleOptions) =>
         isPureThinWorker(options)
-          ? createWorkerRuntime({ workflowGroup: options.partition ?? '' })
+          ? createWorkerRuntime({
+              workflowGroup: options.partition ?? '',
+              // The worker unwinds a failed turn's `localStep` undos itself, so it takes the
+              // module's `compensationRetries` as the engine does.
+              ...(options.compensationRetries !== undefined
+                ? { compensationRetries: options.compensationRetries }
+                : {}),
+            })
           : null,
       inject: [DURABLE_OPTIONS_CANONICAL],
     },
