@@ -9224,7 +9224,7 @@ export class WorkflowEngine {
             output: cmd.output,
             error: cmd.error,
             events: cmd.events,
-            attempts: 1,
+            attempts: cmd.attempts ?? 1,
             enqueuedAt: startedAt,
             startedAt,
             finishedAt,

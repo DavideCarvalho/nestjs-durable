@@ -115,6 +115,36 @@ function fakeRunner(): FakeRunner {
   };
 }
 
+/** Run one failing turn on `runtime` whose completed step has an undo that fails twice, and return
+ *  how many times the undo ran: `compensationRetries` reached the worker iff it ran 3 times. */
+async function undoTries(runtime: DurableWorkerRuntime): Promise<number> {
+  let tries = 0;
+  runtime.workflows.register('saga-retries', async (ctx) => {
+    await ctx.localStep('reserve', async () => 'r', {
+      compensate: async () => {
+        tries += 1;
+        if (tries < 3) throw new Error('refund hiccup');
+      },
+    });
+    await ctx.localStep('charge', async () => {
+      throw new Error('declined');
+    });
+  });
+  const decision = await runtime.workflows.processTask({
+    taskId: 't1',
+    runId: 'r1',
+    workflow: 'saga-retries',
+    workflowVersion: '1',
+    input: null,
+    history: [],
+    pendingSignals: [],
+    group: 'saga-retries',
+    attempt: 1,
+  });
+  expect(decision.status).toBe('failed');
+  return tries;
+}
+
 describe('DurableModule co-located worker (store + connection)', () => {
   it('registers @Workflow group-served (per-name token) and starts a co-located consumer', async () => {
     const runner = fakeRunner();
@@ -273,6 +303,26 @@ describe('DurableModule co-located worker (store + connection)', () => {
     expect(engine.knownGroups().sort()).toEqual([alphaToken, betaToken].sort());
     expect(alphaToken).not.toBe(betaToken);
 
+    await moduleRef.close();
+  });
+  it('passes compensationRetries to the co-located worker runtime', async () => {
+    const runner = fakeRunner();
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableModule.forRoot({
+          store: new InMemoryStateStore(),
+          transport: new WorkflowTaskTransport(),
+          autoSchema: false,
+          connection: 'redis://x',
+          compensationRetries: 3,
+        }),
+      ],
+    })
+      .overrideProvider(IN_APP_RUN_REDIS_WORKER)
+      .useValue(runner.runRedisWorker)
+      .compile();
+    await moduleRef.init();
+    expect(await undoTries(moduleRef.get<DurableWorkerRuntime>(IN_APP_WORKER_RUNTIME))).toBe(3);
     await moduleRef.close();
   });
 });

@@ -1877,6 +1877,9 @@ export type WorkflowCommand =
       startedAt?: number;
       finishedAt?: number;
       events?: StepEvent[];
+      /** How many attempts the local step made (its `retries` loop), carried onto the checkpoint's
+       *  `attempts`. Absent from a worker that predates it, which the engine records as 1. */
+      attempts?: number;
       /** A worker's `ctx.gather([...])` tags every step in the parallel fan with the same group, so the
        *  engine carries it onto the checkpoint and the dashboard renders the fan as one group. */
       parallelGroup?: string;

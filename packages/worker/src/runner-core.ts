@@ -135,8 +135,15 @@ export class DurableWorkerRuntime {
    *  is announced as a bare name rather than with invented fields. */
   private readonly workflowMeta = new Map<string, WorkflowRegistrationMeta>();
 
-  constructor(options: { workflowGroup?: string; stepGroup?: string } = {}) {
-    this.workflows = new WorkflowWorker(options.workflowGroup);
+  /** `compensationRetries`: tries per `localStep` `compensate` when a failed turn unwinds (default 1). */
+  constructor(
+    options: { workflowGroup?: string; stepGroup?: string; compensationRetries?: number } = {},
+  ) {
+    this.workflows = new WorkflowWorker(options.workflowGroup, {
+      ...(options.compensationRetries !== undefined
+        ? { compensationRetries: options.compensationRetries }
+        : {}),
+    });
     this.steps = new StepWorker(options.stepGroup);
   }
 

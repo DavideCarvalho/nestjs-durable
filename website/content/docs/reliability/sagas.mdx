@@ -108,12 +108,19 @@ compensation stack, exactly as it was the first time. That's what makes it crash
 level: after a mid-run crash, the resumed execution reconstructs the full stack of undos for every step that
 had actually completed, not just the ones this pass happened to run.
 
-Its unwind is checkpointed too, the same as the dispatched form's: a crash mid-unwind no longer re-runs a
-local undo that already completed, and doesn't restart its retry budget from attempt 1 — the checkpoint at
-its negative seq is what a later re-drive checks before running it again.
+In-process, its unwind is checkpointed too, the same as the dispatched form's: a crash mid-unwind no longer
+re-runs a local undo that already completed, and doesn't restart its retry budget from attempt 1 — the
+checkpoint at its negative seq is what a later re-drive checks before running it again.
 
-Because a compensation can still run more than once in the field regardless — a transient retry that
-succeeded but whose result got lost before it checkpointed, for instance — **compensations should be
+A workflow whose turns are dispatched to a worker registers the closure the same way, and when a turn fails
+the worker runs the undos in reverse before reporting the failure, recording each as `compensate:<step>`
+(see [the JS worker's local step policy](/docs/cluster/js-worker#local-step-policy)). Those records reach
+the engine only with the failed turn's decision, not one by one, so the worker's unwind is **at least
+once**: a worker that crashes mid-unwind, or whose decision is lost, has the turn redelivered, and the
+replay runs every undo again from the start.
+
+Because a compensation can run more than once in the field regardless — a transient retry that succeeded
+but whose result got lost before it checkpointed, or any worker-side unwind that is redelivered — **compensations must be
 idempotent**: releasing an already-released reservation or refunding an already-refunded charge should be a
 no-op either way.
 

@@ -32,6 +32,7 @@ import {
   parseDuration,
   remoteCallPolicyOf,
   remoteCallRetries,
+  retryLocalStep,
   runInStepLogger,
   runInStepScope,
   stepConfigOf,
@@ -96,6 +97,17 @@ export interface WorkflowContextOptions {
    * feature negotiation: only the original command kinds.
    */
   features?: readonly string[] | undefined;
+  /**
+   * How many times a `localStep`'s `compensate` closure is tried when the turn fails and the saga
+   * unwinds (see {@link WorkflowContext.runCompensations}). The engine's `compensationRetries`; default 1.
+   */
+  compensationRetries?: number | undefined;
+}
+
+/** A completed `localStep`'s registered undo, unwound in reverse when the turn fails. */
+interface LocalCompensation {
+  name: string;
+  fn: () => Promise<void>;
 }
 
 /**
@@ -133,6 +145,9 @@ export class WorkflowContext implements WorkflowCtx {
   private readonly isCancelled: ((runId: string) => boolean) | undefined;
   private readonly workflowPartition: string | undefined;
   private readonly features: ReadonlySet<string>;
+  private readonly compensationRetries: number;
+  /** Saga undos of completed local steps, in completion order; rebuilt identically on every replay. */
+  private readonly compensations: LocalCompensation[] = [];
   private seq = 0;
 
   constructor(runId: string, history: HistoryEvent[], opts: WorkflowContextOptions = {}) {
@@ -143,6 +158,7 @@ export class WorkflowContext implements WorkflowCtx {
     this.isCancelled = opts.isCancelled;
     this.workflowPartition = opts.workflowPartition;
     this.features = new Set(opts.features ?? []);
+    this.compensationRetries = Math.max(1, opts.compensationRetries ?? 1);
   }
 
   /** Fail the turn when the dispatching control plane cannot apply `feature` (see the options). */
@@ -314,71 +330,133 @@ export class WorkflowContext implements WorkflowCtx {
   }
 
   /**
-   * The internal checkpointed LOCAL-step primitive backing {@link sideEffect}/{@link now}/
-   * {@link gather}: run `fn` once and record its result, so side effects / non-determinism happen
-   * exactly once and replay returns the captured value. The body receives a {@link StepLogger}.
-   * `options` (retries/backoff/compensate) are engine-side concerns the thin worker doesn't apply —
-   * accepted for parity with core's `WorkflowCtx.localStep`, ignored on the wire.
+   * The checkpointed LOCAL-step primitive (also backing {@link sideEffect}/{@link now}): run `fn` in
+   * this process and record its result, so side effects / non-determinism happen exactly once and
+   * replay returns the captured value. The body receives a {@link StepLogger}.
+   *
+   * `options` apply as they do in-process (core's `createWorkflowCtx`), through the same
+   * `retryLocalStep` loop: `retries` is the total attempt count, a failed attempt waits
+   * `backoffDelay` (`backoff`/`backoffMs`/`backoffMaxMs`/`jitter`) in process before the next, a
+   * `FatalError` is never retried, and once attempts run out the step records the LAST attempt's
+   * error (its `code` and `details` intact) with `attempts` set, then raises it as {@link StepFailed}.
+   * The wait is not a durable timer, in-process included: a worker that dies mid-backoff replays the
+   * turn and runs the step again from attempt 1. A `compensate` closure is registered when the step
+   * completes (and again on every replay of it), and runs in reverse when the turn fails (see
+   * {@link runCompensations}).
    *
    * Not part of the public {@link WorkflowCtx} surface (the public single step is always dispatched —
    * see {@link step}), but present at runtime for the SAME reason core's `createWorkflowCtx` result
    * carries it: the two runtimes' ctx objects must expose the SAME member set (see
    * `ctx-conformance.spec.ts`).
-   *
-   * **WARNING — silently ignored options:** `options.retries`, `options.backoff`, and
-   * `options.compensate` are **silently ignored** on the thin worker: no retry loop runs and no
-   * saga compensation is registered. A portable workflow body that depends on retry behaviour or
-   * compensation MUST run in-process on the engine instead of on the thin worker, otherwise those
-   * guarantees are simply absent with no error raised.
    */
   async localStep<TOutput>(
     name: string,
     fn: (log: StepLogger) => Promise<TOutput> | TOutput,
-    _options?: StepOptions,
+    options?: StepOptions,
   ): Promise<TOutput> {
     const seq = this.next('localStep');
     const { found, output } = this.replay(seq, 'step', name);
-    if (found) return output as TOutput;
+    if (found) {
+      if (options?.compensate) this.compensations.push({ name, fn: options.compensate });
+      return output as TOutput;
+    }
 
-    const { output: result, error } = await this.runStepBody(seq, name, fn);
+    const { output: result, error } = await this.runStepBody(seq, name, fn, undefined, options);
     if (error !== undefined) throw new StepFailed(error);
+    if (options?.compensate) this.compensations.push({ name, fn: options.compensate });
     return result as TOutput;
   }
 
   /**
-   * Run one local step body, record its `recordStep` command (with `parallelGroup` when set) and
-   * stream its lifecycle. Returns `{output}` on success or `{error}` on failure WITHOUT throwing, so
-   * {@link step} and {@link gather} can decide how to surface it. The single place a local step's
-   * side effects + recording happen exactly once.
+   * The saga unwind for a failed turn: run every registered `localStep` `compensate` in reverse, each
+   * tried up to `compensationRetries` times, and record each outcome as a `compensate:<step>` step at
+   * the negative position `-(k + 1)` the engine gives its own unwind, so the undo trail shows in run
+   * detail as it does in-process. A failing undo is recorded and skipped, never raised: it must not
+   * mask the turn's original failure or strand the undos after it. An undo already in history is
+   * skipped. Called by the worker once a turn ends in a failure; a cancelled turn does not unwind.
+   * Internal to the runtime: workflow code never calls it.
+   */
+  async runCompensations(): Promise<void> {
+    const total = this.compensations.length;
+    for (let i = total - 1; i >= 0; i -= 1) {
+      const comp = this.compensations[i];
+      if (comp === undefined) continue;
+      const seq = -(total - i);
+      if (this.history.has(seq)) continue;
+      const name = `compensate:${comp.name}`;
+      const startedAt = Date.now();
+      let attempts = 0;
+      let error: StepError | undefined;
+      for (let attempt = 1; attempt <= this.compensationRetries; attempt += 1) {
+        attempts = attempt;
+        try {
+          await comp.fn();
+          error = undefined;
+          break;
+        } catch (err) {
+          error = { message: err instanceof Error ? err.message : String(err) };
+        }
+      }
+      const finishedAt = Date.now();
+      this.commands.push({
+        kind: 'recordStep',
+        seq,
+        name,
+        ...(error !== undefined ? { error } : {}),
+        attempts,
+        startedAt,
+        finishedAt,
+      });
+      this.emitStep({
+        runId: this.runId,
+        seq,
+        name,
+        phase: error !== undefined ? 'failed' : 'completed',
+        startedAt,
+        finishedAt,
+        ...(error !== undefined ? { error } : {}),
+      });
+    }
+  }
+
+  /**
+   * Run one local step body through the shared `retryLocalStep` loop (`options` as in
+   * {@link localStep}; none means one attempt), record its `recordStep` command (with `attempts`, and
+   * `parallelGroup` when set) and stream its lifecycle. Returns `{output}` on success or `{error}`
+   * (the last attempt's) on failure WITHOUT throwing, so {@link localStep} and {@link gather} can
+   * decide how to surface it. The single place a local step's side effects + recording happen.
    */
   private async runStepBody(
     seq: number,
     name: string,
     body: StepBody<unknown>,
     parallelGroup?: string,
+    options?: StepOptions,
   ): Promise<{ output?: unknown; error?: StepError; events: StepEvent[] }> {
-    const events: StepEvent[] = [];
-    const log = createStepLogger(events, () => Date.now());
     const startedAt = Date.now();
     const runId = this.runId;
     this.emitStep({ runId, seq, name, phase: 'running', startedAt, parallelGroup });
 
-    try {
+    // Events are scoped per attempt: the record carries only the attempt that completed (or the
+    // final failing one), as in-process.
+    let events: StepEvent[] = [];
+    const outcome = await retryLocalStep(options, async () => {
+      const attemptEvents: StepEvent[] = [];
+      events = attemptEvents;
+      const log = createStepLogger(attemptEvents, () => Date.now());
       // Bind the SAME sink ambiently too, so a helper deep inside the body can emit via
       // `currentStep()` without the handle being threaded down (see core's `ambient-step.ts`).
-      const result = await runInStepScope(this, name, () => runInStepLogger(log, () => body(log)));
-      const finishedAt = Date.now();
-      const cmd: WorkflowCommand = {
-        kind: 'recordStep',
-        seq,
-        name,
-        output: result,
-        startedAt,
-        finishedAt,
-      };
-      if (events.length > 0) cmd.events = events;
-      if (parallelGroup !== undefined) cmd.parallelGroup = parallelGroup;
-      this.commands.push(cmd);
+      return runInStepScope(this, name, () => runInStepLogger(log, () => body(log)));
+    });
+    const finishedAt = Date.now();
+    const cmd: WorkflowCommand = { kind: 'recordStep', seq, name, startedAt, finishedAt };
+    if (outcome.ok) cmd.output = outcome.value;
+    else cmd.error = toError(outcome.error);
+    if (outcome.attempts > 1) cmd.attempts = outcome.attempts;
+    if (events.length > 0) cmd.events = events;
+    if (parallelGroup !== undefined) cmd.parallelGroup = parallelGroup;
+    this.commands.push(cmd);
+    if (outcome.ok) {
       this.emitStep({
         runId,
         seq,
@@ -386,31 +464,25 @@ export class WorkflowContext implements WorkflowCtx {
         phase: 'completed',
         startedAt,
         finishedAt,
-        output: result,
+        output: outcome.value,
         events,
         parallelGroup,
       });
-      return { output: result, events };
-    } catch (err) {
-      const error = toError(err);
-      const finishedAt = Date.now();
-      const cmd: WorkflowCommand = { kind: 'recordStep', seq, name, error, startedAt, finishedAt };
-      if (events.length > 0) cmd.events = events;
-      if (parallelGroup !== undefined) cmd.parallelGroup = parallelGroup;
-      this.commands.push(cmd);
-      this.emitStep({
-        runId,
-        seq,
-        name,
-        phase: 'failed',
-        startedAt,
-        finishedAt,
-        error,
-        events,
-        parallelGroup,
-      });
-      return { error, events };
+      return { output: outcome.value, events };
     }
+    const error = toError(outcome.error);
+    this.emitStep({
+      runId,
+      seq,
+      name,
+      phase: 'failed',
+      startedAt,
+      finishedAt,
+      error,
+      events,
+      parallelGroup,
+    });
+    return { error, events };
   }
 
   /**
