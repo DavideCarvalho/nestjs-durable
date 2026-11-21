@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { describe, expect, it, vi } from 'vitest';
 import { WorkflowEngine } from './engine';
 import type {
   HistoryEvent,
@@ -8,7 +9,9 @@ import type {
   WorkflowDecision,
   WorkflowExecutor,
   WorkflowRun,
+  WorkflowTask,
 } from './interfaces';
+import { RemoteWorkflowExecutor } from './remote-workflow-executor';
 import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
@@ -167,5 +170,183 @@ describe('context carrier — opaque tenant/user/correlation propagation to work
 
     expect(dispatched).toHaveLength(1);
     expect(dispatched[0]?.context).toEqual({ tenantId: 't3', userRef: { type: 'User', id: 3 } });
+  });
+});
+
+describe('context carrier on a dispatched workflow turn', () => {
+  /** A transport that carries workflow tasks and step tasks and records both; decisions and step
+   *  results are delivered by the test through the captured handlers. */
+  function turnTransport() {
+    const turns: WorkflowTask[] = [];
+    const steps: RemoteTask[] = [];
+    const handlers: { decide?: (d: WorkflowDecision) => Promise<void> } = {};
+    const transport: Transport = {
+      async dispatch(task) {
+        steps.push(task);
+      },
+      onResult() {},
+      onHeartbeat() {},
+      async dispatchWorkflowTask(task) {
+        turns.push(task);
+      },
+      onDecision(handler) {
+        handlers.decide = handler;
+      },
+    };
+    return { transport, turns, steps, handlers };
+  }
+
+  /** Start `runId` and wait until its first turn is on the transport (the run then awaits it). */
+  async function startTurn(engine: WorkflowEngine, turns: WorkflowTask[], runId: string) {
+    await engine.start('ask', {}, runId);
+    for (let i = 0; i < 100 && turns.length === 0; i += 1) {
+      await new Promise((r) => setImmediate(r));
+    }
+  }
+
+  it('stamps the context reader on the dispatched turn, and omits it without a reader', async () => {
+    for (const context of [() => ({ traceId: 'trace-1' }), undefined]) {
+      const store = new InMemoryStateStore();
+      const { transport, turns } = turnTransport();
+      const engine = new WorkflowEngine({ store, transport, ...(context ? { context } : {}) });
+      const executor = new RemoteWorkflowExecutor(transport, 'ask');
+      engine.register('ask', '1', async () => 'x', { group: 'ask', executor });
+      await startTurn(engine, turns, 'r1');
+      expect(turns).toHaveLength(1);
+      expect(turns[0]?.context).toEqual(context ? { traceId: 'trace-1' } : undefined);
+      expect(turns[0] !== undefined && 'context' in turns[0]).toBe(context !== undefined);
+    }
+  });
+
+  /** An engine whose context lives in `als`, with one dispatched turn of run `r1` started inside
+   *  `started` (or outside any context when omitted). */
+  async function engineWithTurn(
+    options: {
+      started?: Record<string, unknown>;
+      rehydrate?: (carrier: Record<string, unknown> | undefined, fn: () => unknown) => unknown;
+      tenancy?: ConstructorParameters<typeof WorkflowEngine>[0]['tenancy'];
+      onContext?: () => void;
+    } = {},
+  ) {
+    const als = new AsyncLocalStorage<Record<string, unknown>>();
+    const store = new InMemoryStateStore();
+    const { transport, turns, steps, handlers } = turnTransport();
+    const engine = new WorkflowEngine({
+      store,
+      transport,
+      context: () => {
+        options.onContext?.();
+        return als.getStore() ?? { traceId: 'fresh' };
+      },
+      rehydrate: (options.rehydrate ??
+        ((carrier, fn) => (carrier ? als.run(carrier, fn) : fn()))) as <T>(
+        carrier: Record<string, unknown> | undefined,
+        fn: () => T,
+      ) => T,
+      ...(options.tenancy ? { tenancy: options.tenancy } : {}),
+    });
+    const executor = new RemoteWorkflowExecutor(transport, 'ask');
+    engine.register('ask', '1', async () => 'x', { group: 'ask', executor });
+    const start = () => startTurn(engine, turns, 'r1');
+    await (options.started ? als.run(options.started, start) : start());
+    const taskId = (await store.getRun('r1'))?.awaitingDecisionTaskId as string;
+    const decide = (over: Partial<WorkflowDecision> & Record<string, unknown> = {}) =>
+      handlers.decide?.({
+        taskId,
+        runId: 'r1',
+        status: 'continue',
+        commands: [{ kind: 'call', seq: 0, name: 'probe.run', input: {} }],
+        ...over,
+      } as WorkflowDecision);
+    return { als, store, turns, steps, taskId, decide, engine };
+  }
+
+  it("applies a decision under the carrier the engine stamped on that turn, so the turn's steps carry it", async () => {
+    const { turns, steps, decide } = await engineWithTurn({ started: { traceId: 'started-with' } });
+    expect(turns[0]?.context).toEqual({ traceId: 'started-with' });
+    // Outside any context, as a decision consumer runs.
+    await decide();
+    expect(steps.map((t) => t.context)).toEqual([{ traceId: 'started-with' }]);
+  });
+
+  it('never applies a decision under a carrier the worker sends back', async () => {
+    const { steps, decide } = await engineWithTurn({ started: { traceId: 'started-with' } });
+    await decide({
+      context: { traceId: 'forged', tenantId: 'other', userRef: { type: 'u', id: 1 } },
+    });
+    expect(steps.map((t) => t.context)).toEqual([{ traceId: 'started-with' }]);
+  });
+
+  it("applies a decision another instance dispatched under its own context, not the dispatcher's carrier", async () => {
+    const { store, taskId } = await engineWithTurn({ started: { traceId: 'started-with' } });
+    // A second instance on the same store consumes the decision: it holds no carrier for the turn.
+    const other = turnTransport();
+    const engine = new WorkflowEngine({
+      store,
+      transport: other.transport,
+      context: () => ({ traceId: 'other-instance' }),
+      rehydrate: (_carrier, fn) => fn(),
+    });
+    const executor = new RemoteWorkflowExecutor(other.transport, 'ask');
+    engine.register('ask', '1', async () => 'x', { group: 'ask', executor });
+    await other.handlers.decide?.({
+      taskId,
+      runId: 'r1',
+      status: 'continue',
+      commands: [{ kind: 'call', seq: 0, name: 'probe.run', input: {} }],
+    });
+    expect(other.steps.map((t) => t.context)).toEqual([{ traceId: 'other-instance' }]);
+  });
+
+  it('does not apply a carrier it stamped on a different turn of the run', async () => {
+    const { store, steps, decide } = await engineWithTurn({ started: { traceId: 'started-with' } });
+    // Another instance re-drove the run: the store now awaits a turn this engine never dispatched.
+    await store.updateRun('r1', { awaitingDecisionTaskId: 'r1:wf:elsewhere' });
+    await decide({ taskId: 'r1:wf:elsewhere' });
+    expect(steps.map((t) => t.context)).toEqual([{ traceId: 'fresh' }]);
+  });
+
+  it("drops a turn's carrier once its run settles", async () => {
+    const { engine } = await engineWithTurn({ started: { traceId: 'started-with' } });
+    const held = () => (engine as unknown as { turnCarriers: Map<string, unknown> }).turnCarriers;
+    expect(held().has('r1')).toBe(true);
+    await engine.cancel('r1');
+    expect(held().has('r1')).toBe(false);
+  });
+
+  it('logs a carrier the rehydrate bridge rejects and applies the decision without it', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { store, steps, decide } = await engineWithTurn({
+        started: { traceId: 'started-with' },
+        rehydrate: (carrier, fn) => {
+          if (carrier?.traceId === 'started-with') throw new Error('malformed carrier');
+          return fn();
+        },
+      });
+      await decide();
+      expect(steps.map((t) => t.context)).toEqual([{ traceId: 'fresh' }]);
+      expect((await store.getRun('r1'))?.status).toBe('suspended');
+      expect(warn.mock.calls.flat().join(' ')).toMatch(/r1.*context carrier.*malformed carrier/);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("applies a decision in the run's tenant", async () => {
+    const tenantAls = new AsyncLocalStorage<string>();
+    const seen: Array<string | undefined> = [];
+    const { decide } = await engineWithTurn({
+      tenancy: {
+        current: () => ({ id: 'acme', kind: 'company' }),
+        filter: () => ({ mode: 'all' }),
+        run: (tenant, fn) => tenantAls.run(tenant.id, fn),
+      },
+      onContext: () => seen.push(tenantAls.getStore()),
+    });
+    seen.length = 0;
+    // Outside any tenant, as a decision consumer runs: the step it dispatches sees the run's.
+    await decide();
+    expect(seen).toEqual(['acme']);
   });
 });

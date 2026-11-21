@@ -37,7 +37,8 @@ import {
   type OnModuleInit,
   type Provider,
 } from '@nestjs/common';
-import { DiscoveryService, MetadataScanner } from '@nestjs/core';
+import { DiscoveryService, MetadataScanner, ModuleRef } from '@nestjs/core';
+import { resolveContextRehydrate } from './context-runtime';
 import { eventBatchOf, getOnEvents, getWorkflowMeta, isDeadLetterHandler } from './decorators';
 import { scanSteps, scanWorkflows } from './discovery-helpers';
 import type { DurableStartClient, TenantWorkflowStartPolicy } from './durable-start-client';
@@ -397,18 +398,23 @@ export function thinWorkerProviders(): Provider[] {
       // The role gate lives HERE, not just in the consumers: constructing the runtime resolves the
       // optional `@dudousxd/durable-worker` peer, so an operator that never runs a worker must not
       // reach this branch at all.
-      useFactory: (options: DurableModuleOptions) =>
-        isPureThinWorker(options)
-          ? createWorkerRuntime({
-              workflowGroup: options.partition ?? '',
-              // The worker unwinds a failed turn's `localStep` undos itself, so it takes the
-              // module's `compensationRetries` as the engine does.
-              ...(options.compensationRetries !== undefined
-                ? { compensationRetries: options.compensationRetries }
-                : {}),
-            })
-          : null,
-      inject: [DURABLE_OPTIONS_CANONICAL],
+      useFactory: async (options: DurableModuleOptions, moduleRef: ModuleRef) => {
+        if (!isPureThinWorker(options)) return null;
+        // The context carrier a dispatched turn or step carries is restored around it through
+        // nestjs-context's `deserialize`, the bridge the engine takes around a local step, so the
+        // app's own deserializer decides what reaches the handler.
+        const rehydrate = await resolveContextRehydrate(moduleRef);
+        return createWorkerRuntime({
+          workflowGroup: options.partition ?? '',
+          // The worker unwinds a failed turn's `localStep` undos itself, so it takes the
+          // module's `compensationRetries` as the engine does.
+          ...(options.compensationRetries !== undefined
+            ? { compensationRetries: options.compensationRetries }
+            : {}),
+          ...(rehydrate !== undefined ? { rehydrate } : {}),
+        });
+      },
+      inject: [DURABLE_OPTIONS_CANONICAL, ModuleRef],
     },
     { provide: RUN_REDIS_WORKER, useValue: defaultRunRedisWorker },
     { provide: DURABLE_WORKER_RUNNERS, useValue: [] as RunningWorker[] },

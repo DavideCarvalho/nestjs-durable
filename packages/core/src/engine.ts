@@ -1320,6 +1320,9 @@ const UNREGISTERED_DEAD_LETTER_FROM: RunStatus[] = [
   'blocked',
 ];
 
+/** How many dispatched turns' carriers an engine keeps in memory (see `turnCarriers`). */
+const TURN_CARRIERS_MAX = 10_000;
+
 /**
  * The orchestrator. Owns workflow state and replays runs deterministically: each step's
  * result is checkpointed, so on resume a completed step returns its saved output instead of
@@ -2756,6 +2759,10 @@ export class WorkflowEngine {
    */
   private emit(event: Omit<EngineEvent, 'at'>, opts?: { lifecycle?: boolean }): void {
     const full: EngineEvent = { ...event, at: new Date() };
+    // A settled run awaits no turn: drop its dispatched turn's carrier now, not at eviction.
+    if (full.type === 'run.completed' || full.type === 'run.failed') {
+      this.turnCarriers.delete(full.runId);
+    }
     this.settleParentClose(full);
     this.deliver(full);
     if (opts?.lifecycle !== false) {
@@ -8890,7 +8897,17 @@ export class WorkflowEngine {
       await this.store.releaseRunLock(run.id);
       // THEN enqueue. A failed/lost dispatch leaves the run suspended-awaiting with `wakeAt` set, so the
       // timer poller re-drives it — no lost run.
-      await remote.executor.dispatch(run, history, taskId);
+      // The turn carries the same context carrier a dispatched step does, so a worker can restore it.
+      // The engine keeps its own copy to apply the turn's decision under (see completeRemoteDecision).
+      const context = this.context?.();
+      this.rememberTurnCarrier(run.id, taskId, context);
+      await remote.executor.dispatch(
+        run,
+        history,
+        taskId,
+        undefined,
+        context !== undefined ? { context } : undefined,
+      );
       return { runId: run.id, status: 'suspended' };
     }
 
@@ -12164,12 +12181,77 @@ export class WorkflowEngine {
       });
       fresh.awaitingDecisionTaskId = undefined;
       if (fresh.recoveryAttempts) fresh.recoveryAttempts = 0;
-      await this.applyDecision(fresh, decision);
+      await this.applyDecisionInCarrier(fresh, decision);
     } finally {
       const fenced = held.lease.lost;
       held.stop();
       // A fenced apply no longer owns the lease; releasing would free the new owner's.
       if (!fenced) await this.store.releaseRunLock(decision.runId);
+    }
+  }
+
+  /**
+   * The carrier this engine stamped on each run's dispatched turn, keyed by run id and matched on
+   * the turn's `taskId`. In memory only: a decision applied by another instance, or after this
+   * process restarted, finds none and is applied under the engine's own context. Bounded by
+   * {@link TURN_CARRIERS_MAX} (oldest first out), so a turn whose decision never comes cannot grow it.
+   */
+  private readonly turnCarriers = new Map<
+    string,
+    { taskId: string; carrier: Record<string, unknown> }
+  >();
+
+  private rememberTurnCarrier(
+    runId: string,
+    taskId: string,
+    carrier: Record<string, unknown> | undefined,
+  ): void {
+    this.turnCarriers.delete(runId);
+    if (carrier === undefined) return;
+    this.turnCarriers.set(runId, { taskId, carrier });
+    if (this.turnCarriers.size > TURN_CARRIERS_MAX) {
+      const oldest = this.turnCarriers.keys().next().value;
+      if (oldest !== undefined) this.turnCarriers.delete(oldest);
+    }
+  }
+
+  /** The carrier stamped on `runId`'s turn `taskId`, once; undefined for any other turn. */
+  private takeTurnCarrier(runId: string, taskId: string): Record<string, unknown> | undefined {
+    const entry = this.turnCarriers.get(runId);
+    if (entry?.taskId !== taskId) return undefined;
+    this.turnCarriers.delete(runId);
+    return entry.carrier;
+  }
+
+  /**
+   * Apply a dispatched turn's decision inside the carrier THIS engine stamped on that turn, and in
+   * the run's tenant, as a local step runs: the steps and children the decision dispatches then carry
+   * the turn's carrier. A carrier a worker sends back is never read, so a worker cannot choose the
+   * context its decision is applied under. A `rehydrate` that throws before the decision is applied
+   * (an app deserializer rejecting the carrier) is logged and the decision applied without it.
+   */
+  private async applyDecisionInCarrier(
+    run: WorkflowRun,
+    decision: WorkflowDecision,
+  ): Promise<void> {
+    const carrier = this.takeTurnCarrier(run.id, decision.taskId);
+    const apply = () => this.inRunTenant(run, () => this.applyDecision(run, decision));
+    if (carrier === undefined) {
+      await apply();
+      return;
+    }
+    let applied = false;
+    try {
+      await this.rehydrate(carrier, () => {
+        applied = true;
+        return apply();
+      });
+    } catch (err) {
+      if (applied) throw err;
+      console.warn(
+        `[nestjs-durable] run ${run.id}: could not restore the turn's context carrier, applying its decision without it: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      await apply();
     }
   }
 

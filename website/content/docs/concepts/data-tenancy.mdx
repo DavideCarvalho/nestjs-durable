@@ -112,15 +112,17 @@ through the context's tenancy slot (in the configured `family`, when you set one
 A **lifecycle subscriber** (`onEvent: [runCompletedEvent(...)]`, without `eventBatch`) starts in the
 tenant of the run that settled, even when the event is published later by the background retry pass.
 
-Dispatched step tasks carry the tenant in their context carrier (`tenant` and `tenantId`). A
-`DurableModule` in the process that runs the handler, operator or worker, on any transport, restores
-it around the handler body.
+Dispatched step tasks carry the tenant in their context carrier (`tenant` and `tenantId`) when
+nestjs-context's carrier lets it through: the default carrier is `Context.serialize()`, so a
+`carrier: [...]` allowlist or a custom `serialize` decides. A `DurableModule` in the process that runs
+the handler, operator or worker, on any transport, restores it around the handler body.
 
 <Callout type="warn">
-  Remote step handlers get the tenant **only through the context carrier**. The default carrier
-  includes it. If you pass your own `context` reader, or a custom `serialize` / `deserialize` to
-  `@dudousxd/nestjs-context`, make it include `tenant` (`{ id, kind }`) or `tenantId`; otherwise a
-  remote step handler runs with no tenant.
+  Remote step handlers get the tenant **only through the context carrier**. nestjs-context's default
+  allowlist (`traceId`, `tenantId`, `userRef`) includes it. If you set `carrier: [...]`, a custom
+  `serialize` / `deserialize` on `@dudousxd/nestjs-context`, or your own `context` reader, make it
+  include `tenantId` (or `tenant`, `{ id, kind }`); otherwise a remote step handler runs with no
+  tenant.
 
   ```ts
   DurableModule.forRoot({
@@ -250,5 +252,7 @@ them before you deploy the upgrade:
 - **Prisma:** the fields are in the package's `prisma/schema.prisma`; copy them and run
   `prisma migrate dev`.
 
-Workers that execute **workflow turns** over the wire (remote workflows) don't receive the tenant:
-the turn runs on the worker without it. Step handlers do receive it through the task carrier.
+Workers that execute **workflow turns** over the wire (remote workflows) don't restore the run's
+tenant: a turn runs on the worker with only what `Context.deserialize` restores from the turn's
+context carrier. Step handlers receive the tenant through the task carrier when the carrier includes
+`tenantId` (see the note above).

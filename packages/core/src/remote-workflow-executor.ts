@@ -5,6 +5,7 @@ import {
   type WorkflowExecutor,
   type WorkflowRun,
   type WorkflowTask,
+  type WorkflowTaskDispatchOptions,
   type WorkflowTaskState,
 } from './interfaces';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group';
@@ -53,6 +54,7 @@ export class RemoteWorkflowExecutor implements WorkflowExecutor {
     history: HistoryEvent[],
     taskId: string,
     pendingSignals?: WorkflowTask['pendingSignals'],
+    options?: WorkflowTaskDispatchOptions,
   ): Promise<void> {
     if (!this.transport.dispatchWorkflowTask) {
       throw new Error('transport does not support workflow tasks (dispatchWorkflowTask)');
@@ -71,6 +73,7 @@ export class RemoteWorkflowExecutor implements WorkflowExecutor {
       // What this control plane applies beyond the original command kinds, so a worker fails a turn
       // that needs more instead of emitting a command this engine would not understand.
       features: [...REMOTE_WORKFLOW_FEATURES],
+      ...(options?.context !== undefined ? { context: options.context } : {}),
     };
     await this.transport.dispatchWorkflowTask(task);
   }

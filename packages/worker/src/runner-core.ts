@@ -9,7 +9,7 @@ import type {
 } from '@dudousxd/nestjs-durable-core';
 import type { StepHandler } from './step-worker';
 import { StepWorker } from './step-worker';
-import type { WorkflowFn } from './workflow-worker';
+import type { ContextRehydrate, WorkflowFn } from './workflow-worker';
 import { WorkflowWorker } from './workflow-worker';
 
 /** The default key prefix namespacing the durable queues — matches `BullMQTransport`'s default. */
@@ -135,16 +135,27 @@ export class DurableWorkerRuntime {
    *  is announced as a bare name rather than with invented fields. */
   private readonly workflowMeta = new Map<string, WorkflowRegistrationMeta>();
 
-  /** `compensationRetries`: tries per `localStep` `compensate` when a failed turn unwinds (default 1). */
+  /**
+   * `compensationRetries`: tries per `localStep` `compensate` when a failed turn unwinds (default 1).
+   * `rehydrate`: restores the context carrier a dispatched turn or step carries around its replay or
+   * handler, as the engine's own `rehydrate` does around a local step. Omitted: no carrier is restored.
+   */
   constructor(
-    options: { workflowGroup?: string; stepGroup?: string; compensationRetries?: number } = {},
+    options: {
+      workflowGroup?: string;
+      stepGroup?: string;
+      compensationRetries?: number;
+      rehydrate?: ContextRehydrate;
+    } = {},
   ) {
+    const rehydrate = options.rehydrate !== undefined ? { rehydrate: options.rehydrate } : {};
     this.workflows = new WorkflowWorker(options.workflowGroup, {
       ...(options.compensationRetries !== undefined
         ? { compensationRetries: options.compensationRetries }
         : {}),
+      ...rehydrate,
     });
-    this.steps = new StepWorker(options.stepGroup);
+    this.steps = new StepWorker(options.stepGroup, rehydrate);
   }
 
   /**

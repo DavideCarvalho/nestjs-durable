@@ -35,6 +35,15 @@ import {
 } from '@nestjs/common';
 import { DiscoveryModule, ModuleRef } from '@nestjs/core';
 import type { ContextAccessor } from './context-accessor';
+import {
+  carrierFromContext,
+  contextHasCustomSerialize,
+  contextSlotPresent,
+  rehydrateBridge,
+  resolveAccessor,
+  resolveContextRuntime,
+  resolveContextSerializer,
+} from './context-runtime';
 import { DurableStartClient } from './durable-start-client';
 import { DurableStepRegistrar } from './durable-step.registrar';
 import { thinWorkerProviders, unavailableRunGateway } from './durable-worker.module';
@@ -64,88 +73,9 @@ import {
 } from './tenant-contracts';
 import { TenantEventRepublisher } from './tenant-event-republisher';
 import { TimerPoller } from './timer-poller';
-import { CONTEXT_ACCESSOR, TENANT_AUTH } from './tokens';
+import { TENANT_AUTH } from './tokens';
 import { WorkflowRegistrar } from './workflow.registrar';
 import { WorkflowService } from './workflow.service';
-
-/**
- * Locate the context accessor non-strictly: an accessor provided by ANY module (a global
- * `ContextModule` from `@dudousxd/nestjs-context`, or the app root) is found via {@link ModuleRef},
- * because DurableModule is `global` and its engine factory can't see another module's local
- * providers directly. Returns undefined when the optional peer isn't installed/bound.
- */
-function resolveAccessor(moduleRef: ModuleRef): ContextAccessor | undefined {
-  try {
-    return moduleRef.get<ContextAccessor>(CONTEXT_ACCESSOR, { strict: false });
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Build an opaque context carrier from a {@link ContextAccessor} — the auto-feed default for the
- * engine's `context` option when `@dudousxd/nestjs-context` is present and the app passed no own
- * reader. Drops fields the accessor doesn't populate, so an empty/anonymous request yields `{}`.
- */
-function carrierFromAccessor(accessor: ContextAccessor): Record<string, unknown> | undefined {
-  const carrier: Record<string, unknown> = {};
-  const traceId = accessor.traceId();
-  if (traceId !== undefined) carrier.traceId = traceId;
-  const tenantId = accessor.tenantId();
-  if (tenantId !== undefined) carrier.tenantId = tenantId;
-  // The full tenant (with its kind), so a worker restores `{ id, kind }` and not `kind: 'unknown'`.
-  // A `legacy` one (only a plain `tenantId` was set) adds nothing the `tenantId` above doesn't carry.
-  const tenant = accessor.tenant?.();
-  if (tenant !== undefined && tenant.source !== 'legacy') carrier.tenant = tenant;
-  const userRef = accessor.userRef();
-  if (userRef !== undefined) carrier.userRef = userRef;
-  return carrier;
-}
-
-/** True when nestjs-context publishes its accessor on the global slot (even with no DI binding). */
-function contextSlotPresent(): boolean {
-  const slot = (globalThis as unknown as Record<symbol, { current?: unknown } | undefined>)[
-    Symbol.for('@dudousxd/nestjs-diagnostics:accessor')
-  ];
-  return !!slot?.current;
-}
-
-/**
- * The slice of `@dudousxd/nestjs-context`'s module-level `Context` singleton we use to re-hydrate the
- * originating context around a local step body. Structural — we never import the package's types (it
- * is an OPTIONAL peer); the guarded dynamic import below captures whatever the installed package
- * exports as `Context`.
- */
-interface ContextRuntime {
-  /** Re-hydrate a context from an opaque carrier and run `fn` inside its ALS scope. */
-  deserialize<T>(carrier: Record<string, unknown>, fn: () => T): T;
-  /** Run `fn` with a tenant (nestjs-context ≥ 1.2). Absent on an older context: tenancy stays off. */
-  withTenant?: TenantRuntime['withTenant'];
-}
-
-function isContextRuntime(x: unknown): x is ContextRuntime {
-  return !!x && typeof (x as ContextRuntime).deserialize === 'function';
-}
-
-/**
- * Resolve `@dudousxd/nestjs-context`'s runtime `Context` singleton via a GUARDED dynamic import — used
- * to build the engine's `rehydrate` bridge. The runtime `Context` (its `deserialize`/ALS `run`) is a
- * module-level singleton, NOT a DI provider behind {@link CONTEXT_ACCESSOR}, so it can't be resolved
- * through ModuleRef — we import it directly. We do NOT add a hard/static import (the peer is optional):
- * a failure (peer not installed) returns undefined and the engine falls back to passthrough re-hydration.
- */
-async function resolveContextRuntime(): Promise<ContextRuntime | undefined> {
-  try {
-    // Indirect the specifier through a variable so the compiler does not try to STATICALLY resolve
-    // the optional peer (it may be uninstalled). This stays a runtime guarded import — a missing
-    // module rejects and is caught below.
-    const specifier = '@dudousxd/nestjs-context';
-    const mod = (await import(specifier)) as { Context?: unknown };
-    return isContextRuntime(mod.Context) ? mod.Context : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 /** True when `x` can act as a control plane (broadcast pub/sub) — e.g. a broadcast-capable transport. */
 function isControlPlane(x: unknown): x is ControlPlane {
@@ -510,9 +440,11 @@ export interface DurableModuleSharedOptions {
    * inspects its shape.
    *
    * **Auto-feed**: if you omit this AND `@dudousxd/nestjs-context` is installed (its accessor is bound
-   * to the shared `CONTEXT_ACCESSOR` token), DurableModule defaults this to a reader that builds
-   * `{ traceId, tenantId, userRef }` from the accessor — so a workflow dispatched within a request
-   * automatically carries the originating context across process boundaries. Pass your own reader to
+   * to the shared `CONTEXT_ACCESSOR` token), DurableModule defaults this to nestjs-context's
+   * `Context.serialize()` — the fields its `carrier: [...]` allowlist names, `traceId`, `tenantId` and
+   * `userRef` by default — so a workflow dispatched within a request automatically carries the
+   * originating context across process boundaries, and nothing the allowlist leaves out reaches the
+   * broker. (An app's own accessor bound to the token is read directly instead.) Pass your own reader to
    * override the auto-feed; with neither, the carrier is omitted (unchanged behavior).
    *
    * Re-evaluated at each (re)dispatch — including a retry or a crash/scale-down resume that the engine
@@ -1094,8 +1026,6 @@ export class DurableModule {
             // pass its own `context` reader. The app's own reader always wins; with no accessor the
             // carrier stays `undefined` (unchanged behavior — `traceparent` etc. still work).
             const accessor = resolveAccessor(moduleRef);
-            const context =
-              options.context ?? (accessor ? () => carrierFromAccessor(accessor) : undefined);
             const runtimeNeeded = accessor !== undefined || contextSlotPresent();
             // Consume side: when nestjs-context is present (an accessor is bound), re-hydrate the
             // originating context AROUND each local step body, so a `@Step` reader sees the
@@ -1104,14 +1034,23 @@ export class DurableModule {
             // ONCE here via a guarded dynamic import (optional peer — failure leaves the default
             // passthrough). Best-effort: an empty/undefined carrier just runs the handler normally.
             // The engine re-applies the run row's tenant INSIDE this bridge, so an app deserializer
-            // that drops the tenant cannot take it away from a local step.
+            // that drops the tenant cannot take it away from a local step. A worker runtime takes the
+            // same bridge (`resolveContextRehydrate`) around each dispatched turn and step.
             const runtime = runtimeNeeded ? await resolveContextRuntime() : undefined;
-            const rehydrate =
-              runtime &&
-              (<T>(carrier: Record<string, unknown> | undefined, fn: () => T): T =>
-                carrier && Object.keys(carrier).length > 0
-                  ? runtime.deserialize(carrier, fn)
-                  : fn());
+            const rehydrate = runtime && rehydrateBridge(runtime);
+            // The auto-fed carrier goes through nestjs-context's own `serialize`, so the app's
+            // `carrier: [...]` allowlist (or `serialize` override) decides what reaches the wire —
+            // dispatched tasks sit in the broker, failed ones for a day.
+            const serialize =
+              options.context === undefined && accessor
+                ? await resolveContextSerializer(accessor)
+                : undefined;
+            const customSerialize = contextHasCustomSerialize(moduleRef);
+            const context =
+              options.context ??
+              (accessor
+                ? () => carrierFromContext(accessor, serialize, customSerialize)
+                : undefined);
             // `consumers: false`: park every transport's point-to-point consumers BEFORE the engine
             // subscribes to them (its constructor registers the results/decisions consumers).
             if (options.consumers === false) {
