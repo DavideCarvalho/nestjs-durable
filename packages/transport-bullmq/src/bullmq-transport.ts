@@ -937,6 +937,15 @@ export class BullMQTransport implements Transport, ControlPlane {
     return at === -1 ? base : `${base}@${routingToken.slice(at + 1)}`;
   }
 
+  /**
+   * The step task queue layout this transport dispatches to and consumes (`taskQueues`), and whether
+   * it also drains the other layout's queues (`taskQueueDrain`). A co-located worker reads it to tell
+   * whether its own per-handler consumer already covers the queues a step is dispatched to.
+   */
+  get taskQueueLayout(): { queues: 'per-handler' | 'grouped'; drain: boolean } {
+    return { queues: this.taskQueues, drain: this.drainEnabled };
+  }
+
   /** The queue a routing token's step tasks go to in this transport's layout. */
   private taskQueueName(routingToken: string): string {
     return this.taskQueues === 'grouped'

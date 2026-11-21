@@ -367,7 +367,9 @@ export interface DurableModuleSharedOptions {
    * parked via `deferConsumers()`, and no co-located/thin worker consumer starts. The process still
    * dispatches and starts runs; the jobs stay on the queues for the fleet. Pair it with
    * `drive: false` so it doesn't poll/recover runs either. To consume later in the same process, call
-   * `startConsumers()` on your transport. A transport without `deferConsumers()` (the SQL/SQS/in-process
+   * `startConsumers()` on your transport. On a co-located worker whose transport uses per-handler step
+   * queues, the transport has no step handlers registered (the in-app worker runtime consumes them), so
+   * `startConsumers()` starts no step consumer there. A transport without `deferConsumers()` (the SQL/SQS/in-process
    * transports) keeps consuming — a warning says so.
    */
   consumers?: boolean;
