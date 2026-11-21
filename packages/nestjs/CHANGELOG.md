@@ -1,5 +1,14 @@
 # @dudousxd/nestjs-durable
 
+## 0.70.1
+
+### Patch Changes
+
+- [#495](https://github.com/DavideCarvalho/nestjs-durable/pull/495) [`d6aac97`](https://github.com/DavideCarvalho/nestjs-durable/commit/d6aac970c362580880f6c420d56e037621ce3942) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A co-located worker (`store` + `connection`) whose transport uses per-handler step queues no longer starts a second consumer on each `@Step` queue.
+
+  - nestjs: `DurableStepRegistrar` registered every `@Step` on the transport (`transport.handle`) on any driving operator, so with `BullMQTransport` the transport's own BullMQ Worker and the in-app worker both consumed `<prefix>-tasks-<step>@<partition>` and raced for each job. A step the transport's copy took ran without its context carrier and at the transport's concurrency and lock settings instead of the step consumer's (`concurrency`, `concurrencyByHandler`, `lockDuration`, `stalledInterval`, `maxStalledCount`). The registrar now skips a co-located worker when the transport declares the per-handler layout with no drain: the in-app worker runtime is then the step queues' only consumer. With `taskQueues: 'grouped'`, a draining transport, or a transport that states no layout, the transport's consumer stays, since the in-app runtime does not read the grouped `<prefix>-taskgroup` queue; such a worker does not yet get `concurrencyByHandler` or the carrier restore on its steps. With a per-handler transport that drains (`taskQueueDrain` on), the per-handler step queues keep two consumers, the transport's and the in-app runtime's, as before this release, because `BullMQTransport.handle()` cannot drain the grouped queue without also consuming its per-handler one; and a grouped transport draining leftover per-handler jobs overlaps the in-app runtime on those queues for the length of a layout switch. Both go away once the in-app runtime consumes the grouped layout ([#496](https://github.com/DavideCarvalho/nestjs-durable/issues/496)). A driving operator without `connection` is unchanged.
+  - transport-bullmq: `BullMQTransport.taskQueueLayout` states the step queue layout (`{ queues: 'per-handler' | 'grouped', drain }`). The nestjs fix reads it, so it takes effect with this transport-bullmq release or later; with an older one the registrar keeps today's behaviour.
+
 ## 0.70.0
 
 ### Minor Changes
