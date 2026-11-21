@@ -279,8 +279,15 @@ describe('announced @Workflow options on a convention-served tenant workflow (it
     ];
     advance(120_000);
     await engine.resumeDueTimers();
-    // One of the two starts once a worker is live; the other is held behind it by the key.
-    for (let i = 0; i < 200 && broker.turns.length === 0; i++) await settle();
+    // One of the two starts once a worker is live; the other is held behind it by the key. Both
+    // resume together, so both can lose the race for the key and be held with a short retry; the
+    // clock is fake, so move it on and resume what is due until one is admitted.
+    for (let i = 0; i < 20 && broker.turns.length === 0; i++) {
+      for (let j = 0; j < 10 && broker.turns.length === 0; j++) await settle();
+      if (broker.turns.length > 0) break;
+      advance(5_000);
+      await engine.resumeDueTimers();
+    }
     await settle();
     expect(new Set(broker.turns.map((t) => t.runId)).size).toBe(1);
     const held = ['p1', 'p2'].find((id) => !broker.turns.some((t) => t.runId === id));
