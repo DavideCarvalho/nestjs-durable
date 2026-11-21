@@ -221,4 +221,45 @@ describe('one consumer per step queue (real Redis) [testcontainers]', () => {
       await moduleRef.close();
     }
   }, 60_000);
+
+  it("a co-located worker on the grouped layout keeps the transport's consumer of its taskgroup queue", async (ctx) => {
+    if (skipped || redisError || !connection) {
+      ctx.skip();
+      return;
+    }
+    // The in-app runtime subscribes per-handler queues only, so the grouped `<prefix>-taskgroup`
+    // queue's one consumer is the transport's; without it the step would never run.
+    const prefix = `grouped-${randomUUID().slice(0, 8)}`;
+    const store = new InMemoryStateStore();
+    const moduleRef = await boot({
+      store,
+      transport: new BullMQTransport({
+        connection,
+        prefix,
+        partition: 'p1',
+        taskQueues: 'grouped',
+      }),
+      connection,
+      prefix,
+      partition: 'p1',
+      autoSchema: false,
+    });
+    try {
+      const taskGroup = `${prefix}-taskgroup@p1`;
+      await until(
+        () => consumersOf(taskGroup),
+        (n) => n >= 1,
+      );
+      expect(await consumersOf(taskGroup)).toBe(1);
+      const service = moduleRef.get(WorkflowService);
+      await service.start('probe.flow', { key: 'grouped' }, 'grouped-1');
+      await until(
+        async () => (await store.getRun('grouped-1'))?.status,
+        (status) => status === 'completed',
+      );
+      expect(seen.has('grouped')).toBe(true);
+    } finally {
+      await moduleRef.close();
+    }
+  }, 60_000);
 });

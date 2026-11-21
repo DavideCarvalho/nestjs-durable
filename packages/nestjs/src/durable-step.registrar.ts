@@ -25,13 +25,31 @@ function supportsHandle(transport: unknown): transport is LocalTaskHandling {
   return typeof (transport as LocalTaskHandling | null)?.handle === 'function';
 }
 
+/** A transport that states its step queue layout (`BullMQTransport.taskQueueLayout`). */
+interface TaskQueueLayout {
+  readonly taskQueueLayout: { queues: 'per-handler' | 'grouped'; drain: boolean };
+}
+
+/**
+ * Whether a co-located worker's in-app runtime already consumes every queue this transport sends
+ * steps to: the transport declares the per-handler layout (`<prefix>-tasks-<token>`, the queues the
+ * runtime subscribes) and drains no other layout. A grouped transport (`<prefix>-taskgroup`), a
+ * draining one, or one that states no layout keeps its own consumer, or its steps would have none.
+ */
+function stepQueuesServedInApp(transport: unknown): boolean {
+  const layout = (transport as Partial<TaskQueueLayout> | null)?.taskQueueLayout;
+  return layout?.queues === 'per-handler' && layout.drain === false;
+}
+
 /**
  * Discovers `@Step` methods and registers them — under their RESOLVED name (derived `Class.method`
  * for a bare `@Step()`, or the explicit override) — as step handlers on the configured transport,
- * when that transport runs handlers in-process, on a driving operator with no step consumer of its
- * own. With a queue/remote transport the handlers live in the worker process instead, and a
- * co-located worker (`store` + `connection`) serves them through its in-app worker runtime, so there
- * is nothing to wire here in either case: each step queue has exactly one consumer.
+ * when that transport runs handlers in-process, on a driving operator. A co-located worker
+ * (`store` + `connection`) whose transport uses the per-handler step layout serves its steps through
+ * its in-app worker runtime instead, so nothing is wired here and each per-handler step queue has
+ * one consumer. With the grouped layout (`taskQueues: 'grouped'`), or a transport that states no
+ * layout, the transport's consumer stays the step consumer, since the in-app runtime does not read
+ * those queues (DavideCarvalho/nestjs-durable#496).
  *
  * **Context re-hydration (consume side).** DurableModule's produce side auto-feeds an opaque carrier
  * (`Context.serialize()`, filtered by the app's `carrier: [...]` allowlist) from
@@ -56,12 +74,13 @@ export class DurableStepRegistrar implements OnModuleInit {
     // queue — receiving and running step tasks locally is exactly the driving-operator role we're
     // switching off here (a thin worker registers its steps via `ThinStepRegistrar` instead).
     if (!isDrivingOperator(this.options)) return;
-    // A co-located worker (`store` + `connection`) consumes every `@Step` queue through its in-app
-    // worker runtime, which restores the task's context carrier and applies the step consumer's
-    // concurrency and lock settings. Registering here too would start a second consumer on the
-    // same queue, racing it for each job.
-    if (isCoLocatedWorker(this.options)) return;
     if (!supportsHandle(this.transport)) return;
+    // A co-located worker (`store` + `connection`) consumes each per-handler `@Step` queue through
+    // its in-app worker runtime, which restores the task's context carrier and applies the step
+    // consumer's concurrency and lock settings. When the transport sends steps to those same
+    // queues, registering here too would start a second consumer racing it for each job. A grouped
+    // transport keeps registering: the in-app runtime does not consume `<prefix>-taskgroup`.
+    if (isCoLocatedWorker(this.options) && stepQueuesServedInApp(this.transport)) return;
     const transport = this.transport;
 
     // Forward the step logger as a second arg; methods that only declare `(input)` ignore it.

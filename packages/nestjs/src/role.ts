@@ -22,9 +22,9 @@ export function isDrivingOperator(options: DurableModuleOptions): boolean {
 
 /**
  * True for the **co-located worker** role — `store` + `connection`: the engine shares its process
- * with an in-app worker runtime that consumes one queue per registered `@Workflow` and `@Step`
- * (`in-app-worker.ts`). That runtime is the only consumer of those queues: the transport's own
- * in-process step consumers stay off.
+ * with an in-app worker runtime that consumes one per-handler queue per registered `@Workflow` and
+ * `@Step` (`in-app-worker.ts`). Where the transport sends steps to those queues, that runtime is
+ * their only consumer and the transport's own step consumers stay off (`DurableStepRegistrar`).
  */
 export function isCoLocatedWorker(options: DurableModuleOptions): boolean {
   return options.store !== undefined && options.connection !== undefined;

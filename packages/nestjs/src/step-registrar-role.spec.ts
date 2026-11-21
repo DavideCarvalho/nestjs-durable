@@ -16,8 +16,9 @@ import { DurableModule, type DurableModuleOptions } from './durable.module';
 import { IN_APP_RUN_REDIS_WORKER } from './in-app-worker';
 
 // `DurableStepRegistrar` registers `@Step` handlers on the transport only where nothing else
-// consumes their queues: a driving operator without a step consumer. A co-located worker serves
-// them through its in-app worker runtime, so a second, transport-owned consumer must not start.
+// consumes their queues. A co-located worker whose transport sends steps to per-handler queues
+// serves them through its in-app worker runtime, so a second, transport-owned consumer must not
+// start; with any other layout the transport's consumer is the only one and stays.
 
 @Injectable()
 class Probe {
@@ -38,6 +39,9 @@ class ProbeFlow {
 /** A transport that runs handlers in-process and carries workflow tasks; records `handle` calls. */
 class HandlingTransport implements Transport {
   readonly handled: Array<{ name: string; partition: string | undefined }> = [];
+  constructor(
+    readonly taskQueueLayout?: { queues: 'per-handler' | 'grouped'; drain: boolean } | undefined,
+  ) {}
   async dispatch(_task: RemoteTask): Promise<void> {}
   onResult(_handler: (result: StepResult) => Promise<void>): void {}
   onHeartbeat(_handler: (beat: Heartbeat) => Promise<void>): void {}
@@ -48,8 +52,10 @@ class HandlingTransport implements Transport {
   }
 }
 
-async function handledBy(extra: Partial<DurableModuleOptions>) {
-  const transport = new HandlingTransport();
+type Layout = ConstructorParameters<typeof HandlingTransport>[0];
+
+async function handledBy(extra: Partial<DurableModuleOptions>, layout?: Layout) {
+  const transport = new HandlingTransport(layout);
   const moduleRef = await Test.createTestingModule({
     imports: [
       DurableModule.forRoot({
@@ -72,11 +78,30 @@ async function handledBy(extra: Partial<DurableModuleOptions>) {
 
 describe('DurableStepRegistrar — one consumer per step queue', () => {
   it('registers @Step handlers on the transport for a driving operator with no step consumer', async () => {
-    expect(await handledBy({ partition: 'p1' })).toEqual([{ name: 'probe.run', partition: 'p1' }]);
+    expect(await handledBy({ partition: 'p1' }, { queues: 'per-handler', drain: false })).toEqual([
+      { name: 'probe.run', partition: 'p1' },
+    ]);
   });
 
-  it('registers none on a co-located worker, whose in-app runtime consumes the step queues', async () => {
-    expect(await handledBy({ connection: 'redis://x', partition: 'p1' })).toEqual([]);
+  const perHandler = { queues: 'per-handler', drain: false } as const;
+  const coLocated = { connection: 'redis://x', partition: 'p1' };
+  const registered = [{ name: 'probe.run', partition: 'p1' }];
+
+  it('registers none on a co-located worker whose transport uses per-handler step queues', async () => {
+    expect(await handledBy(coLocated, perHandler)).toEqual([]);
+  });
+
+  it('keeps registering on a co-located worker whose transport uses the grouped layout', async () => {
+    // The in-app runtime does not consume `<prefix>-taskgroup`: the transport's consumer is the only one.
+    expect(await handledBy(coLocated, { queues: 'grouped', drain: true })).toEqual(registered);
+  });
+
+  it('keeps registering on a co-located worker whose per-handler transport drains the grouped layout', async () => {
+    expect(await handledBy(coLocated, { queues: 'per-handler', drain: true })).toEqual(registered);
+  });
+
+  it('keeps registering on a co-located worker whose transport states no layout', async () => {
+    expect(await handledBy(coLocated)).toEqual(registered);
   });
 
   it('registers none on a non-driving operator', async () => {
