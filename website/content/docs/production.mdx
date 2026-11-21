@@ -473,11 +473,14 @@ DurableModule.forRoot({
 });
 ```
 
-`concurrencyByHandler` (a `Record<string, ConcurrencyOption>`, keyed by `@Workflow` / `@Step` name)
-gives that name's queue its own BullMQ concurrency; every other queue keeps `concurrency`. It works the
-same on a co-located worker (`store` + `connection`) and a thin worker (`connection` only). An
-adaptive override tunes that queue on its own controller; the heartbeat status reports the default
-pool. A name the process does not register is ignored with a warning.
+`concurrencyByHandler` (a `Record<string, ConcurrencyOption>`) gives one queue its own BullMQ
+concurrency; every other queue keeps `concurrency`. The key is the exact name string you gave
+`@Workflow({ name })` or `@Step(name)`, namespace and dots included: a workflow declared as
+`@Workflow({ name: 'agent.opencode.run' })` is keyed `'agent.opencode.run'`, not `'opencode.run'`
+and not its sanitized queue token. It works the same on a co-located worker (`store` + `connection`)
+and a thin worker (`connection` only). An overridden queue runs on its own controller (an adaptive
+override tunes that queue alone), and its heartbeat reports that controller's limit and in-flight
+count. A name this process does not register is ignored, with one warning per name per process.
 
 This is the knob for one interactive workflow among many background ones: with ~20 queues per
 process and a small database pool, keep `concurrency: 1` and raise only the workflow a person waits on.
@@ -487,7 +490,7 @@ DurableModule.forRoot({
   store,
   connection: process.env.REDIS_URL,
   concurrency: 1,
-  concurrencyByHandler: { 'assistant.turn': 4 },
+  concurrencyByHandler: { 'agent.opencode.run': 4 }, // the exact @Workflow({ name })
 });
 ```
 

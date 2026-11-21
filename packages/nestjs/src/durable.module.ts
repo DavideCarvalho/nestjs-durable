@@ -579,10 +579,12 @@ export interface DurableModuleSharedOptions {
   concurrency?: ConcurrencyOption;
   /**
    * Per-handler concurrency override for a worker role's consumer (co-located or thin), keyed by
-   * the `@Workflow`/`@Step` NAME: that name's queue runs at this limit, every other queue at
-   * {@link concurrency} (then 1). Example: `{ concurrency: 1, concurrencyByHandler: { 'ask.run': 4 } }`.
-   * A number or an adaptive config; an adaptive override tunes that one queue on its own controller.
-   * A name this process does not register is ignored with a warning. Ignored for a plain operator.
+   * the exact `@Workflow({ name })` / `@Step(name)` string, namespace included (e.g.
+   * `'agent.opencode.run'`, never the sanitized queue token): that name's queue runs at this limit,
+   * every other queue at {@link concurrency} (then 1). A number or an adaptive config; an
+   * overridden queue runs on its own controller and reports its own status on the heartbeat. A
+   * name this process does not register is ignored, with one warning per name per process.
+   * Ignored for a plain operator.
    */
   concurrencyByHandler?: Record<string, ConcurrencyOption>;
   /**

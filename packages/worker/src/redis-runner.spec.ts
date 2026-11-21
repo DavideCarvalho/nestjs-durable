@@ -22,6 +22,8 @@ function makeFakeDeps(opts: { withRedis?: boolean } = {}) {
     name: string;
     opts: Record<string, unknown>;
     processor: (job: { data: unknown }) => Promise<unknown>;
+    /** The Worker itself, whose settable `concurrency` a controller writes. */
+    instance: { concurrency?: number };
   }> = [];
 
   // A fake ioredis client recording `publish` (run/step heartbeats) — `set`/`subscribe`/`duplicate`
@@ -43,12 +45,14 @@ function makeFakeDeps(opts: { withRedis?: boolean } = {}) {
 
   const deps: RunnerDeps = {
     Worker: class {
+      concurrency?: number;
       constructor(
         name: string,
         proc: (job: { data: unknown }) => Promise<unknown>,
         wopts: Record<string, unknown>,
       ) {
-        workers.push({ name, opts: wopts, processor: proc });
+        this.concurrency = wopts.concurrency as number | undefined;
+        workers.push({ name, opts: wopts, processor: proc, instance: this });
       }
       async close() {}
     },
@@ -227,6 +231,91 @@ describe('runRedisWorker wiring (faked bullmq, no Redis)', () => {
     ]);
     expect(warn.mock.calls.flat().join(' ')).toMatch(/concurrencyByHandler.*no\.such/);
     warn.mockRestore();
+  });
+
+  it('warns once per process about a name several runners sharing one config do not register', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    for (const name of ['wf.a', 'wf.b']) {
+      const runtime = new DurableWorkerRuntime();
+      runtime.registerWorkflow(name, async () => 1);
+      await runRedisWorker({
+        runtime,
+        connection: {},
+        concurrencyByHandler: { 'shared.missing': 4 },
+        deps: makeFakeDeps().deps,
+      });
+    }
+    const warned = warn.mock.calls.flat().filter((m) => String(m).includes('shared.missing'));
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toMatch(/not registered by this process/);
+    warn.mockRestore();
+  });
+
+  it("leaves an override Worker's limit alone when the default controller moves its own", async () => {
+    const fake = makeFakeDeps();
+    const runtime = new DurableWorkerRuntime();
+    runtime.registerStep<number, number>('charge', (n) => n);
+    runtime.registerStep<number, number>('ask.run', (n) => n);
+    const runner = await runRedisWorker({
+      runtime,
+      connection: {},
+      concurrency: { mode: 'adaptive', min: 1, max: 8, start: 1 },
+      concurrencyByHandler: { 'ask.run': 3 },
+      deps: fake.deps,
+    });
+    const worker = (queue: string) => fake.workers.find((w) => w.name === queue)?.instance;
+    // A settled step lets the default controller grow its limit (slow start re-decides per step).
+    await fake.run('durable-tasks-charge', {
+      data: remoteTask({ name: 'charge', group: 'charge' }),
+    });
+    expect(worker('durable-tasks-charge')?.concurrency).toBeGreaterThan(1);
+    expect(worker('durable-tasks-ask.run')?.concurrency).toBe(3);
+    await runner.close();
+  });
+
+  it('reports each queue on the heartbeat with the controller that governs it', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      const fake = makeFakeDeps({ withRedis: true });
+      const runtime = new DurableWorkerRuntime();
+      runtime.registerStep<number, number>('charge', (n) => n);
+      let release: () => void = () => {};
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      runtime.registerStep('ask.run', async () => {
+        await held;
+        return 1;
+      });
+      const runner = await runRedisWorker({
+        runtime,
+        connection: {},
+        instanceId: 'w1',
+        concurrency: 1,
+        concurrencyByHandler: { 'ask.run': 3 },
+        deps: fake.deps,
+      });
+      // One job in flight on the override queue only.
+      const job = fake.run('durable-tasks-ask.run', {
+        data: remoteTask({ name: 'ask.run', group: 'ask.run' }),
+      });
+      fake.sets.length = 0;
+      vi.advanceTimersByTime(10_000);
+      await Promise.resolve();
+      const status = (token: string) => {
+        const beat = [...fake.sets]
+          .reverse()
+          .find((e) => e.key === `durable-worker-heartbeat:${token}:w1`);
+        return (JSON.parse(beat?.value ?? '{}') as { status?: Record<string, unknown> }).status;
+      };
+      expect(status('ask.run')).toMatchObject({ concurrency: { limit: 3 }, inFlight: 1 });
+      expect(status('charge')).toMatchObject({ concurrency: { limit: 1 }, inFlight: 0 });
+      release();
+      await job;
+      await runner.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps the 5 min lock and BullMQ stall defaults when unset or invalid', async () => {

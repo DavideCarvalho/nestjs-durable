@@ -159,13 +159,13 @@ export interface RunRedisWorkerOptions {
    */
   concurrency?: ConcurrencyOption;
   /**
-   * Per-name concurrency overrides, keyed by the registered workflow or step NAME (as passed to
-   * `registerWorkflow`/`registerStep`, before queue-token sanitizing). The Worker for a named queue
-   * runs at this limit instead of {@link concurrency}; every other queue keeps {@link concurrency}.
-   * An overridden name gets its own {@link AdaptiveController}, so an adaptive override tunes that
-   * queue alone, and the default limit's controller (whose status rides the heartbeat) governs only
-   * the queues without an override. A name that is not registered on `runtime` is ignored with a
-   * warning.
+   * Per-name concurrency overrides, keyed by the exact registered workflow or step NAME (as passed
+   * to `registerWorkflow`/`registerStep`, namespace included, before queue-token sanitizing). The
+   * Worker for a named queue runs at this limit instead of {@link concurrency}; every other queue
+   * keeps {@link concurrency}. An overridden name gets its own {@link AdaptiveController}, so an
+   * adaptive override tunes that queue alone, and each queue's heartbeat reports the status of the
+   * controller that governs it. A name that is not registered on `runtime` is ignored, with one
+   * warning per name per process.
    */
   concurrencyByHandler?: Record<string, ConcurrencyOption>;
   /**
@@ -305,6 +305,23 @@ export function buildRunnerDescriptor(
   });
 }
 
+/** `concurrencyByHandler` names already warned about in this process. */
+const warnedOverrides = new Set<string>();
+
+/**
+ * Warn, once per name per process, about `concurrencyByHandler` names this runner does not
+ * subscribe. Several runners in one process (one per role or partition) often share one config, so
+ * a name one of them serves is expected to be missing from the others.
+ */
+function warnUnregisteredOverrides(keys: string[], registered: Set<string>): void {
+  const fresh = keys.filter((name) => !registered.has(name) && !warnedOverrides.has(name));
+  if (fresh.length === 0) return;
+  for (const name of fresh) warnedOverrides.add(name);
+  console.warn(
+    `[nestjs-durable] concurrencyByHandler names a workflow or step not registered by this process, ignored: ${fresh.join(', ')}`,
+  );
+}
+
 /**
  * Start one BullMQ `Worker` per name in `runtime.registeredNames()` (workflows ∪ steps, deduped),
  * each consuming `<prefix>-tasks-<sanitized-name>[@<partition>]`, and drive the
@@ -375,17 +392,12 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
   // The concurrency controllers. The default one tracks inFlight + a rolling window of completions,
   // snapshots a live status for the heartbeat, and (adaptive mode) re-tunes the live limit, writing
   // the settable `concurrency` of every per-name Worker WITHOUT an override. Each name in
-  // `concurrencyByHandler` gets its own controller governing that name's Worker alone. `apply`
-  // reaches Workers constructed after the controller: a controller never calls back before `start()`.
+  // `concurrencyByHandler` gets its own controller governing that name's Worker alone, and its queue's
+  // heartbeat reports that controller's status. `apply` reaches Workers constructed after the
+  // controller: a controller never calls back before `start()`.
   type RunnerWorker = InstanceType<RunnerDeps['Worker']>;
   const overrides = options.concurrencyByHandler ?? {};
-  const registered = new Set(names);
-  const unknown = Object.keys(overrides).filter((name) => !registered.has(name));
-  if (unknown.length > 0) {
-    console.warn(
-      `[nestjs-durable] concurrencyByHandler names no registered workflow or step, ignored: ${unknown.join(', ')}`,
-    );
-  }
+  warnUnregisteredOverrides(Object.keys(overrides), new Set(names));
   const defaultWorkers: RunnerWorker[] = [];
   const controller = new AdaptiveController({
     ...(options.concurrency !== undefined ? { concurrency: options.concurrency } : {}),
@@ -395,6 +407,8 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
   });
   const ownControllers: AdaptiveController[] = [];
   const allWorkers: RunnerWorker[] = [];
+  /** The controller governing each subscribed queue token, read when building its heartbeat. */
+  const controllerByToken = new Map<string, AdaptiveController>();
 
   const processJob = async (pool: AdaptiveController, job: { data: unknown }): Promise<void> => {
     const task = job.data as Parameters<DurableWorkerRuntime['handleTask']>[0];
@@ -445,6 +459,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       });
       defaultWorkers.push(worker);
       allWorkers.push(worker);
+      controllerByToken.set(queueTokens[i] as string, controller);
       return;
     }
     const holder: { worker?: RunnerWorker } = {};
@@ -460,6 +475,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
     });
     ownControllers.push(own);
     allWorkers.push(holder.worker);
+    controllerByToken.set(queueTokens[i] as string, own);
   });
   // Start the AIMD loop for an adaptive worker; a fixed worker only takes its CPU baseline.
   controller.start();
@@ -523,15 +539,22 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
         // value is `{ts,status,descriptorHash}` JSON; the hash is the two-tier ETag that tells a
         // control plane when the descriptor changed (design §7.2). The descriptor rides the SAME
         // beat with the SAME TTL, so this worker's announcements cannot outlive its liveness.
-        const value = JSON.stringify({
-          ts: Date.now(),
-          status: controller.snapshot(),
-          descriptorHash: etag,
-        });
+        // Each queue reports the controller that governs it: one snapshot per controller per beat.
+        const ts = Date.now();
+        const values = new Map<AdaptiveController, string>();
+        const heartbeatOf = (token: string): string => {
+          const pool = controllerByToken.get(token) ?? controller;
+          let value = values.get(pool);
+          if (value === undefined) {
+            value = JSON.stringify({ ts, status: pool.snapshot(), descriptorHash: etag });
+            values.set(pool, value);
+          }
+          return value;
+        };
         void writer
           .beat({
             tokens: queueTokens,
-            heartbeat: value,
+            heartbeat: heartbeatOf,
             descriptor: descriptorJson,
             ttlSeconds: WORKER_HEARTBEAT_TTL_SECONDS,
             heartbeatKey: (token) => workerHeartbeatKey(prefix, token, instanceId),

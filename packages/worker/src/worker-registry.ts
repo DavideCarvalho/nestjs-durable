@@ -128,11 +128,12 @@ export class RegistryWriter {
 
   /**
    * One beat: `heartbeat` and `descriptor` for every token, live `ttlSeconds`. `keys` maps each
-   * entry to its per-instance key for older readers.
+   * entry to its per-instance key for older readers. `heartbeat` is one value for every token, or a
+   * function giving each token its own (a queue with its own concurrency reports its own status).
    */
   async beat(b: {
     tokens: readonly string[];
-    heartbeat: string;
+    heartbeat: string | ((token: string) => string);
     descriptor: string;
     ttlSeconds: number;
     heartbeatKey: (token: string) => string;
@@ -140,12 +141,13 @@ export class RegistryWriter {
   }): Promise<void> {
     const now = Date.now();
     const expiresAt = now + b.ttlSeconds * 1000;
+    const heartbeatOf = typeof b.heartbeat === 'string' ? () => b.heartbeat as string : b.heartbeat;
     const writes: Promise<unknown>[] = [];
     const hashes = this.#hashes();
     if (hashes) {
       const entries: RegistryFieldEntry[] = [];
       for (const token of b.tokens) {
-        entries.push({ kind: 'heartbeats', token, value: b.heartbeat, expiresAt });
+        entries.push({ kind: 'heartbeats', token, value: heartbeatOf(token), expiresAt });
         entries.push({ kind: 'descriptors', token, value: b.descriptor, expiresAt });
       }
       const key = workerInstancesKey(this.#prefix);
@@ -177,7 +179,7 @@ export class RegistryWriter {
         const dk = b.descriptorKey(token);
         this.#legacyKeys.add(hk);
         this.#legacyKeys.add(dk);
-        writes.push(this.#client.set(hk, b.heartbeat, 'EX', ttl));
+        writes.push(this.#client.set(hk, heartbeatOf(token), 'EX', ttl));
         writes.push(this.#client.set(dk, b.descriptor, 'EX', ttl));
       }
     }

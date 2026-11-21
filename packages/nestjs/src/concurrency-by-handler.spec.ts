@@ -94,7 +94,7 @@ const roles = [
   { role: 'thin worker (connection only)', options: thin, token: RUN_REDIS_WORKER },
 ] as const;
 
-describe.each(roles)('concurrencyByHandler on a $role', ({ options, token }) => {
+describe.each(roles)('concurrencyByHandler on a $role', ({ role, options, token }) => {
   async function boot(extra: Partial<DurableModuleOptions>) {
     const runner = realRunnerOverFakeBullmq();
     const moduleRef = await Test.createTestingModule({
@@ -134,9 +134,13 @@ describe.each(roles)('concurrencyByHandler on a $role', ({ options, token }) => 
 
   it('warns about a name no handler registers and still boots', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const { runner, moduleRef } = await boot({ concurrencyByHandler: { 'gone.workflow': 8 } });
+    // The warning is once per name per process, so each role gets a name of its own.
+    const missing = `gone.${role.split(' ')[0]}`;
+    const { runner, moduleRef } = await boot({ concurrencyByHandler: { [missing]: 8 } });
     expect(Object.values(runner.byQueue())).toEqual([1, 1, 1]);
-    expect(warn.mock.calls.flat().join(' ')).toMatch(/concurrencyByHandler.*gone\.workflow/);
+    expect(warn.mock.calls.flat().join(' ')).toContain(
+      `not registered by this process, ignored: ${missing}`,
+    );
     warn.mockRestore();
     await moduleRef.close();
   });
