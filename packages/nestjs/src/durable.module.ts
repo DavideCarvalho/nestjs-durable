@@ -568,7 +568,8 @@ export interface DurableModuleSharedOptions {
   /**
    * How many tasks a worker role's co-located/thin consumer runs concurrently PER SUBSCRIBED QUEUE
    * (BullMQ Worker concurrency — the same limit is applied to every per-name queue the single
-   * `runRedisWorker` call starts). Defaults to 1. Raise it so a fanned-out batch (e.g. the N remote
+   * `runRedisWorker` call starts, except the names {@link concurrencyByHandler} overrides).
+   * Defaults to 1. Raise it so a fanned-out batch (e.g. the N remote
    * steps of a `gather`) runs in parallel instead of serially.
    *
    * Pass `'adaptive'` (or `{ mode:'adaptive', ... }`) to let the consumer self-tune its concurrency
@@ -577,10 +578,11 @@ export interface DurableModuleSharedOptions {
    */
   concurrency?: ConcurrencyOption;
   /**
-   * Per-handler concurrency override, keyed by workflow/step NAME. Falls back to {@link concurrency}
-   * (then 1). NOT YET WIRED THROUGH: `runRedisWorker` (`@dudousxd/durable-worker`) currently applies
-   * one {@link concurrency} limit uniformly across every per-name queue it subscribes to from a
-   * single call — reserved here for when per-name concurrency lands there.
+   * Per-handler concurrency override for a worker role's consumer (co-located or thin), keyed by
+   * the `@Workflow`/`@Step` NAME: that name's queue runs at this limit, every other queue at
+   * {@link concurrency} (then 1). Example: `{ concurrency: 1, concurrencyByHandler: { 'ask.run': 4 } }`.
+   * A number or an adaptive config; an adaptive override tunes that one queue on its own controller.
+   * A name this process does not register is ignored with a warning. Ignored for a plain operator.
    */
   concurrencyByHandler?: Record<string, ConcurrencyOption>;
   /**

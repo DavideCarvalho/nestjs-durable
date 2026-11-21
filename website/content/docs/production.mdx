@@ -473,12 +473,23 @@ DurableModule.forRoot({
 });
 ```
 
-<Callout type="warn">
-`concurrencyByHandler` (a `Record<string, ConcurrencyOption>`) is accepted as a per-handler override
-but is **not yet wired through `runRedisWorker`** — today every subscribed queue uses the single
-`concurrency` value. Set it to declare intent, but rely on `concurrency` for the effective limit until
-per-handler routing lands.
-</Callout>
+`concurrencyByHandler` (a `Record<string, ConcurrencyOption>`, keyed by `@Workflow` / `@Step` name)
+gives that name's queue its own BullMQ concurrency; every other queue keeps `concurrency`. It works the
+same on a co-located worker (`store` + `connection`) and a thin worker (`connection` only). An
+adaptive override tunes that queue on its own controller; the heartbeat status reports the default
+pool. A name the process does not register is ignored with a warning.
+
+This is the knob for one interactive workflow among many background ones: with ~20 queues per
+process and a small database pool, keep `concurrency: 1` and raise only the workflow a person waits on.
+
+```ts
+DurableModule.forRoot({
+  store,
+  connection: process.env.REDIS_URL,
+  concurrency: 1,
+  concurrencyByHandler: { 'assistant.turn': 4 },
+});
+```
 
 ### Tuning for wide fans
 

@@ -163,6 +163,72 @@ describe('runRedisWorker wiring (faked bullmq, no Redis)', () => {
     }
   });
 
+  it('gives every Worker concurrency 1 when no concurrency option is set', async () => {
+    const fake = makeFakeDeps();
+    const runtime = new DurableWorkerRuntime();
+    runtime.registerWorkflow('pipeline', async () => 1);
+    runtime.registerStep<number, number>('charge', (n) => n);
+    await runRedisWorker({ runtime, connection: {}, deps: fake.deps });
+    expect(fake.workers.map((w) => w.opts.concurrency)).toEqual([1, 1]);
+  });
+
+  it('gives a name in concurrencyByHandler its own Worker concurrency and leaves the rest on the default', async () => {
+    const fake = makeFakeDeps();
+    const runtime = new DurableWorkerRuntime();
+    runtime.registerWorkflow('ask.run', async () => 1);
+    runtime.registerWorkflow('digest', async () => 1);
+    runtime.registerStep<number, number>('extraction:page', (n) => n);
+    await runRedisWorker({
+      runtime,
+      connection: {},
+      partition: 'acme',
+      concurrency: 2,
+      // Keyed by the registered name, not the sanitized queue token.
+      concurrencyByHandler: { 'ask.run': 4, 'extraction:page': 3 },
+      deps: fake.deps,
+    });
+    const byQueue = Object.fromEntries(fake.workers.map((w) => [w.name, w.opts.concurrency]));
+    expect(byQueue).toEqual({
+      'durable-tasks-ask.run@acme': 4,
+      'durable-tasks-digest@acme': 2,
+      'durable-tasks-extraction-page@acme': 3,
+    });
+  });
+
+  it('starts an adaptive override at its own start limit', async () => {
+    const fake = makeFakeDeps();
+    const runtime = new DurableWorkerRuntime();
+    runtime.registerWorkflow('ask.run', async () => 1);
+    runtime.registerWorkflow('digest', async () => 1);
+    const runner = await runRedisWorker({
+      runtime,
+      connection: {},
+      concurrencyByHandler: { 'ask.run': { mode: 'adaptive', min: 2, max: 8, start: 5 } },
+      deps: fake.deps,
+    });
+    expect(fake.workerOptsFor('durable-tasks-ask.run')?.concurrency).toBe(5);
+    expect(fake.workerOptsFor('durable-tasks-digest')?.concurrency).toBe(1);
+    await runner.close();
+  });
+
+  it('ignores an unregistered name in concurrencyByHandler with a warning', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fake = makeFakeDeps();
+    const runtime = new DurableWorkerRuntime();
+    runtime.registerWorkflow('pipeline', async () => 1);
+    await runRedisWorker({
+      runtime,
+      connection: {},
+      concurrencyByHandler: { 'no.such': 9, pipeline: 2 },
+      deps: fake.deps,
+    });
+    expect(fake.workers.map((w) => [w.name, w.opts.concurrency])).toEqual([
+      ['durable-tasks-pipeline', 2],
+    ]);
+    expect(warn.mock.calls.flat().join(' ')).toMatch(/concurrencyByHandler.*no\.such/);
+    warn.mockRestore();
+  });
+
   it('keeps the 5 min lock and BullMQ stall defaults when unset or invalid', async () => {
     for (const extra of [
       {},

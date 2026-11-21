@@ -147,7 +147,8 @@ export interface RunRedisWorkerOptions {
   maxStalledCount?: number;
   /**
    * How many tasks this worker runs concurrently PER SUBSCRIBED QUEUE (BullMQ Worker concurrency —
-   * the same limit is applied to every per-name `Worker` this runner starts). Defaults to 1. Raise
+   * the same limit is applied to every per-name `Worker` this runner starts, except the names
+   * {@link concurrencyByHandler} overrides). Defaults to 1. Raise
    * it so a fanned-out batch (e.g. the N remote steps of a `gather`) runs in parallel instead of
    * serially. Per process; total parallelism is `concurrency × distinct names × replicas`.
    *
@@ -157,6 +158,16 @@ export interface RunRedisWorkerOptions {
    * modes (fixed workers report inFlight/RSS/throughput/p95 too).
    */
   concurrency?: ConcurrencyOption;
+  /**
+   * Per-name concurrency overrides, keyed by the registered workflow or step NAME (as passed to
+   * `registerWorkflow`/`registerStep`, before queue-token sanitizing). The Worker for a named queue
+   * runs at this limit instead of {@link concurrency}; every other queue keeps {@link concurrency}.
+   * An overridden name gets its own {@link AdaptiveController}, so an adaptive override tunes that
+   * queue alone, and the default limit's controller (whose status rides the heartbeat) governs only
+   * the queues without an override. A name that is not registered on `runtime` is ignored with a
+   * warning.
+   */
+  concurrencyByHandler?: Record<string, ConcurrencyOption>;
   /**
    * The recurring starts this worker's app declares, announced on its descriptor so the control
    * plane adopts them as persisted schedules and fires them (see `ScheduleAnnouncement`). `tenant` is
@@ -361,20 +372,31 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
     void stepEvents.add('stepEvent', event, jobOpts).catch(() => {});
   };
 
-  // The concurrency controller: tracks inFlight + a rolling window of completions, snapshots a live
-  // status for the heartbeat, and (adaptive mode) re-tunes the live limit. `apply` writes the SAME
-  // settable `concurrency` on EVERY per-name Worker this runner starts; they're created below with
-  // the controller's initial limit. A holder lets `apply` reference the Workers before they're
-  // constructed (controller never calls back before `start()`), keeping `workers` a `const`.
-  const workersRef: { current: Array<InstanceType<RunnerDeps['Worker']>> } = { current: [] };
+  // The concurrency controllers. The default one tracks inFlight + a rolling window of completions,
+  // snapshots a live status for the heartbeat, and (adaptive mode) re-tunes the live limit, writing
+  // the settable `concurrency` of every per-name Worker WITHOUT an override. Each name in
+  // `concurrencyByHandler` gets its own controller governing that name's Worker alone. `apply`
+  // reaches Workers constructed after the controller: a controller never calls back before `start()`.
+  type RunnerWorker = InstanceType<RunnerDeps['Worker']>;
+  const overrides = options.concurrencyByHandler ?? {};
+  const registered = new Set(names);
+  const unknown = Object.keys(overrides).filter((name) => !registered.has(name));
+  if (unknown.length > 0) {
+    console.warn(
+      `[nestjs-durable] concurrencyByHandler names no registered workflow or step, ignored: ${unknown.join(', ')}`,
+    );
+  }
+  const defaultWorkers: RunnerWorker[] = [];
   const controller = new AdaptiveController({
     ...(options.concurrency !== undefined ? { concurrency: options.concurrency } : {}),
     apply: (limit) => {
-      for (const w of workersRef.current) w.concurrency = limit;
+      for (const w of defaultWorkers) w.concurrency = limit;
     },
   });
+  const ownControllers: AdaptiveController[] = [];
+  const allWorkers: RunnerWorker[] = [];
 
-  const processJob = async (job: { data: unknown }): Promise<void> => {
+  const processJob = async (pool: AdaptiveController, job: { data: unknown }): Promise<void> => {
     const task = job.data as Parameters<DurableWorkerRuntime['handleTask']>[0];
     // While replaying a WORKFLOW turn, beat run-scoped liveness so the engine's heartbeat-rearmed
     // `advance` deadline never re-drives a worker that's alive-but-slow. Only workflow tasks carry a
@@ -386,7 +408,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
         ? startRunHeartbeat(heartbeatClient, prefix, task.group, task.runId)
         : () => {};
     const startedAt = performance.now();
-    controller.onStart();
+    pool.onStart();
     let ok = false;
     try {
       // `handleTask` is async; awaiting it keeps the event loop free (step bodies await), so the job
@@ -401,28 +423,47 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
     } finally {
       // One pool, two task kinds. Only step completions feed the adaptive measurement window; a
       // workflow turn's duration would corrupt the latency gradient (it suspends, it doesn't block).
-      controller.onSettle(
-        performance.now() - startedAt,
-        ok,
-        isWorkflowTask(task) ? 'workflow' : 'step',
-      );
+      pool.onSettle(performance.now() - startedAt, ok, isWorkflowTask(task) ? 'workflow' : 'step');
       // Stop the run-scoped beat the moment the turn settles (success OR failure).
       stopBeat();
     }
   };
 
-  workersRef.current = queueTokens.map(
-    (token) =>
-      new deps.Worker(tasksName(prefix, token), processJob, {
-        connection: workerConnection(connection),
-        lockDuration,
-        ...(stalledInterval !== undefined ? { stalledInterval } : {}),
-        ...(maxStalledCount !== undefined ? { maxStalledCount } : {}),
+  names.forEach((name, i) => {
+    const override = Object.hasOwn(overrides, name) ? overrides[name] : undefined;
+    const workerOpts = {
+      connection: workerConnection(connection),
+      lockDuration,
+      ...(stalledInterval !== undefined ? { stalledInterval } : {}),
+      ...(maxStalledCount !== undefined ? { maxStalledCount } : {}),
+    };
+    const queue = tasksName(prefix, queueTokens[i] as string);
+    if (override === undefined) {
+      const worker = new deps.Worker(queue, (job) => processJob(controller, job), {
+        ...workerOpts,
         concurrency: controller.initialLimit,
-      }),
-  );
+      });
+      defaultWorkers.push(worker);
+      allWorkers.push(worker);
+      return;
+    }
+    const holder: { worker?: RunnerWorker } = {};
+    const own = new AdaptiveController({
+      concurrency: override,
+      apply: (limit) => {
+        if (holder.worker) holder.worker.concurrency = limit;
+      },
+    });
+    holder.worker = new deps.Worker(queue, (job) => processJob(own, job), {
+      ...workerOpts,
+      concurrency: own.initialLimit,
+    });
+    ownControllers.push(own);
+    allWorkers.push(holder.worker);
+  });
   // Start the AIMD loop for an adaptive worker; a fixed worker only takes its CPU baseline.
   controller.start();
+  for (const own of ownControllers) own.start();
 
   // --- best-effort pub/sub control channel + worker-liveness heartbeat (mirror the Python SDK) ---
   let controlSub: RedisSubClient | undefined;
@@ -513,6 +554,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
       closing = true;
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       controller.stop();
+      for (const own of ownControllers) own.stop();
       // Leave the registry now rather than at expiry, so readers stop routing to this worker. Bounded:
       // an unreachable Redis must not hold the shutdown (the entries expire on their own anyway).
       if (registry) {
@@ -526,7 +568,7 @@ export async function runRedisWorker(options: RunRedisWorkerOptions): Promise<Ru
         ]);
         if (timer) clearTimeout(timer);
       }
-      await Promise.all(workersRef.current.map((w) => w.close()));
+      await Promise.all(allWorkers.map((w) => w.close()));
       await Promise.all([decisions.close(), publisher.close(), stepEvents.close()]);
       controlSub?.disconnect();
       heartbeatClient?.disconnect();
