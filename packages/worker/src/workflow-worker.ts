@@ -99,7 +99,11 @@ export class WorkflowWorker {
       // partition — continuity with the pre-redesign "one group, one worker" default.
       workflowPartition: this.group,
       pendingSignals: task.pendingSignals,
-      onStep: opts.onStep,
+      // Each event names this turn, so the engine can drop the events of a turn it no longer awaits.
+      onStep:
+        opts.onStep === undefined
+          ? undefined
+          : (event) => opts.onStep?.({ ...event, taskId: base.taskId }),
       isCancelled: opts.isCancelled,
       features: task.features,
       compensationRetries: this.options.compensationRetries,
