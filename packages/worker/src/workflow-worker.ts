@@ -109,8 +109,10 @@ export class WorkflowWorker {
     } catch (err) {
       if (started) throw err;
       // The carrier could not be restored (an app deserializer rejected it, e.g. one changed by a
-      // rolling deploy). It is correlation only, so the turn runs without it rather than failing the
-      // run; the engine still applies the run's tenant to the decision.
+      // rolling deploy). The turn runs without it rather than failing the run: its local steps then see no
+      // tenant or userRef (they fail closed, nobody else's identity gets in), and the engine still applies the
+      // run's tenant to the decision. A dispatched step instead refuses to run (see step-worker.ts), because
+      // a step's handler can act on that identity outside the turn's replay.
       console.warn(
         `[nestjs-durable] run ${task.runId}: could not restore the turn's context carrier, running it without: ${err instanceof Error ? err.message : String(err)}`,
       );
