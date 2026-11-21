@@ -35,6 +35,9 @@ interface TaskQueueLayout {
  * steps to: the transport declares the per-handler layout (`<prefix>-tasks-<token>`, the queues the
  * runtime subscribes) and drains no other layout. A grouped transport (`<prefix>-taskgroup`), a
  * draining one, or one that states no layout keeps its own consumer, or its steps would have none.
+ * A draining per-handler transport therefore leaves its per-handler step queues with two consumers
+ * (its own and the in-app runtime's), since `handle()` cannot drain without consuming them, until the
+ * in-app runtime reads the grouped layout (#496).
  */
 function stepQueuesServedInApp(transport: unknown): boolean {
   const layout = (transport as Partial<TaskQueueLayout> | null)?.taskQueueLayout;
