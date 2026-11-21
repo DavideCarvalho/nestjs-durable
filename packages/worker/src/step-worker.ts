@@ -12,6 +12,7 @@ import {
 } from '@dudousxd/nestjs-durable-core';
 import { toError } from './errors';
 import type { StepLog } from './workflow-context';
+import type { ContextRehydrate } from './workflow-worker';
 
 /**
  * A registered step handler. Receives the task's `input` and a {@link StepLog} sink (so it can record
@@ -29,7 +30,11 @@ export class StepWorker {
   private readonly handlers = new Map<string, StepHandler>();
   private readonly interceptors: StepInterceptor[] = [];
 
-  constructor(readonly group = 'steps') {}
+  /** `options.rehydrate` restores each task's {@link RemoteTask.context} around its handler. */
+  constructor(
+    readonly group = 'steps',
+    private readonly options: { rehydrate?: ContextRehydrate } = {},
+  ) {}
 
   /**
    * Wrap every step handler this worker runs with `interceptor` (the engine's `engine.use`
@@ -86,21 +91,26 @@ export class StepWorker {
       // The execution wrappers sit outside that, so a Telescope batch / OTel span opened for this
       // step is ambient while the handler runs. A thin worker has no `WorkflowEngine` at all, which
       // is why the registry they come from is process-level rather than hung off the engine.
-      const output = await runDurableExecution(
-        {
-          unit: 'step',
-          runId: task.runId,
-          workflow: undefined, // not carried on the step wire format
-          name: task.name,
-          seq: task.seq,
-          attempt: task.attempt,
-        },
-        // A handler is not the workflow body: never let an in-process caller's ambient ctx leak in.
-        async () =>
-          runOutsideWorkflowCtx(() =>
-            runInStepLogger(log, () => this.intercepted(task, () => handler(task.input, log))),
-          ),
-      );
+      const execute = () =>
+        runDurableExecution(
+          {
+            unit: 'step',
+            runId: task.runId,
+            workflow: undefined, // not carried on the step wire format
+            name: task.name,
+            seq: task.seq,
+            attempt: task.attempt,
+            context: task.context,
+          },
+          // A handler is not the workflow body: never let an in-process caller's ambient ctx leak in.
+          async () =>
+            runOutsideWorkflowCtx(() =>
+              runInStepLogger(log, () => this.intercepted(task, () => handler(task.input, log))),
+            ),
+        );
+      // The carrier is restored outside the wrappers, as the engine restores it around a local step.
+      const rehydrate = this.options.rehydrate;
+      const output = await (rehydrate ? rehydrate(task.context, execute) : execute());
       const result: StepResult = { ...base, status: 'completed', output };
       if (events.length > 0) result.events = events;
       return result;

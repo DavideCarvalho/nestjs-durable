@@ -63,5 +63,5 @@ export type {
   WorkflowContextOptions,
 } from './workflow-context';
 export { WorkflowContext } from './workflow-context';
-export type { ProcessTaskOptions, WorkflowFn } from './workflow-worker';
+export type { ContextRehydrate, ProcessTaskOptions, WorkflowFn } from './workflow-worker';
 export { WorkflowWorker } from './workflow-worker';

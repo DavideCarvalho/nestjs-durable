@@ -31,17 +31,13 @@ function supportsHandle(transport: unknown): transport is LocalTaskHandling {
  * when that transport runs handlers in-process. With a queue/remote transport the handlers live in
  * the worker process instead, so there is nothing to wire here.
  *
- * **Context re-hydration (consume side) is the consumer's responsibility.** DurableModule's
- * produce side auto-feeds an opaque carrier (`{ traceId, tenantId, userRef }`) from
- * `@dudousxd/nestjs-context` onto each dispatched `RemoteTask.context` (see DurableModule). A worker
- * that wants its `@Step` reads to SEE the originating context must re-establish it from
- * `task.context`. We do NOT do this here because: (a) re-hydration needs nestjs-context's module-level
- * `Context.deserialize(carrier, fn)` at runtime, and it is an OPTIONAL peer we must not hard-import;
- * and (b) the in-process `StepHandler` contract is `(input, log)` — the engine never surfaces
- * `task.context` to the handler closure, so wrapping it here would require widening the core
- * transport/handler signature (a non-additive cross-cutting change). Instead, a worker that consumes
- * the carrier should wrap its handler with `Context.deserialize(task.context, () => handler(...))`
- * from its own transport/worker bootstrap, where `task` is in scope.
+ * **Context re-hydration (consume side).** DurableModule's produce side auto-feeds an opaque carrier
+ * (`{ traceId, tenantId, userRef }`) from `@dudousxd/nestjs-context` onto each dispatched
+ * `RemoteTask.context` and `WorkflowTask.context` (see DurableModule). A worker role restores it
+ * around each dispatched turn and step through the worker runtime's `rehydrate` bridge
+ * (`Context.deserialize`, see `context-runtime.ts`). A handler registered HERE, on an in-process
+ * transport, gets no carrier: the in-process `StepHandler` contract is `(input, log)` and the engine
+ * never surfaces `task.context` to it; only the tenant is restored there, by the tenancy bridge.
  */
 @Injectable()
 export class DurableStepRegistrar implements OnModuleInit {

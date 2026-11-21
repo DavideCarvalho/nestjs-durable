@@ -35,6 +35,12 @@ import {
 } from '@nestjs/common';
 import { DiscoveryModule, ModuleRef } from '@nestjs/core';
 import type { ContextAccessor } from './context-accessor';
+import {
+  contextSlotPresent,
+  rehydrateBridge,
+  resolveAccessor,
+  resolveContextRuntime,
+} from './context-runtime';
 import { DurableStartClient } from './durable-start-client';
 import { DurableStepRegistrar } from './durable-step.registrar';
 import { thinWorkerProviders, unavailableRunGateway } from './durable-worker.module';
@@ -64,23 +70,9 @@ import {
 } from './tenant-contracts';
 import { TenantEventRepublisher } from './tenant-event-republisher';
 import { TimerPoller } from './timer-poller';
-import { CONTEXT_ACCESSOR, TENANT_AUTH } from './tokens';
+import { TENANT_AUTH } from './tokens';
 import { WorkflowRegistrar } from './workflow.registrar';
 import { WorkflowService } from './workflow.service';
-
-/**
- * Locate the context accessor non-strictly: an accessor provided by ANY module (a global
- * `ContextModule` from `@dudousxd/nestjs-context`, or the app root) is found via {@link ModuleRef},
- * because DurableModule is `global` and its engine factory can't see another module's local
- * providers directly. Returns undefined when the optional peer isn't installed/bound.
- */
-function resolveAccessor(moduleRef: ModuleRef): ContextAccessor | undefined {
-  try {
-    return moduleRef.get<ContextAccessor>(CONTEXT_ACCESSOR, { strict: false });
-  } catch {
-    return undefined;
-  }
-}
 
 /**
  * Build an opaque context carrier from a {@link ContextAccessor} — the auto-feed default for the
@@ -100,51 +92,6 @@ function carrierFromAccessor(accessor: ContextAccessor): Record<string, unknown>
   const userRef = accessor.userRef();
   if (userRef !== undefined) carrier.userRef = userRef;
   return carrier;
-}
-
-/** True when nestjs-context publishes its accessor on the global slot (even with no DI binding). */
-function contextSlotPresent(): boolean {
-  const slot = (globalThis as unknown as Record<symbol, { current?: unknown } | undefined>)[
-    Symbol.for('@dudousxd/nestjs-diagnostics:accessor')
-  ];
-  return !!slot?.current;
-}
-
-/**
- * The slice of `@dudousxd/nestjs-context`'s module-level `Context` singleton we use to re-hydrate the
- * originating context around a local step body. Structural — we never import the package's types (it
- * is an OPTIONAL peer); the guarded dynamic import below captures whatever the installed package
- * exports as `Context`.
- */
-interface ContextRuntime {
-  /** Re-hydrate a context from an opaque carrier and run `fn` inside its ALS scope. */
-  deserialize<T>(carrier: Record<string, unknown>, fn: () => T): T;
-  /** Run `fn` with a tenant (nestjs-context ≥ 1.2). Absent on an older context: tenancy stays off. */
-  withTenant?: TenantRuntime['withTenant'];
-}
-
-function isContextRuntime(x: unknown): x is ContextRuntime {
-  return !!x && typeof (x as ContextRuntime).deserialize === 'function';
-}
-
-/**
- * Resolve `@dudousxd/nestjs-context`'s runtime `Context` singleton via a GUARDED dynamic import — used
- * to build the engine's `rehydrate` bridge. The runtime `Context` (its `deserialize`/ALS `run`) is a
- * module-level singleton, NOT a DI provider behind {@link CONTEXT_ACCESSOR}, so it can't be resolved
- * through ModuleRef — we import it directly. We do NOT add a hard/static import (the peer is optional):
- * a failure (peer not installed) returns undefined and the engine falls back to passthrough re-hydration.
- */
-async function resolveContextRuntime(): Promise<ContextRuntime | undefined> {
-  try {
-    // Indirect the specifier through a variable so the compiler does not try to STATICALLY resolve
-    // the optional peer (it may be uninstalled). This stays a runtime guarded import — a missing
-    // module rejects and is caught below.
-    const specifier = '@dudousxd/nestjs-context';
-    const mod = (await import(specifier)) as { Context?: unknown };
-    return isContextRuntime(mod.Context) ? mod.Context : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 /** True when `x` can act as a control plane (broadcast pub/sub) — e.g. a broadcast-capable transport. */
@@ -1104,14 +1051,10 @@ export class DurableModule {
             // ONCE here via a guarded dynamic import (optional peer — failure leaves the default
             // passthrough). Best-effort: an empty/undefined carrier just runs the handler normally.
             // The engine re-applies the run row's tenant INSIDE this bridge, so an app deserializer
-            // that drops the tenant cannot take it away from a local step.
+            // that drops the tenant cannot take it away from a local step. A worker runtime takes the
+            // same bridge (`resolveContextRehydrate`) around each dispatched turn and step.
             const runtime = runtimeNeeded ? await resolveContextRuntime() : undefined;
-            const rehydrate =
-              runtime &&
-              (<T>(carrier: Record<string, unknown> | undefined, fn: () => T): T =>
-                carrier && Object.keys(carrier).length > 0
-                  ? runtime.deserialize(carrier, fn)
-                  : fn());
+            const rehydrate = runtime && rehydrateBridge(runtime);
             // `consumers: false`: park every transport's point-to-point consumers BEFORE the engine
             // subscribes to them (its constructor registers the results/decisions consumers).
             if (options.consumers === false) {

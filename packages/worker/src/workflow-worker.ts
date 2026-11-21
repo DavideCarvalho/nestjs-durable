@@ -8,6 +8,14 @@ import {
 import { Cancelled, ContinuedAsNew, StepFailed, Suspend, toError } from './errors';
 import { WorkflowContext } from './workflow-context';
 
+/**
+ * Restores an opaque context carrier around `fn` (for `@dudousxd/nestjs-context`, its
+ * `Context.deserialize`) — the bridge the engine's own `rehydrate` option takes. The worker calls it
+ * with the carrier a dispatched task carries (`undefined` when it carries none) around the whole
+ * turn or step handler, outside the durable execution wrappers.
+ */
+export type ContextRehydrate = <T>(carrier: Record<string, unknown> | undefined, fn: () => T) => T;
+
 /** A registered workflow body. Receives the {@link WorkflowContext} and the run's input. */
 export type WorkflowFn = (ctx: WorkflowContext, input: unknown) => Promise<unknown> | unknown;
 
@@ -28,10 +36,11 @@ export class WorkflowWorker {
   /**
    * `options.compensationRetries` is how many times each `localStep` `compensate` is tried when a
    * failed turn unwinds its saga, as the engine's own `compensationRetries` (default 1).
+   * `options.rehydrate` restores each turn's {@link WorkflowTask.context} around the replay.
    */
   constructor(
     readonly group = 'workflows',
-    private readonly options: { compensationRetries?: number } = {},
+    private readonly options: { compensationRetries?: number; rehydrate?: ContextRehydrate } = {},
   ) {}
 
   /** Register `fn` as the workflow `name`. `fn(ctx, input)` (or `fn(ctx)`). */
@@ -74,17 +83,25 @@ export class WorkflowWorker {
     // One turn = one unit of durable work, so the registered execution wrappers bracket the whole
     // replay (body + the classification of what it threw), not just the body call: a Suspend or a
     // StepFailed is part of this turn's story and belongs inside the same observability scope.
-    return runDurableExecution(
-      {
-        unit: 'workflow',
-        runId: task.runId,
-        workflow: task.workflow,
-        name: undefined,
-        seq: undefined,
-        attempt: undefined,
-      },
-      () => this.replayTurn(base, fn, task, opts),
-    );
+    // The carrier is restored outside the wrappers, as the engine restores it around a local step,
+    // so a wrapper's own scope (a tenant, a span) is opened inside the originating context.
+    const turn = () =>
+      runDurableExecution(
+        {
+          unit: 'workflow',
+          runId: task.runId,
+          workflow: task.workflow,
+          name: undefined,
+          seq: undefined,
+          attempt: undefined,
+          context: task.context,
+        },
+        () => this.replayTurn(base, fn, task, opts),
+      );
+    const rehydrate = this.options.rehydrate;
+    const decision = await (rehydrate ? rehydrate(task.context, turn) : turn());
+    // Echo the carrier so the engine dispatches this turn's steps and children inside it.
+    return task.context !== undefined ? { ...decision, context: task.context } : decision;
   }
 
   /** The replay itself — see {@link processTask}, which wraps this in the execution hooks. */

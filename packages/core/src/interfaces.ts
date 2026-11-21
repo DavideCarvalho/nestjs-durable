@@ -1776,6 +1776,12 @@ export interface WorkflowTask {
   transport?: string;
   traceparent?: string;
   /**
+   * Opaque context carrier the engine's `context` reader produced when it dispatched this turn, the
+   * same one a dispatched step's {@link RemoteTask.context} carries. A worker given a `rehydrate`
+   * bridge restores it around the turn. Absent when no `context` reader is configured.
+   */
+  context?: Record<string, unknown> | undefined;
+  /**
    * Admission priority carried to the broker (BullMQ job `priority`) so an urgent child workflow can
    * jump ahead of already-enqueued lower-priority ones at the worker. Higher wins; absent means
    * default/unprioritised. Transports without priority support ignore it.
@@ -1960,6 +1966,13 @@ export interface WorkflowDecision {
   output?: unknown;
   /** Terminal error (status === 'failed'). */
   error?: StepError;
+  /**
+   * The context carrier of the turn this decision answers ({@link WorkflowTask.context}), echoed back
+   * by the worker. The engine applies the decision inside it (its `rehydrate` bridge), so the steps
+   * and children the turn dispatches carry the same carrier. Absent when the turn carried none or the
+   * worker does not echo it.
+   */
+  context?: Record<string, unknown> | undefined;
 }
 
 /**
@@ -2031,6 +2044,7 @@ export interface WorkflowExecutor {
     history: HistoryEvent[],
     taskId: string,
     pendingSignals?: WorkflowTask['pendingSignals'],
+    options?: WorkflowTaskDispatchOptions,
   ): Promise<void>;
   /**
    * Optional, for a {@link dispatch} executor: where the broker has the task dispatched for `run`
@@ -2039,6 +2053,12 @@ export interface WorkflowExecutor {
    * `'unknown'`.
    */
   taskState?(run: WorkflowRun, taskId: string): Promise<WorkflowTaskState>;
+}
+
+/** What the engine adds to a dispatched turn beyond the run and its history. */
+export interface WorkflowTaskDispatchOptions {
+  /** The engine's context carrier at dispatch time, stamped on {@link WorkflowTask.context}. */
+  context?: Record<string, unknown> | undefined;
 }
 
 /**

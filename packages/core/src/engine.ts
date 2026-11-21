@@ -8890,7 +8890,15 @@ export class WorkflowEngine {
       await this.store.releaseRunLock(run.id);
       // THEN enqueue. A failed/lost dispatch leaves the run suspended-awaiting with `wakeAt` set, so the
       // timer poller re-drives it — no lost run.
-      await remote.executor.dispatch(run, history, taskId);
+      // The turn carries the same context carrier a dispatched step does, so a worker can restore it.
+      const context = this.context?.();
+      await remote.executor.dispatch(
+        run,
+        history,
+        taskId,
+        undefined,
+        context !== undefined ? { context } : undefined,
+      );
       return { runId: run.id, status: 'suspended' };
     }
 
@@ -12164,7 +12172,9 @@ export class WorkflowEngine {
       });
       fresh.awaitingDecisionTaskId = undefined;
       if (fresh.recoveryAttempts) fresh.recoveryAttempts = 0;
-      await this.applyDecision(fresh, decision);
+      // Inside the turn's carrier, as a local step runs inside it: the steps and children this
+      // decision dispatches read the same carrier from the `context` reader.
+      await this.rehydrate(decision.context, () => this.applyDecision(fresh, decision));
     } finally {
       const fenced = held.lease.lost;
       held.stop();

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from './engine';
 import type {
@@ -8,7 +9,9 @@ import type {
   WorkflowDecision,
   WorkflowExecutor,
   WorkflowRun,
+  WorkflowTask,
 } from './interfaces';
+import { RemoteWorkflowExecutor } from './remote-workflow-executor';
 import { startRun } from './test-helpers';
 import { InMemoryStateStore } from './testing/in-memory-state-store';
 
@@ -167,5 +170,78 @@ describe('context carrier — opaque tenant/user/correlation propagation to work
 
     expect(dispatched).toHaveLength(1);
     expect(dispatched[0]?.context).toEqual({ tenantId: 't3', userRef: { type: 'User', id: 3 } });
+  });
+});
+
+describe('context carrier on a dispatched workflow turn', () => {
+  /** A transport that carries workflow tasks and step tasks and records both; decisions and step
+   *  results are delivered by the test through the captured handlers. */
+  function turnTransport() {
+    const turns: WorkflowTask[] = [];
+    const steps: RemoteTask[] = [];
+    const handlers: { decide?: (d: WorkflowDecision) => Promise<void> } = {};
+    const transport: Transport = {
+      async dispatch(task) {
+        steps.push(task);
+      },
+      onResult() {},
+      onHeartbeat() {},
+      async dispatchWorkflowTask(task) {
+        turns.push(task);
+      },
+      onDecision(handler) {
+        handlers.decide = handler;
+      },
+    };
+    return { transport, turns, steps, handlers };
+  }
+
+  /** Start `runId` and wait until its first turn is on the transport (the run then awaits it). */
+  async function startTurn(engine: WorkflowEngine, turns: WorkflowTask[], runId: string) {
+    await engine.start('ask', {}, runId);
+    for (let i = 0; i < 100 && turns.length === 0; i += 1) {
+      await new Promise((r) => setImmediate(r));
+    }
+  }
+
+  it('stamps the context reader on the dispatched turn, and omits it without a reader', async () => {
+    for (const context of [() => ({ traceId: 'trace-1' }), undefined]) {
+      const store = new InMemoryStateStore();
+      const { transport, turns } = turnTransport();
+      const engine = new WorkflowEngine({ store, transport, ...(context ? { context } : {}) });
+      const executor = new RemoteWorkflowExecutor(transport, 'ask');
+      engine.register('ask', '1', async () => 'x', { group: 'ask', executor });
+      await startTurn(engine, turns, 'r1');
+      expect(turns).toHaveLength(1);
+      expect(turns[0]?.context).toEqual(context ? { traceId: 'trace-1' } : undefined);
+      expect(turns[0] !== undefined && 'context' in turns[0]).toBe(context !== undefined);
+    }
+  });
+
+  it("applies a decision inside the carrier it echoes, so the turn's steps carry it", async () => {
+    const als = new AsyncLocalStorage<Record<string, unknown>>();
+    const store = new InMemoryStateStore();
+    const { transport, turns, steps, handlers } = turnTransport();
+    const engine = new WorkflowEngine({
+      store,
+      transport,
+      context: () => als.getStore() ?? { traceId: 'fresh' },
+      rehydrate: (carrier, fn) => (carrier ? als.run(carrier, fn) : fn()),
+    });
+    const executor = new RemoteWorkflowExecutor(transport, 'ask');
+    engine.register('ask', '1', async () => 'x', { group: 'ask', executor });
+    await startTurn(engine, turns, 'r1');
+    const run = await store.getRun('r1');
+    const taskId = run?.awaitingDecisionTaskId as string;
+
+    // Outside any context, as a decision consumer runs: the step reads the echoed carrier.
+    await handlers.decide?.({
+      taskId,
+      runId: 'r1',
+      status: 'continue',
+      commands: [{ kind: 'call', seq: 0, name: 'probe.run', input: {} }],
+      context: { traceId: 'started-with' },
+    });
+    expect(steps.map((t) => t.context)).toEqual([{ traceId: 'started-with' }]);
   });
 });

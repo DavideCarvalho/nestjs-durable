@@ -250,5 +250,6 @@ them before you deploy the upgrade:
 - **Prisma:** the fields are in the package's `prisma/schema.prisma`; copy them and run
   `prisma migrate dev`.
 
-Workers that execute **workflow turns** over the wire (remote workflows) don't receive the tenant:
-the turn runs on the worker without it. Step handlers do receive it through the task carrier.
+Workers that execute **workflow turns** over the wire (remote workflows) don't restore the run's
+tenant: a turn runs on the worker with only what `Context.deserialize` restores from the turn's
+context carrier. Step handlers do receive the tenant through the task carrier.
