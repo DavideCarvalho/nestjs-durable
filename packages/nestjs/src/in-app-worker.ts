@@ -131,6 +131,9 @@ export class InAppWorkerBootstrap
       ...(options.prefix !== undefined ? { prefix: options.prefix } : {}),
       ...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
       ...(options.concurrency !== undefined ? { concurrency: options.concurrency } : {}),
+      ...(options.concurrencyByHandler !== undefined
+        ? { concurrencyByHandler: options.concurrencyByHandler }
+        : {}),
       ...(options.lockDuration !== undefined ? { lockDuration: options.lockDuration } : {}),
       ...(options.stalledInterval !== undefined
         ? { stalledInterval: options.stalledInterval }

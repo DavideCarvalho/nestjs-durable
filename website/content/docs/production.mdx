@@ -473,12 +473,26 @@ DurableModule.forRoot({
 });
 ```
 
-<Callout type="warn">
-`concurrencyByHandler` (a `Record<string, ConcurrencyOption>`) is accepted as a per-handler override
-but is **not yet wired through `runRedisWorker`** — today every subscribed queue uses the single
-`concurrency` value. Set it to declare intent, but rely on `concurrency` for the effective limit until
-per-handler routing lands.
-</Callout>
+`concurrencyByHandler` (a `Record<string, ConcurrencyOption>`) gives one queue its own BullMQ
+concurrency; every other queue keeps `concurrency`. The key is the exact name string you gave
+`@Workflow({ name })` or `@Step(name)`, namespace and dots included: a workflow declared as
+`@Workflow({ name: 'agent.opencode.run' })` is keyed `'agent.opencode.run'`, not `'opencode.run'`
+and not its sanitized queue token. It works the same on a co-located worker (`store` + `connection`)
+and a thin worker (`connection` only). An overridden queue runs on its own controller (an adaptive
+override tunes that queue alone), and its heartbeat reports that controller's limit and in-flight
+count. A name this process does not register is ignored, with one warning per name per process.
+
+This is the knob for one interactive workflow among many background ones: with ~20 queues per
+process and a small database pool, keep `concurrency: 1` and raise only the workflow a person waits on.
+
+```ts
+DurableModule.forRoot({
+  store,
+  connection: process.env.REDIS_URL,
+  concurrency: 1,
+  concurrencyByHandler: { 'agent.opencode.run': 4 }, // the exact @Workflow({ name })
+});
+```
 
 ### Tuning for wide fans
 
