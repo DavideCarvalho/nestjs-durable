@@ -1396,6 +1396,92 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect((await store.getCheckpoint('r2', 0))?.input).toEqual({ prompt: 'p0' });
     });
 
+    t('settleCheckpointsIfPending of one row clears its wakeAt, failed or completed', async () => {
+      // One entry takes a store's single-row branch (a dispatched step's result, the common case),
+      // apart from the batch above.
+      if (!store.settleCheckpointsIfPending) return;
+      await store.createRun(run());
+      const leased = (seq: number) =>
+        checkpoint({
+          runId: 'r1',
+          seq,
+          name: 'ask',
+          kind: 'remote',
+          stepId: `r1:${seq}`,
+          status: 'pending',
+          attempts: 1,
+          wakeAt: 600_000,
+        });
+      await store.saveCheckpoint(leased(0));
+      await store.saveCheckpoint(leased(1));
+      const later = new Date(at.getTime() + 60_000);
+      expect(
+        await store.settleCheckpointsIfPending([
+          {
+            runId: 'r1',
+            seq: 0,
+            status: 'failed',
+            error: { message: 'boom' },
+            startedAt: at,
+            finishedAt: later,
+          },
+        ]),
+      ).toEqual([true]);
+      const failed = await store.getCheckpoint('r1', 0);
+      expect(failed?.status).toBe('failed');
+      expect(failed?.error).toEqual({ message: 'boom' });
+      expect(failed?.wakeAt).toBeUndefined();
+      expect(
+        await store.settleCheckpointsIfPending([
+          {
+            runId: 'r1',
+            seq: 1,
+            status: 'completed',
+            output: { ok: true },
+            startedAt: at,
+            finishedAt: later,
+          },
+        ]),
+      ).toEqual([true]);
+      const done = await store.getCheckpoint('r1', 1);
+      expect(done?.status).toBe('completed');
+      expect(done?.wakeAt).toBeUndefined();
+    });
+
+    t(
+      'settleResultsIfPending of one row clears its wakeAt, as read back and as stored',
+      async () => {
+        if (!store.settleResultsIfPending) return;
+        await store.createRun(run());
+        const leased = (seq: number) =>
+          checkpoint({
+            runId: 'r1',
+            seq,
+            name: 'ask',
+            kind: 'remote',
+            stepId: `r1:${seq}`,
+            status: 'pending',
+            attempts: 1,
+            wakeAt: 600_000,
+          });
+        await store.saveCheckpoint(leased(0));
+        await store.saveCheckpoint(leased(1));
+        const later = new Date(at.getTime() + 60_000);
+        const [failed] = await store.settleResultsIfPending([
+          { runId: 'r1', seq: 0, status: 'failed', error: { message: 'boom' }, finishedAt: later },
+        ]);
+        expect(failed?.status).toBe('failed');
+        expect(failed?.wakeAt).toBeUndefined();
+        expect((await store.getCheckpoint('r1', 0))?.wakeAt).toBeUndefined();
+        const [done] = await store.settleResultsIfPending([
+          { runId: 'r1', seq: 1, status: 'completed', output: { ok: true }, finishedAt: later },
+        ]);
+        expect(done?.status).toBe('completed');
+        expect(done?.wakeAt).toBeUndefined();
+        expect((await store.getCheckpoint('r1', 1))?.wakeAt).toBeUndefined();
+      },
+    );
+
     t(
       'settleResultsIfPending settles pending rows and reads them back without their input',
       async () => {
