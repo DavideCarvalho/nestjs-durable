@@ -1729,7 +1729,7 @@ function buildHotStatements(schema: string | undefined) {
       const p = (k: number) => `$${r * 8 + k}`;
       return `(${p(1)}::text, ${p(2)}::integer, ${p(3)}::text, ${p(4)}::jsonb, ${p(5)}::jsonb, ${p(6)}::jsonb, ${p(7)}::timestamptz, ${p(8)}::timestamptz)`;
     });
-    text = `UPDATE ${T_CPS} AS c SET status = v.status, output = CASE WHEN v.status = 'completed' THEN v.output ELSE c.output END, error = v.error, events = COALESCE(v.events, c.events), started_at = COALESCE(v.started_at, c.started_at), finished_at = v.finished_at FROM (VALUES ${rows.join(', ')}) AS v(run_id, seq, status, output, error, events, started_at, finished_at) WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending' AND NOT EXISTS (SELECT 1 FROM ${T_RUNS} AS r WHERE r.id = c.run_id AND r.status IN ('cancelled', 'completed')) RETURNING ${CPS_NO_INPUT.columns.map(([, c]) => `c.${quote(c.name)}`).join(', ')}`;
+    text = `UPDATE ${T_CPS} AS c SET status = v.status, output = CASE WHEN v.status = 'completed' THEN v.output ELSE c.output END, error = v.error, events = COALESCE(v.events, c.events), started_at = COALESCE(v.started_at, c.started_at), finished_at = v.finished_at, wake_at = NULL FROM (VALUES ${rows.join(', ')}) AS v(run_id, seq, status, output, error, events, started_at, finished_at) WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending' AND NOT EXISTS (SELECT 1 FROM ${T_RUNS} AS r WHERE r.id = c.run_id AND r.status IN ('cancelled', 'completed')) RETURNING ${CPS_NO_INPUT.columns.map(([, c]) => `c.${quote(c.name)}`).join(', ')}`;
     settleTexts.set(n, text);
     return text;
   };
@@ -1852,7 +1852,8 @@ function updateIfPendingFrom(t: StoreTables, checkpoints: StepCheckpoint[]): SQL
   RETURNING c.run_id, c.seq`;
 }
 
-/** {@link updateIfPendingFrom} for settlements: it sets only the columns a step's result writes. */
+/** {@link updateIfPendingFrom} for settlements: it sets only the columns a step's result writes,
+ *  and clears `wake_at` (a settled step has no dispatch lease left). */
 function settleIfPendingFrom(t: StoreTables, settlements: StepSettlement[]): SQL {
   const json = (v: unknown) => (v == null ? null : JSON.stringify(v));
   const values = settlements.map(
@@ -1861,7 +1862,7 @@ function settleIfPendingFrom(t: StoreTables, settlements: StepSettlement[]): SQL
   );
   return sql`UPDATE ${t.stepCheckpoints} AS c SET
     status = v.status, output = v.output, error = v.error, events = v.events,
-    started_at = v.started_at, finished_at = v.finished_at
+    started_at = v.started_at, finished_at = v.finished_at, wake_at = NULL
   FROM (VALUES ${sql.join(values, sql`, `)}) AS v(run_id, seq, status, output, error, events,
     started_at, finished_at)
   WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending'
@@ -1916,7 +1917,8 @@ function settleResultsFrom(t: StoreTables, results: StepResultSettlement[]): SQL
     error = v.error,
     events = COALESCE(v.events, c.events),
     started_at = COALESCE(v.started_at, c.started_at),
-    finished_at = v.finished_at
+    finished_at = v.finished_at,
+    wake_at = NULL
   FROM (VALUES ${sql.join(values, sql`, `)}) AS v(run_id, seq, status, output, error, events,
     started_at, finished_at)
   WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending'

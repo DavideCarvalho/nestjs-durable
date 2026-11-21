@@ -547,6 +547,8 @@ export class TypeOrmStateStore implements StateStore {
           events: s.events ?? null,
           startedAt: s.startedAt,
           finishedAt: s.finishedAt,
+          // A settled step has no dispatch lease left.
+          wakeAt: () => 'NULL',
         } as QueryDeepPartialEntity<StepCheckpointEntity>)
         .where({ runId: s.runId, seq: s.seq, status: 'pending' })
         .execute();
@@ -585,6 +587,7 @@ export class TypeOrmStateStore implements StateStore {
           events: s.events ?? null,
           startedAt: s.startedAt,
           finishedAt: s.finishedAt,
+          wakeAt: null,
         } as QueryDeepPartialEntity<StepCheckpointEntity>);
       }
       const column = (property: string) =>
@@ -1497,7 +1500,9 @@ function toCheckpointEntity(cp: StepCheckpoint): StepCheckpointEntity {
     attempts: cp.attempts,
     workerGroup: cp.workerGroup ?? null,
     parallelGroup: cp.parallelGroup ?? null,
-    ...(cp.wakeAt == null ? {} : { wakeAt: new Date(cp.wakeAt) }),
+    // Always present, null when unset: an upsert leaves a column it is not given as stored, so a
+    // checkpoint saved without its `wakeAt` (a lease cleared, a timeout settled) must write NULL.
+    wakeAt: cp.wakeAt == null ? null : new Date(cp.wakeAt),
     enqueuedAt: cp.enqueuedAt,
     startedAt: cp.startedAt,
     finishedAt: cp.finishedAt,
@@ -1621,8 +1626,9 @@ function runUpdateSet(patch: Partial<WorkflowRun>): Record<string, unknown> {
 }
 
 /** `checkpoints`' distinct seqs, by run. */
-/** The checkpoint columns a step's result writes (see `settleCheckpointsIfPending`). */
-const SETTLED_FIELDS = ['status', 'output', 'error', 'events', 'startedAt', 'finishedAt'];
+/** The checkpoint columns a step's result writes (see `settleCheckpointsIfPending`); `wakeAt` is
+ *  cleared, since a settled step has no dispatch lease left. */
+const SETTLED_FIELDS = ['status', 'output', 'error', 'events', 'startedAt', 'finishedAt', 'wakeAt'];
 
 function seqsByRun(checkpoints: { runId: string; seq: number }[]): Map<string, number[]> {
   const byRun = new Map<string, Set<number>>();
@@ -1902,7 +1908,7 @@ class TypeOrmRoundTrips {
         .join(', ');
       const settled = this.rows(
         await this.ds.query(
-          `UPDATE ${this.table(k)} AS c SET ${c('status')} = v.status, ${c('output')} = CASE WHEN v.status = 'completed' THEN v.output ELSE c.${c('output')} END, ${c('error')} = v.error, ${c('events')} = COALESCE(v.events, c.${c('events')}), ${c('startedAt')} = COALESCE(v.started_at, c.${c('startedAt')}), ${c('finishedAt')} = v.finished_at FROM (VALUES ${rows.join(', ')}) AS v(run_id, seq, status, output, error, events, started_at, finished_at) WHERE c.${c('runId')} = v.run_id AND c.${c('seq')} = v.seq AND c.${c('status')} = 'pending' AND NOT EXISTS (SELECT 1 FROM ${this.table(r)} AS r WHERE r.${this.c(r, 'id')} = c.${c('runId')} AND r.${this.c(r, 'status')} IN ('cancelled', 'completed')) RETURNING ${returning}`,
+          `UPDATE ${this.table(k)} AS c SET ${c('status')} = v.status, ${c('output')} = CASE WHEN v.status = 'completed' THEN v.output ELSE c.${c('output')} END, ${c('error')} = v.error, ${c('events')} = COALESCE(v.events, c.${c('events')}), ${c('startedAt')} = COALESCE(v.started_at, c.${c('startedAt')}), ${c('finishedAt')} = v.finished_at, ${c('wakeAt')} = NULL FROM (VALUES ${rows.join(', ')}) AS v(run_id, seq, status, output, error, events, started_at, finished_at) WHERE c.${c('runId')} = v.run_id AND c.${c('seq')} = v.seq AND c.${c('status')} = 'pending' AND NOT EXISTS (SELECT 1 FROM ${this.table(r)} AS r WHERE r.${this.c(r, 'id')} = c.${c('runId')} AND r.${this.c(r, 'status')} IN ('cancelled', 'completed')) RETURNING ${returning}`,
           values,
         ),
       );
@@ -1927,7 +1933,7 @@ class TypeOrmRoundTrips {
     const c = (prop: string) => `c.${this.c(k, prop)}`;
     const done = s.status === 'completed';
     const result = (await this.ds.query(
-      `UPDATE ${this.table(k)} AS c SET ${c('status')} = ?, ${c('output')} = ${done ? '?' : c('output')}, ${c('error')} = ?, ${c('events')} = COALESCE(?, ${c('events')}), ${c('startedAt')} = COALESCE(?, ${c('startedAt')}), ${c('finishedAt')} = ? WHERE ${c('runId')} = ? AND ${c('seq')} = ? AND ${c('status')} = 'pending' AND NOT EXISTS (SELECT 1 FROM ${this.table(r)} AS r WHERE r.${this.c(r, 'id')} = ${c('runId')} AND r.${this.c(r, 'status')} IN ('cancelled', 'completed'))`,
+      `UPDATE ${this.table(k)} AS c SET ${c('status')} = ?, ${c('output')} = ${done ? '?' : c('output')}, ${c('error')} = ?, ${c('events')} = COALESCE(?, ${c('events')}), ${c('startedAt')} = COALESCE(?, ${c('startedAt')}), ${c('finishedAt')} = ?, ${c('wakeAt')} = NULL WHERE ${c('runId')} = ? AND ${c('seq')} = ? AND ${c('status')} = 'pending' AND NOT EXISTS (SELECT 1 FROM ${this.table(r)} AS r WHERE r.${this.c(r, 'id')} = ${c('runId')} AND r.${this.c(r, 'status')} IN ('cancelled', 'completed'))`,
       [
         s.status,
         ...(done ? [this.bind(k, 'output', s.output)] : []),

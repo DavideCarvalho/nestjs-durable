@@ -104,7 +104,7 @@ export class StepCheckpointEntity {
   attempts!: number;
   workerGroup?: string | null;
   parallelGroup?: string | null;
-  wakeAt?: Date;
+  wakeAt?: Date | null;
   enqueuedAt?: Date;
   startedAt!: Date;
   finishedAt!: Date;

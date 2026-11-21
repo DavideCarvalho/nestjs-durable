@@ -11655,8 +11655,9 @@ export class WorkflowEngine {
   ): Promise<(boolean | { error: unknown })[]> {
     const settle = this.store.settleCheckpointsIfPending?.bind(this.store);
     if (!settle) {
+      // A settled step has no dispatch lease left (see StateStore.settleCheckpointsIfPending).
       return this.savePendingCheckpoints(
-        settlements.map((s, i) => ({ ...(settled[i] as StepCheckpoint), ...s })),
+        settlements.map((s, i) => ({ ...(settled[i] as StepCheckpoint), ...s, wakeAt: undefined })),
       );
     }
     if (settlements.length > 1) {

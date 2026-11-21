@@ -1268,6 +1268,39 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect((await store.getCheckpoint('r1', n - 1))?.output).toEqual({ seq: n - 1 });
     });
 
+    t(
+      'saveCheckpoint and saveCheckpoints clear a wakeAt the checkpoint no longer carries',
+      async () => {
+        await store.createRun(run());
+        const leased = (seq: number) =>
+          checkpoint({
+            runId: 'r1',
+            seq,
+            name: 'ask',
+            kind: 'remote',
+            stepId: `r1:${seq}`,
+            status: 'failed',
+            error: { message: 'boom' },
+            wakeAt: 600_000,
+          });
+        // One row at a time.
+        await store.saveCheckpoint(leased(0));
+        expect((await store.getCheckpoint('r1', 0))?.wakeAt).toBe(600_000);
+        await store.saveCheckpoint({ ...leased(0), wakeAt: undefined });
+        expect((await store.getCheckpoint('r1', 0))?.wakeAt).toBeUndefined();
+        // A batch (optional on the interface; exercised when present).
+        if (!store.saveCheckpoints) return;
+        await store.saveCheckpoints([leased(1), leased(2)]);
+        expect((await store.getCheckpoint('r1', 1))?.wakeAt).toBe(600_000);
+        await store.saveCheckpoints([
+          { ...leased(1), wakeAt: undefined },
+          { ...leased(2), wakeAt: 700_000 },
+        ]);
+        expect((await store.getCheckpoint('r1', 1))?.wakeAt).toBeUndefined();
+        expect((await store.getCheckpoint('r1', 2))?.wakeAt).toBe(700_000);
+      },
+    );
+
     t('settleCheckpointsIfPending writes only what a result changes, row by row', async () => {
       // Optional on the interface (the engine falls back to saveCheckpointsIfPending with the whole
       // rows), but a conformant store MUST provide it — assert presence, then exercise it.
@@ -1346,7 +1379,11 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(first?.attempts).toBe(2);
       expect(first?.workerGroup).toBe('llm');
       expect(first?.parallelGroup).toBe('all:0:2');
-      expect(first?.wakeAt).toBe(5_000);
+      // A settled step has no dispatch lease left: its `wakeAt` is cleared, whatever the outcome,
+      // so a failed step's `wakeAt` can only be its retry's backoff. A row left pending keeps it.
+      expect(first?.wakeAt).toBeUndefined();
+      expect(r1[2]?.wakeAt).toBeUndefined();
+      expect(r1[3]?.wakeAt).toBe(5_000);
       expect(first?.enqueuedAt.getTime()).toBe(at.getTime());
       expect(first?.startedAt.getTime()).toBe(at.getTime() + 1_000);
       expect(first?.finishedAt.getTime()).toBe(later.getTime());
@@ -1358,6 +1395,92 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect((await store.getCheckpoint('r2', 0))?.output).toEqual({ n: 'r2' });
       expect((await store.getCheckpoint('r2', 0))?.input).toEqual({ prompt: 'p0' });
     });
+
+    t('settleCheckpointsIfPending of one row clears its wakeAt, failed or completed', async () => {
+      // One entry takes a store's single-row branch (a dispatched step's result, the common case),
+      // apart from the batch above.
+      if (!store.settleCheckpointsIfPending) return;
+      await store.createRun(run());
+      const leased = (seq: number) =>
+        checkpoint({
+          runId: 'r1',
+          seq,
+          name: 'ask',
+          kind: 'remote',
+          stepId: `r1:${seq}`,
+          status: 'pending',
+          attempts: 1,
+          wakeAt: 600_000,
+        });
+      await store.saveCheckpoint(leased(0));
+      await store.saveCheckpoint(leased(1));
+      const later = new Date(at.getTime() + 60_000);
+      expect(
+        await store.settleCheckpointsIfPending([
+          {
+            runId: 'r1',
+            seq: 0,
+            status: 'failed',
+            error: { message: 'boom' },
+            startedAt: at,
+            finishedAt: later,
+          },
+        ]),
+      ).toEqual([true]);
+      const failed = await store.getCheckpoint('r1', 0);
+      expect(failed?.status).toBe('failed');
+      expect(failed?.error).toEqual({ message: 'boom' });
+      expect(failed?.wakeAt).toBeUndefined();
+      expect(
+        await store.settleCheckpointsIfPending([
+          {
+            runId: 'r1',
+            seq: 1,
+            status: 'completed',
+            output: { ok: true },
+            startedAt: at,
+            finishedAt: later,
+          },
+        ]),
+      ).toEqual([true]);
+      const done = await store.getCheckpoint('r1', 1);
+      expect(done?.status).toBe('completed');
+      expect(done?.wakeAt).toBeUndefined();
+    });
+
+    t(
+      'settleResultsIfPending of one row clears its wakeAt, as read back and as stored',
+      async () => {
+        if (!store.settleResultsIfPending) return;
+        await store.createRun(run());
+        const leased = (seq: number) =>
+          checkpoint({
+            runId: 'r1',
+            seq,
+            name: 'ask',
+            kind: 'remote',
+            stepId: `r1:${seq}`,
+            status: 'pending',
+            attempts: 1,
+            wakeAt: 600_000,
+          });
+        await store.saveCheckpoint(leased(0));
+        await store.saveCheckpoint(leased(1));
+        const later = new Date(at.getTime() + 60_000);
+        const [failed] = await store.settleResultsIfPending([
+          { runId: 'r1', seq: 0, status: 'failed', error: { message: 'boom' }, finishedAt: later },
+        ]);
+        expect(failed?.status).toBe('failed');
+        expect(failed?.wakeAt).toBeUndefined();
+        expect((await store.getCheckpoint('r1', 0))?.wakeAt).toBeUndefined();
+        const [done] = await store.settleResultsIfPending([
+          { runId: 'r1', seq: 1, status: 'completed', output: { ok: true }, finishedAt: later },
+        ]);
+        expect(done?.status).toBe('completed');
+        expect(done?.wakeAt).toBeUndefined();
+        expect((await store.getCheckpoint('r1', 1))?.wakeAt).toBeUndefined();
+      },
+    );
 
     t(
       'settleResultsIfPending settles pending rows and reads them back without their input',
@@ -1438,6 +1561,12 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect(failed?.output).toEqual({ partial: 2 });
         expect(failed?.error).toEqual({ message: 'boom' });
         expect(failed?.startedAt.getTime()).toBe(at.getTime());
+        // The dispatch lease is cleared on the settled rows, as read back and as stored.
+        expect(first?.wakeAt).toBeUndefined();
+        expect(failed?.wakeAt).toBeUndefined();
+        expect((await store.getCheckpoint('r1', 0))?.wakeAt).toBeUndefined();
+        expect((await store.getCheckpoint('r1', 2))?.wakeAt).toBeUndefined();
+        expect((await store.getCheckpoint('r1', 3))?.wakeAt).toBe(5_000);
 
         // JSON values that are arrays bind as one JSON document, not as a SQL value list.
         await store.saveCheckpoint(pending('r1', 4));
