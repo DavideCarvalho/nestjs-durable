@@ -7823,6 +7823,19 @@ export class WorkflowEngine {
   }
 
   /**
+   * Whether a streamed step event comes from the turn its run awaits. A dispatched turn that went
+   * quiet past the silence window is dispatched again, but its first worker may still be replaying it
+   * and streaming its steps; written unchecked, those would put a stale turn's output under the live
+   * turn's checkpoint. An event without a `taskId` (a worker from before the field) is kept.
+   */
+  private async stepEventFromAwaitedTurn(event: WorkflowStepEvent): Promise<boolean> {
+    if (event.taskId === undefined) return true;
+    const run = await this.store.getRun(event.runId);
+    if (!run) return false;
+    return awaitsDecision(run, { taskId: event.taskId });
+  }
+
+  /**
    * Persist a streamed local-step lifecycle event from a remote workflow worker (see
    * {@link WorkflowStepEvent}). A Python `@workflow` runs its `ctx.step`s inline over one turn that
    * can last minutes; the worker streams each step's start/finish so the engine checkpoints it LIVE —
@@ -7832,6 +7845,7 @@ export class WorkflowEngine {
    * idempotently, so this is purely additive observability and never changes the run's outcome.
    */
   private async persistStepEvent(event: WorkflowStepEvent): Promise<void> {
+    if (!(await this.stepEventFromAwaitedTurn(event))) return;
     const startedAt = new Date(event.startedAt);
     if (event.phase === 'running') {
       await this.store.saveCheckpoint(

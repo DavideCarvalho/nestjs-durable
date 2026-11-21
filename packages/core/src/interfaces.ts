@@ -1970,6 +1970,13 @@ export interface WorkflowDecision {
  */
 export interface WorkflowStepEvent {
   runId: string;
+  /**
+   * The dispatched turn ({@link WorkflowTask.taskId}) whose replay ran the step. The engine keeps an
+   * event only while the run still awaits that turn, so a turn that went quiet, was dispatched again
+   * and kept running on its first worker cannot write over the live turn's checkpoints. Absent (a
+   * worker from before this field): the event is kept, unchecked.
+   */
+  taskId?: string | undefined;
   seq: number;
   name: string;
   phase: 'running' | 'completed' | 'failed';
