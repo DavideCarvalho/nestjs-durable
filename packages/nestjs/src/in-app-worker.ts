@@ -17,6 +17,7 @@ import { resolveContextRehydrate } from './context-runtime';
 import { scanSteps, scanWorkflows } from './discovery-helpers';
 import type { RunRedisWorkerFn } from './durable-worker.module';
 import type { DurableModuleOptions } from './durable.module';
+import { isCoLocatedWorker } from './role';
 import { registerOnRuntime } from './runtime-registration';
 import { createWorkerRuntime, runRedisWorker as defaultRunRedisWorker } from './worker-sdk';
 
@@ -51,11 +52,6 @@ export const IN_APP_WORKER_RUNNERS = Symbol('nestjs-durable:in-app-worker-runner
 export interface InAppWorkerBinding {
   transport: Transport;
   partition?: string;
-}
-
-/** True for the **co-located** role — both `store` AND `connection` set. */
-function isCoLocatedWorker(options: DurableModuleOptions): boolean {
-  return options.store !== undefined && options.connection !== undefined;
 }
 
 /**

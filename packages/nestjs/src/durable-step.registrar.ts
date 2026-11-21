@@ -8,7 +8,7 @@ import { Inject, Injectable, type OnModuleInit } from '@nestjs/common';
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { scanSteps } from './discovery-helpers';
 import type { DurableModuleOptions } from './durable.module';
-import { isDrivingOperator } from './role';
+import { isCoLocatedWorker, isDrivingOperator } from './role';
 
 /** A transport that can run step handlers in-process (e.g. the event-emitter transport). */
 interface LocalTaskHandling {
@@ -28,8 +28,10 @@ function supportsHandle(transport: unknown): transport is LocalTaskHandling {
 /**
  * Discovers `@Step` methods and registers them — under their RESOLVED name (derived `Class.method`
  * for a bare `@Step()`, or the explicit override) — as step handlers on the configured transport,
- * when that transport runs handlers in-process. With a queue/remote transport the handlers live in
- * the worker process instead, so there is nothing to wire here.
+ * when that transport runs handlers in-process, on a driving operator with no step consumer of its
+ * own. With a queue/remote transport the handlers live in the worker process instead, and a
+ * co-located worker (`store` + `connection`) serves them through its in-app worker runtime, so there
+ * is nothing to wire here in either case: each step queue has exactly one consumer.
  *
  * **Context re-hydration (consume side).** DurableModule's produce side auto-feeds an opaque carrier
  * (`Context.serialize()`, filtered by the app's `carrier: [...]` allowlist) from
@@ -54,6 +56,11 @@ export class DurableStepRegistrar implements OnModuleInit {
     // queue — receiving and running step tasks locally is exactly the driving-operator role we're
     // switching off here (a thin worker registers its steps via `ThinStepRegistrar` instead).
     if (!isDrivingOperator(this.options)) return;
+    // A co-located worker (`store` + `connection`) consumes every `@Step` queue through its in-app
+    // worker runtime, which restores the task's context carrier and applies the step consumer's
+    // concurrency and lock settings. Registering here too would start a second consumer on the
+    // same queue, racing it for each job.
+    if (isCoLocatedWorker(this.options)) return;
     if (!supportsHandle(this.transport)) return;
     const transport = this.transport;
 
