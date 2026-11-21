@@ -39,6 +39,8 @@ class LoopbackTransport implements Transport {
   readonly handlers = new Map<string, Handler>();
   /** Dispatches whose result is lost (the worker died with the job): counted down per dispatch. */
   dropResults = 0;
+  /** Holds the next dispatch's result until it resolves (a step still running on its worker). */
+  holdNext: Promise<void> | undefined;
   turns = 0;
   dispatchRuns?: (runs: readonly RunDispatch[], opts?: RunQueueOptions) => Promise<void>;
   onDispatchedRun?: (
@@ -63,6 +65,15 @@ class LoopbackTransport implements Transport {
   async dispatch(task: RemoteTask): Promise<void> {
     if (this.dropResults > 0) {
       this.dropResults -= 1;
+      return;
+    }
+    const held = this.holdNext;
+    if (held) {
+      this.holdNext = undefined;
+      void held.then(async () => {
+        const result = await runStepHandler(task, this.handlers.get(task.name));
+        await this.resultHandler?.(result);
+      });
       return;
     }
     const result = await runStepHandler(task, this.handlers.get(task.name));
@@ -259,5 +270,50 @@ describe.each([
     expect(attempts).toBe(1);
     expect((await a.store.getCheckpoint('r4', 0))?.attempts).toBe(2);
     expect(now).toBeGreaterThanOrEqual(startedAt + REDISPATCH_MS);
+  });
+
+  it('waits its backoff even when a replay stamped the lease while the attempt was in flight', async () => {
+    let now = 5_000_000;
+    const a = app(dispatched, runQueue, () => now);
+    let release!: () => void;
+    a.transport.holdNext = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let attempts = 0;
+    a.transport.handlers.set('ext.slow', async () => {
+      attempts += 1;
+      if (attempts < 2) throw new Error(`wedged ${attempts}`);
+      return 'ok';
+    });
+    a.serve('wf', async (ctx) =>
+      ctx.step<string>('ext.slow', {}, { retries: 3, backoff: 'exp', backoffMs: 1_000 }),
+    );
+    const startedAt = now;
+    await a.engine.start('wf', {}, 'r5');
+    await ticks();
+    // A replay while the step is still running: the run's turn sees it pending and its lease is
+    // stamped (inline: by the replay itself; dispatched: at dispatch).
+    now += 1_000;
+    await a.engine.resume('r5');
+    await ticks();
+    const pending = await a.store.getCheckpoint('r5', 0);
+    expect(pending?.status).toBe('pending');
+    expect(pending?.wakeAt).toBeGreaterThanOrEqual(startedAt + REDISPATCH_MS);
+    // The attempt fails now: its retry waits the backoff, not the lease the replay stamped.
+    release();
+    await ticks();
+    const failed = await a.store.getCheckpoint('r5', 0);
+    expect(failed?.status).toBe('failed');
+    if (failed?.wakeAt != null) expect(failed.wakeAt).toBeLessThan(startedAt + 10_000);
+    const done = await drive(
+      a,
+      'r5',
+      () => {
+        now += 5_000;
+      },
+      30,
+    );
+    expect(done.status).toBe('completed');
+    expect(attempts).toBe(2);
   });
 });

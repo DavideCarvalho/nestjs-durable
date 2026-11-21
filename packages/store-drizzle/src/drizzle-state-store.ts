@@ -552,6 +552,8 @@ export class DrizzleStateStore implements StateStore {
             events: s.events ?? null,
             startedAt: s.startedAt.getTime(),
             finishedAt: s.finishedAt.getTime(),
+            // A settled step has no dispatch lease left.
+            wakeAt: null,
           });
         }
         const writes: Array<() => unknown> = [];
@@ -1662,8 +1664,9 @@ function fromScheduleRow(row: ScheduleRow): ScheduleRecord {
  * value the conflicting row proposed.
  */
 /** Run `steps` one after another, synchronously while each returns synchronously. */
-/** The checkpoint columns a step's result writes (see `settleCheckpointsIfPending`). */
-const SETTLED_FIELDS = ['status', 'output', 'error', 'events', 'startedAt', 'finishedAt'];
+/** The checkpoint columns a step's result writes (see `settleCheckpointsIfPending`); `wakeAt` is
+ *  cleared, since a settled step has no dispatch lease left. */
+const SETTLED_FIELDS = ['status', 'output', 'error', 'events', 'startedAt', 'finishedAt', 'wakeAt'];
 
 function inSequence(steps: Array<() => unknown>, from = 0): undefined | Promise<undefined> {
   for (let i = from; i < steps.length; i += 1) {

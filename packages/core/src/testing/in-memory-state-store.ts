@@ -277,7 +277,7 @@ export class InMemoryStateStore implements StateStore {
       const key = this.key(settlement.runId, settlement.seq);
       const cp = this.checkpoints.get(key);
       if (cp?.status !== 'pending') return false;
-      this.checkpoints.set(key, { ...cp, ...settlement });
+      this.checkpoints.set(key, { ...cp, ...settlement, wakeAt: undefined });
       return true;
     });
   }
@@ -365,7 +365,7 @@ export class InMemoryStateStore implements StateStore {
     settlements.forEach((settlement, k) => {
       if (!wrote[k]) return;
       const cp = before.get(this.key(settlement.runId, settlement.seq)) as StepCheckpoint;
-      out[at[k] as number] = { ...cp, ...settlement };
+      out[at[k] as number] = { ...cp, ...settlement, wakeAt: undefined };
     });
     return out;
   }

@@ -571,6 +571,8 @@ export class MikroOrmStateStore implements StateStore {
           events: s.events ?? null,
           startedAt: s.startedAt,
           finishedAt: s.finishedAt,
+          // A settled step has no dispatch lease left.
+          wakeAt: null,
         } as never,
       );
       return [changed === 1];
@@ -609,6 +611,7 @@ export class MikroOrmStateStore implements StateStore {
           events: s.events ?? null,
           startedAt: s.startedAt,
           finishedAt: s.finishedAt,
+          wakeAt: null,
         });
       }
       for (let at = 0; at < rows.length; at += 500) {
@@ -1736,8 +1739,17 @@ async function selectCheckpointRows(
   return rows as unknown as StepCheckpointEntity[];
 }
 
-/** The checkpoint columns a step's result writes (see `settleCheckpointsIfPending`). */
-const SETTLED_FIELDS = ['status', 'output', 'error', 'events', 'startedAt', 'finishedAt'] as const;
+/** The checkpoint columns a step's result writes (see `settleCheckpointsIfPending`); `wakeAt` is
+ *  cleared, since a settled step has no dispatch lease left. */
+const SETTLED_FIELDS = [
+  'status',
+  'output',
+  'error',
+  'events',
+  'startedAt',
+  'finishedAt',
+  'wakeAt',
+] as const;
 
 const checkpointKey = (runId: string, seq: number) => `${runId}\u0000${seq}`;
 
@@ -1816,7 +1828,9 @@ function toCheckpointEntity(cp: StepCheckpoint): StepCheckpointEntity {
   e.attempts = cp.attempts;
   if (cp.workerGroup !== undefined) e.workerGroup = cp.workerGroup;
   if (cp.parallelGroup !== undefined) e.parallelGroup = cp.parallelGroup;
-  if (cp.wakeAt != null) e.wakeAt = new Date(cp.wakeAt);
+  // Always set, null when unset: an upsert leaves a property it is not given as stored, so a
+  // checkpoint saved without its `wakeAt` (a lease cleared, a timeout settled) must write NULL.
+  e.wakeAt = cp.wakeAt != null ? new Date(cp.wakeAt) : null;
   e.enqueuedAt = cp.enqueuedAt;
   e.startedAt = cp.startedAt;
   e.finishedAt = cp.finishedAt;
@@ -2091,7 +2105,7 @@ class MikroOrmRoundTrips {
         const wrote = this.affected(
           await this.run(
             em,
-            `UPDATE ${this.table(em, K)} c SET c.${c('status')} = ?, c.${c('output')} = ${done ? '?' : `c.${c('output')}`}, c.${c('error')} = ?, c.${c('events')} = COALESCE(?, c.${c('events')}), c.${c('startedAt')} = COALESCE(?, c.${c('startedAt')}), c.${c('finishedAt')} = ? WHERE c.${c('runId')} = ? AND c.${c('seq')} = ? AND c.${c('status')} = 'pending' AND ${finished}`,
+            `UPDATE ${this.table(em, K)} c SET c.${c('status')} = ?, c.${c('output')} = ${done ? '?' : `c.${c('output')}`}, c.${c('error')} = ?, c.${c('events')} = COALESCE(?, c.${c('events')}), c.${c('startedAt')} = COALESCE(?, c.${c('startedAt')}), c.${c('finishedAt')} = ?, c.${c('wakeAt')} = NULL WHERE c.${c('runId')} = ? AND c.${c('seq')} = ? AND c.${c('status')} = 'pending' AND ${finished}`,
             [
               s.status,
               ...(done ? [this.bind(em, K, 'output', s.output)] : []),
@@ -2150,7 +2164,7 @@ class MikroOrmRoundTrips {
       const settled = this.rows(
         await this.run(
           em,
-          `UPDATE ${this.table(em, K)} AS c SET ${c('status')} = v.status, ${c('output')} = CASE WHEN v.status = 'completed' THEN v.output ELSE c.${c('output')} END, ${c('error')} = v.error, ${c('events')} = COALESCE(v.events, c.${c('events')}), ${c('startedAt')} = COALESCE(v.started_at, c.${c('startedAt')}), ${c('finishedAt')} = v.finished_at FROM (VALUES ${rows.join(', ')}) AS v(run_id, seq, status, output, error, events, started_at, finished_at) WHERE c.${c('runId')} = v.run_id AND c.${c('seq')} = v.seq AND c.${c('status')} = 'pending' AND ${finished} RETURNING ${this.settledColumns(em, 'c.')}`,
+          `UPDATE ${this.table(em, K)} AS c SET ${c('status')} = v.status, ${c('output')} = CASE WHEN v.status = 'completed' THEN v.output ELSE c.${c('output')} END, ${c('error')} = v.error, ${c('events')} = COALESCE(v.events, c.${c('events')}), ${c('startedAt')} = COALESCE(v.started_at, c.${c('startedAt')}), ${c('finishedAt')} = v.finished_at, ${c('wakeAt')} = NULL FROM (VALUES ${rows.join(', ')}) AS v(run_id, seq, status, output, error, events, started_at, finished_at) WHERE c.${c('runId')} = v.run_id AND c.${c('seq')} = v.seq AND c.${c('status')} = 'pending' AND ${finished} RETURNING ${this.settledColumns(em, 'c.')}`,
           params,
         ),
       );

@@ -515,7 +515,9 @@ export interface StateStore {
   /**
    * Settle steps from their results: per entry and in input order, while the row at `(runId, seq)`
    * is still `pending`, write the entry's `status`, `output`, `error`, `events`, `startedAt` and
-   * `finishedAt` (an absent one is stored empty) and leave every other column as it is stored;
+   * `finishedAt` (an absent one is stored empty), clear `wakeAt` (a settled step has no dispatch
+   * lease left, and a failed one's `wakeAt` is later its retry's backoff deadline), and leave every
+   * other column as it is stored;
    * resolves whether each entry wrote. Claims like {@link saveCheckpointsIfPending}: a later entry for
    * a row an earlier one settled loses, and a rejection writes nothing. The engine settles a batch of
    * one run's step results through it, so a step's `input` (an LLM prompt, say) is not written again
@@ -530,7 +532,8 @@ export interface StateStore {
    * `cancelled` or `completed` (a late result for a finished run settles nothing), write the result
    * (see {@link StepResultSettlement} for what keeps its stored value) and resolve the row as it now
    * reads, without its `input` (as {@link getCheckpointsForSettle} reads it); `null` for an entry
-   * that wrote nothing (the row is absent or already settled, or the run finished). Claims like
+   * that wrote nothing (the row is absent or already settled, or the run finished). Clears `wakeAt`
+   * as {@link settleCheckpointsIfPending} does. Claims like
    * {@link settleCheckpointsIfPending}: a later entry for a row an earlier one settled loses, and a
    * rejection writes nothing. The engine settles a batch of one run's step results through it
    * without reading the rows first.

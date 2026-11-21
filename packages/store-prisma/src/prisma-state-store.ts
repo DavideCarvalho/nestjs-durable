@@ -634,6 +634,8 @@ export class PrismaStateStore implements StateStore {
               events: jsonOrNull(s.events),
               startedAt: s.startedAt,
               finishedAt: s.finishedAt,
+              // A settled step has no dispatch lease left.
+              wakeAt: null,
             },
           });
           wrote[i] = count > 0;
@@ -1759,7 +1761,8 @@ const settleRowsPostgres: RawSettle = async (db, settlements, schema) => {
   });
   const written = await db.$queryRawUnsafe<{ run_id: string; seq: number }[]>(
     `UPDATE ${rawTable('"durable_step_checkpoints"', schema, 'postgres')} AS c SET status = v.status, output = v.output,
-      error = v.error, events = v.events, started_at = v.started_at, finished_at = v.finished_at
+      error = v.error, events = v.events, started_at = v.started_at, finished_at = v.finished_at,
+      wake_at = NULL
     FROM (VALUES ${rows.join(', ')}) AS v(run_id, seq, status, output, error, events, started_at,
       finished_at)
     WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending'
@@ -1808,7 +1811,8 @@ const settleRowsMysql: RawSettle = async (db, settlements, schema) => {
     `UPDATE ${rawTable('durable_step_checkpoints', schema, 'mysql')} AS c JOIN (${rows.join(' UNION ALL ')}) AS v
       ON c.run_id = v.run_id AND c.seq = v.seq
     SET c.status = v.status, c.output = CAST(v.output AS JSON), c.error = CAST(v.error AS JSON),
-      c.events = CAST(v.events AS JSON), c.started_at = v.started_at, c.finished_at = v.finished_at
+      c.events = CAST(v.events AS JSON), c.started_at = v.started_at, c.finished_at = v.finished_at,
+      c.wake_at = NULL
     WHERE c.status = 'pending'`,
     ...values,
   );
@@ -1840,7 +1844,7 @@ const settleRowsSqlite: RawSettle = async (db, settlements) => {
   const written = await db.$queryRawUnsafe<{ run_id: string; seq: number | bigint }[]>(
     `WITH v(run_id, seq, status, output, error, events, started_at, finished_at) AS (VALUES ${rows.join(', ')})
     UPDATE durable_step_checkpoints SET status = v.status, output = v.output, error = v.error,
-      events = v.events, started_at = v.started_at, finished_at = v.finished_at
+      events = v.events, started_at = v.started_at, finished_at = v.finished_at, wake_at = NULL
     FROM v
     WHERE durable_step_checkpoints.run_id = v.run_id AND durable_step_checkpoints.seq = v.seq
       AND durable_step_checkpoints.status = 'pending'
@@ -2146,7 +2150,7 @@ class PrismaRoundTrips {
       const done = s.status === 'completed';
       const at = (d: Date) => d.toISOString().replace('T', ' ').replace('Z', '');
       const wrote = await this.raw.$executeRawUnsafe(
-        `UPDATE ${this.t('durable_step_checkpoints')} c SET c.status = ?, c.output = ${done ? 'CAST(? AS JSON)' : 'c.output'}, c.error = CAST(? AS JSON), c.events = COALESCE(CAST(? AS JSON), c.events), c.started_at = COALESCE(?, c.started_at), c.finished_at = ? WHERE c.run_id = ? AND c.seq = ? AND c.status = 'pending' AND ${finished}`,
+        `UPDATE ${this.t('durable_step_checkpoints')} c SET c.status = ?, c.output = ${done ? 'CAST(? AS JSON)' : 'c.output'}, c.error = CAST(? AS JSON), c.events = COALESCE(CAST(? AS JSON), c.events), c.started_at = COALESCE(?, c.started_at), c.finished_at = ?, c.wake_at = NULL WHERE c.run_id = ? AND c.seq = ? AND c.status = 'pending' AND ${finished}`,
         s.status,
         ...(done ? [jsonText(s.output)] : []),
         jsonText(s.error),
@@ -2185,7 +2189,7 @@ class PrismaRoundTrips {
         return `(${p(1)}::text, ${p(2)}::integer, ${p(3)}::text, ${p(4)}::jsonb, ${p(5)}::jsonb, ${p(6)}::jsonb, (${p(7)}::timestamptz AT TIME ZONE 'UTC'), (${p(8)}::timestamptz AT TIME ZONE 'UTC'))`;
       });
       const settled = await this.raw.$queryRawUnsafe<Record<string, unknown>[]>(
-        `UPDATE ${this.t('"durable_step_checkpoints"')} AS c SET status = v.status, output = CASE WHEN v.status = 'completed' THEN v.output ELSE c.output END, error = v.error, events = COALESCE(v.events, c.events), started_at = COALESCE(v.started_at, c.started_at), finished_at = v.finished_at FROM (VALUES ${rows.join(', ')}) AS v(run_id, seq, status, output, error, events, started_at, finished_at) WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending' AND ${finished} RETURNING ${SETTLED_CHECKPOINT_COLUMNS.split(
+        `UPDATE ${this.t('"durable_step_checkpoints"')} AS c SET status = v.status, output = CASE WHEN v.status = 'completed' THEN v.output ELSE c.output END, error = v.error, events = COALESCE(v.events, c.events), started_at = COALESCE(v.started_at, c.started_at), finished_at = v.finished_at, wake_at = NULL FROM (VALUES ${rows.join(', ')}) AS v(run_id, seq, status, output, error, events, started_at, finished_at) WHERE c.run_id = v.run_id AND c.seq = v.seq AND c.status = 'pending' AND ${finished} RETURNING ${SETTLED_CHECKPOINT_COLUMNS.split(
           ', ',
         )
           .map((col) => `c.${col}`)
