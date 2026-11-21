@@ -11913,6 +11913,7 @@ export class WorkflowEngine {
         durationMs: finishedAt.getTime() - startedAt.getTime(),
       });
     }
+    await this.releaseFailedStepLeases(runId, settled);
     // Asked after every write of the batch committed, so the batch holding a fan's last step sees
     // the barrier open.
     const barriers = new Map<number, Promise<boolean>>();
@@ -12023,6 +12024,7 @@ export class WorkflowEngine {
       if (resettled.length === 0) return outcomes;
       return this.resumeForRedelivered(runId, resettled, outcomes, queuedIn);
     }
+    await this.releaseFailedStepLeases(runId, settled);
     // Asked after every write of the batch committed, so the batch holding a fan's last step sees
     // the barrier open.
     const barriers = new Map<number, Promise<boolean>>();
@@ -12034,6 +12036,41 @@ export class WorkflowEngine {
       }
     }
     return wake.applyTo(outcomes);
+  }
+
+  /**
+   * Clear the dispatch lease a failed remote step still carries in `wakeAt`, before anything resumes
+   * its run. With `remoteRedispatchMs` (or a policy `timeoutMs`) every dispatched step is written with
+   * that lease, and a result settles the row without touching `wakeAt`. On a failed step `wakeAt` means
+   * the retry's backoff deadline ({@link applyCallPolicy} stamps it at first sight, the in-process
+   * `callRemote` likewise), so a lease left there would hold the retry until the lease passed. A
+   * completed step keeps its row as written: no retry reads its `wakeAt`.
+   *
+   * Written only while the row is still the failed attempt this batch settled (same attempt, same
+   * lease), so a row a concurrent turn moved on since is left alone. A failure here is swallowed: the
+   * retry then waits for the lease, which is late but never lost.
+   */
+  private async releaseFailedStepLeases(
+    runId: string,
+    settled: { cp: StepCheckpoint; result: StepResult }[],
+  ): Promise<void> {
+    for (const { cp, result } of settled) {
+      if (result.status !== 'failed' || cp.kind !== 'remote' || cp.wakeAt == null) continue;
+      try {
+        const current = await this.store.getCheckpoint(runId, cp.seq);
+        if (
+          current?.status !== 'failed' ||
+          current.kind !== 'remote' ||
+          current.attempts !== cp.attempts ||
+          current.wakeAt !== cp.wakeAt
+        ) {
+          continue;
+        }
+        await this.store.saveCheckpoint({ ...current, wakeAt: undefined });
+      } catch {
+        // The retry waits for the lease instead.
+      }
+    }
   }
 
   /**
