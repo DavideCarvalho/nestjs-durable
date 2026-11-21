@@ -84,6 +84,21 @@ export async function resolveContextSerializer(
   }
 }
 
+/** Where nestjs-context binds its `ContextModule.forRoot` options. */
+const CONTEXT_MODULE_OPTIONS = Symbol.for('@dudousxd/nestjs-context:options');
+
+/** Whether the app gave nestjs-context its own `serialize` (it then decides the whole carrier). */
+export function contextHasCustomSerialize(moduleRef: ModuleRef): boolean {
+  try {
+    const options = moduleRef.get<{ serialize?: unknown }>(CONTEXT_MODULE_OPTIONS, {
+      strict: false,
+    });
+    return typeof options?.serialize === 'function';
+  } catch {
+    return false;
+  }
+}
+
 /** Restores a context carrier around `fn`: the engine's and the worker runtime's `rehydrate`. */
 export type ContextRehydrateBridge = <T>(
   carrier: Record<string, unknown> | undefined,
@@ -108,4 +123,40 @@ export async function resolveContextRehydrate(
   if (resolveAccessor(moduleRef) === undefined) return undefined;
   const runtime = await resolveContextRuntime();
   return runtime ? rehydrateBridge(runtime) : undefined;
+}
+
+/**
+ * Build the auto-fed context carrier — the engine's `context` default when `@dudousxd/nestjs-context`
+ * is present and the app passed no own reader. When the bound accessor is nestjs-context's own it is
+ * `Context.serialize()`, so the app's `carrier: [...]` allowlist or `serialize` override decides
+ * which fields travel; the full `tenant` (with its kind) is added only when the allowlist let the
+ * `tenantId` through and no custom `serialize` is configured (that one decides the whole carrier). An app's own accessor is read directly. Drops fields that aren't populated, so an empty/anonymous context yields `{}`.
+ */
+export function carrierFromContext(
+  accessor: ContextAccessor,
+  serialize: (() => Record<string, unknown> | undefined) | undefined,
+  customSerialize: boolean,
+): Record<string, unknown> | undefined {
+  if (serialize) {
+    const carrier: Record<string, unknown> = { ...(serialize() ?? {}) };
+    for (const key of Object.keys(carrier)) if (carrier[key] === undefined) delete carrier[key];
+    // An app's own `serialize` decides the whole carrier; only the allowlist path gets the full tenant.
+    const tenant = customSerialize ? undefined : accessor.tenant?.();
+    if (carrier.tenantId !== undefined && tenant !== undefined && tenant.source !== 'legacy') {
+      carrier.tenant = tenant;
+    }
+    return carrier;
+  }
+  const carrier: Record<string, unknown> = {};
+  const traceId = accessor.traceId();
+  if (traceId !== undefined) carrier.traceId = traceId;
+  const tenantId = accessor.tenantId();
+  if (tenantId !== undefined) carrier.tenantId = tenantId;
+  // The full tenant (with its kind), so a worker restores `{ id, kind }` and not `kind: 'unknown'`.
+  // A `legacy` one (only a plain `tenantId` was set) adds nothing the `tenantId` above doesn't carry.
+  const tenant = accessor.tenant?.();
+  if (tenant !== undefined && tenant.source !== 'legacy') carrier.tenant = tenant;
+  const userRef = accessor.userRef();
+  if (userRef !== undefined) carrier.userRef = userRef;
+  return carrier;
 }

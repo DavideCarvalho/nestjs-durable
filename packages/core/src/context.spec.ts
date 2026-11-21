@@ -258,7 +258,7 @@ describe('context carrier on a dispatched workflow turn', () => {
         commands: [{ kind: 'call', seq: 0, name: 'probe.run', input: {} }],
         ...over,
       } as WorkflowDecision);
-    return { als, store, turns, steps, taskId, decide };
+    return { als, store, turns, steps, taskId, decide, engine };
   }
 
   it("applies a decision under the carrier the engine stamped on that turn, so the turn's steps carry it", async () => {
@@ -296,6 +296,22 @@ describe('context carrier on a dispatched workflow turn', () => {
       commands: [{ kind: 'call', seq: 0, name: 'probe.run', input: {} }],
     });
     expect(other.steps.map((t) => t.context)).toEqual([{ traceId: 'other-instance' }]);
+  });
+
+  it('does not apply a carrier it stamped on a different turn of the run', async () => {
+    const { store, steps, decide } = await engineWithTurn({ started: { traceId: 'started-with' } });
+    // Another instance re-drove the run: the store now awaits a turn this engine never dispatched.
+    await store.updateRun('r1', { awaitingDecisionTaskId: 'r1:wf:elsewhere' });
+    await decide({ taskId: 'r1:wf:elsewhere' });
+    expect(steps.map((t) => t.context)).toEqual([{ traceId: 'fresh' }]);
+  });
+
+  it("drops a turn's carrier once its run settles", async () => {
+    const { engine } = await engineWithTurn({ started: { traceId: 'started-with' } });
+    const held = () => (engine as unknown as { turnCarriers: Map<string, unknown> }).turnCarriers;
+    expect(held().has('r1')).toBe(true);
+    await engine.cancel('r1');
+    expect(held().has('r1')).toBe(false);
   });
 
   it('logs a carrier the rehydrate bridge rejects and applies the decision without it', async () => {

@@ -36,6 +36,8 @@ import {
 import { DiscoveryModule, ModuleRef } from '@nestjs/core';
 import type { ContextAccessor } from './context-accessor';
 import {
+  carrierFromContext,
+  contextHasCustomSerialize,
   contextSlotPresent,
   rehydrateBridge,
   resolveAccessor,
@@ -74,40 +76,6 @@ import { TimerPoller } from './timer-poller';
 import { TENANT_AUTH } from './tokens';
 import { WorkflowRegistrar } from './workflow.registrar';
 import { WorkflowService } from './workflow.service';
-
-/**
- * Build the auto-fed context carrier — the engine's `context` default when `@dudousxd/nestjs-context`
- * is present and the app passed no own reader. When the bound accessor is nestjs-context's own it is
- * `Context.serialize()`, so the app's `carrier: [...]` allowlist or `serialize` override decides
- * which fields travel; the full `tenant` (with its kind) is added only when the allowlist let the
- * `tenantId` through. An app's own accessor is read directly. Drops fields that aren't populated, so an empty/anonymous context yields `{}`.
- */
-function carrierFromContext(
-  accessor: ContextAccessor,
-  serialize: (() => Record<string, unknown> | undefined) | undefined,
-): Record<string, unknown> | undefined {
-  if (serialize) {
-    const carrier: Record<string, unknown> = { ...(serialize() ?? {}) };
-    for (const key of Object.keys(carrier)) if (carrier[key] === undefined) delete carrier[key];
-    const tenant = accessor.tenant?.();
-    if (carrier.tenantId !== undefined && tenant !== undefined && tenant.source !== 'legacy') {
-      carrier.tenant = tenant;
-    }
-    return carrier;
-  }
-  const carrier: Record<string, unknown> = {};
-  const traceId = accessor.traceId();
-  if (traceId !== undefined) carrier.traceId = traceId;
-  const tenantId = accessor.tenantId();
-  if (tenantId !== undefined) carrier.tenantId = tenantId;
-  // The full tenant (with its kind), so a worker restores `{ id, kind }` and not `kind: 'unknown'`.
-  // A `legacy` one (only a plain `tenantId` was set) adds nothing the `tenantId` above doesn't carry.
-  const tenant = accessor.tenant?.();
-  if (tenant !== undefined && tenant.source !== 'legacy') carrier.tenant = tenant;
-  const userRef = accessor.userRef();
-  if (userRef !== undefined) carrier.userRef = userRef;
-  return carrier;
-}
 
 /** True when `x` can act as a control plane (broadcast pub/sub) — e.g. a broadcast-capable transport. */
 function isControlPlane(x: unknown): x is ControlPlane {
@@ -1077,9 +1045,12 @@ export class DurableModule {
               options.context === undefined && accessor
                 ? await resolveContextSerializer(accessor)
                 : undefined;
+            const customSerialize = contextHasCustomSerialize(moduleRef);
             const context =
               options.context ??
-              (accessor ? () => carrierFromContext(accessor, serialize) : undefined);
+              (accessor
+                ? () => carrierFromContext(accessor, serialize, customSerialize)
+                : undefined);
             // `consumers: false`: park every transport's point-to-point consumers BEFORE the engine
             // subscribes to them (its constructor registers the results/decisions consumers).
             if (options.consumers === false) {

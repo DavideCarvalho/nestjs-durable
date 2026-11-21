@@ -6,7 +6,7 @@ import {
   clearDurableExecutionWrappers,
   useDurableExecution,
 } from '@dudousxd/nestjs-durable-core';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DurableWorkerRuntime } from './runner-core';
 
 const als = new AsyncLocalStorage<Record<string, unknown>>();
@@ -72,32 +72,25 @@ describe('DurableWorkerRuntime — the dispatched context carrier', () => {
     expect(seen).toEqual([null, null]);
   });
 
-  it('answers a turn whose carrier `rehydrate` rejects with a non-retryable failed decision', async () => {
-    const seen: unknown[] = [];
-    const rejecting = (() => {
-      throw new Error('malformed carrier');
-    }) as typeof rehydrate;
-    const out = await runtimeSeeing(seen, { rehydrate: rejecting }).handleTask(
-      turn({ traceId: 'bad' }),
-    );
-    expect(seen).toEqual([]);
-    expect(out).toEqual({
-      kind: 'decision',
-      decision: {
-        taskId: 'r1:wf:1',
-        runId: 'r1',
-        status: 'failed',
-        commands: [],
-        error: {
-          message: "could not restore the turn's context carrier: malformed carrier",
-          code: 'context_rehydrate_failed',
-          retryable: false,
-        },
-      },
-    });
+  it('runs a turn whose carrier `rehydrate` rejects without the carrier, and logs it', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const seen: unknown[] = [];
+      const rejecting = (() => {
+        throw new Error('malformed carrier');
+      }) as typeof rehydrate;
+      const out = await runtimeSeeing(seen, { rehydrate: rejecting }).handleTask(
+        turn({ traceId: 'bad' }),
+      );
+      expect(seen).toEqual([null]);
+      expect(out.kind === 'decision' && out.decision.status).toBe('completed');
+      expect(warn.mock.calls.flat().join(' ')).toMatch(/r1.*context carrier.*malformed carrier/);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
-  it('fails a step whose carrier `rehydrate` rejects for good, without running its handler', async () => {
+  it('fails a step whose carrier `rehydrate` rejects as retryable, without running its handler', async () => {
     const seen: unknown[] = [];
     const rejecting = (() => {
       throw new Error('malformed carrier');
@@ -110,7 +103,7 @@ describe('DurableWorkerRuntime — the dispatched context carrier', () => {
     expect(out.kind === 'result' && out.result.error).toMatchObject({
       message: "could not restore the step's context carrier: malformed carrier",
       code: 'context_rehydrate_failed',
-      retryable: false,
+      retryable: true,
     });
   });
 

@@ -121,13 +121,14 @@ export class StepWorker {
           : execute());
       } catch (err) {
         if (!rehydrate || started) throw err;
-        // The carrier could not be restored (an app deserializer rejected it); a retry would hit
-        // the same carrier, so the step fails for good.
+        // The carrier could not be restored (an app deserializer rejected it). The handler never
+        // runs without its context; the step fails retryable, so its retry policy applies and the
+        // retry is dispatched with a freshly stamped carrier.
         throw Object.assign(
           new Error(
             `could not restore the step's context carrier: ${err instanceof Error ? err.message : String(err)}`,
           ),
-          { code: 'context_rehydrate_failed', retryable: false },
+          { code: 'context_rehydrate_failed', retryable: true },
         );
       }
       const result: StepResult = { ...base, status: 'completed', output };

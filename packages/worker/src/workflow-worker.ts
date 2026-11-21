@@ -108,18 +108,13 @@ export class WorkflowWorker {
       });
     } catch (err) {
       if (started) throw err;
-      // The carrier could not be restored (an app deserializer rejected it): answer the turn with a
-      // failure the engine records, rather than dropping it to die later as a lost turn.
-      return {
-        ...base,
-        status: 'failed',
-        commands: [],
-        error: {
-          message: `could not restore the turn's context carrier: ${err instanceof Error ? err.message : String(err)}`,
-          code: 'context_rehydrate_failed',
-          retryable: false,
-        },
-      };
+      // The carrier could not be restored (an app deserializer rejected it, e.g. one changed by a
+      // rolling deploy). It is correlation only, so the turn runs without it rather than failing the
+      // run; the engine still applies the run's tenant to the decision.
+      console.warn(
+        `[nestjs-durable] run ${task.runId}: could not restore the turn's context carrier, running it without: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return turn();
     }
   }
 

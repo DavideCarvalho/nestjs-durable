@@ -2759,6 +2759,10 @@ export class WorkflowEngine {
    */
   private emit(event: Omit<EngineEvent, 'at'>, opts?: { lifecycle?: boolean }): void {
     const full: EngineEvent = { ...event, at: new Date() };
+    // A settled run awaits no turn: drop its dispatched turn's carrier now, not at eviction.
+    if (full.type === 'run.completed' || full.type === 'run.failed') {
+      this.turnCarriers.delete(full.runId);
+    }
     this.settleParentClose(full);
     this.deliver(full);
     if (opts?.lifecycle !== false) {
