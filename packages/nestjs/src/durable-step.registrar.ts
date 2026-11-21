@@ -32,7 +32,8 @@ function supportsHandle(transport: unknown): transport is LocalTaskHandling {
  * the worker process instead, so there is nothing to wire here.
  *
  * **Context re-hydration (consume side).** DurableModule's produce side auto-feeds an opaque carrier
- * (`{ traceId, tenantId, userRef }`) from `@dudousxd/nestjs-context` onto each dispatched
+ * (`Context.serialize()`, filtered by the app's `carrier: [...]` allowlist) from
+ * `@dudousxd/nestjs-context` onto each dispatched
  * `RemoteTask.context` and `WorkflowTask.context` (see DurableModule). A worker role restores it
  * around each dispatched turn and step through the worker runtime's `rehydrate` bridge
  * (`Context.deserialize`, see `context-runtime.ts`). A handler registered HERE, on an in-process

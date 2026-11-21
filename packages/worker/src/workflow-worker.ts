@@ -99,9 +99,28 @@ export class WorkflowWorker {
         () => this.replayTurn(base, fn, task, opts),
       );
     const rehydrate = this.options.rehydrate;
-    const decision = await (rehydrate ? rehydrate(task.context, turn) : turn());
-    // Echo the carrier so the engine dispatches this turn's steps and children inside it.
-    return task.context !== undefined ? { ...decision, context: task.context } : decision;
+    if (!rehydrate) return turn();
+    let started = false;
+    try {
+      return await rehydrate(task.context, () => {
+        started = true;
+        return turn();
+      });
+    } catch (err) {
+      if (started) throw err;
+      // The carrier could not be restored (an app deserializer rejected it): answer the turn with a
+      // failure the engine records, rather than dropping it to die later as a lost turn.
+      return {
+        ...base,
+        status: 'failed',
+        commands: [],
+        error: {
+          message: `could not restore the turn's context carrier: ${err instanceof Error ? err.message : String(err)}`,
+          code: 'context_rehydrate_failed',
+          retryable: false,
+        },
+      };
+    }
   }
 
   /** The replay itself — see {@link processTask}, which wraps this in the execution hooks. */

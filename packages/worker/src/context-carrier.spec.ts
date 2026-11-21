@@ -61,15 +61,57 @@ describe('DurableWorkerRuntime — the dispatched context carrier', () => {
     const out = await runtime.handleTask(turn(carrier));
     await runtime.handleTask(step(carrier));
     expect(seen).toEqual([carrier, carrier]);
-    expect(out.kind === 'decision' && out.decision.context).toEqual(carrier);
+    // The worker never sends a carrier back on its decision.
+    expect(out.kind === 'decision' && 'context' in out.decision).toBe(false);
   });
 
-  it('restores nothing without `rehydrate`, and a task without a carrier echoes none', async () => {
+  it('restores nothing without `rehydrate`, or for a task without a carrier', async () => {
     const seen: unknown[] = [];
     await runtimeSeeing(seen).handleTask(turn({ traceId: 'trace-1' }));
-    const out = await runtimeSeeing(seen, { rehydrate }).handleTask(turn());
+    await runtimeSeeing(seen, { rehydrate }).handleTask(turn());
     expect(seen).toEqual([null, null]);
-    expect(out.kind === 'decision' && 'context' in out.decision).toBe(false);
+  });
+
+  it('answers a turn whose carrier `rehydrate` rejects with a non-retryable failed decision', async () => {
+    const seen: unknown[] = [];
+    const rejecting = (() => {
+      throw new Error('malformed carrier');
+    }) as typeof rehydrate;
+    const out = await runtimeSeeing(seen, { rehydrate: rejecting }).handleTask(
+      turn({ traceId: 'bad' }),
+    );
+    expect(seen).toEqual([]);
+    expect(out).toEqual({
+      kind: 'decision',
+      decision: {
+        taskId: 'r1:wf:1',
+        runId: 'r1',
+        status: 'failed',
+        commands: [],
+        error: {
+          message: "could not restore the turn's context carrier: malformed carrier",
+          code: 'context_rehydrate_failed',
+          retryable: false,
+        },
+      },
+    });
+  });
+
+  it('fails a step whose carrier `rehydrate` rejects for good, without running its handler', async () => {
+    const seen: unknown[] = [];
+    const rejecting = (() => {
+      throw new Error('malformed carrier');
+    }) as typeof rehydrate;
+    const out = await runtimeSeeing(seen, { rehydrate: rejecting }).handleTask(
+      step({ traceId: 'bad' }),
+    );
+    expect(seen).toEqual([]);
+    expect(out.kind === 'result' && out.result.status).toBe('failed');
+    expect(out.kind === 'result' && out.result.error).toMatchObject({
+      message: "could not restore the step's context carrier: malformed carrier",
+      code: 'context_rehydrate_failed',
+      retryable: false,
+    });
   });
 
   it('hands the carrier to the execution wrappers, which run inside it', async () => {

@@ -100,8 +100,8 @@ describe('worker runtime restores the dispatched context carrier (thin worker)',
     const out = await runtime.handleTask(turn);
     expect(out.kind).toBe('decision');
     expect(seen.turn).toEqual([{ traceId: request.traceId }]);
-    // The decision echoes the carrier, so the engine dispatches this turn's step inside it.
-    if (out.kind === 'decision') expect(out.decision.context).toEqual(carrier);
+    // The worker never sends a carrier back: the engine applies the decision under its own.
+    if (out.kind === 'decision') expect('context' in out.decision).toBe(false);
 
     const step: RemoteTask = {
       runId: 'r1',
@@ -178,12 +178,14 @@ describe('worker runtime restores the dispatched context carrier (co-located wor
 
     // The worker consumes outside the request, as a BullMQ processor does.
     expect(Context.get()).toBeUndefined();
+    const wire: Array<Record<string, unknown> | undefined> = [];
     for (let i = 0; i < 20 && (await store.getRun('r1'))?.status !== 'completed'; i += 1) {
       const task = transport.tasks.shift();
       if (!task) {
         await new Promise((resolve) => setImmediate(resolve));
         continue;
       }
+      wire.push(task.context);
       const out = await runtime.handleTask(task);
       if (out.kind === 'decision') await transport.decide?.(out.decision);
       else await transport.settle?.(out.result);
@@ -197,6 +199,15 @@ describe('worker runtime restores the dispatched context carrier (co-located wor
     expect(seen.turn[0]).toEqual({ traceId: request.traceId });
     // The step that turn dispatched carries the same trace, still without the request's authority.
     expect(seen.step).toEqual([{ traceId: request.traceId }]);
+    // The auto-fed carrier goes through `Context.serialize`, so the `carrier: ['traceId']`
+    // allowlist holds on the wire: the request's user and tenant never reach the broker.
+    expect(wire.length).toBeGreaterThanOrEqual(3);
+    for (const context of wire) {
+      expect(context?.userRef).toBeUndefined();
+      expect(context?.tenantId).toBeUndefined();
+    }
+    expect(wire[0]).toEqual({ traceId: request.traceId });
+    expect(wire[1]).toEqual({ traceId: request.traceId });
     await moduleRef.close();
   });
 });

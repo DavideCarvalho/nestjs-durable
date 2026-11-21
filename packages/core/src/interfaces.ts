@@ -1778,7 +1778,8 @@ export interface WorkflowTask {
   /**
    * Opaque context carrier the engine's `context` reader produced when it dispatched this turn, the
    * same one a dispatched step's {@link RemoteTask.context} carries. A worker given a `rehydrate`
-   * bridge restores it around the turn. Absent when no `context` reader is configured.
+   * bridge restores it around the turn. Absent when no `context` reader is configured. Correlation
+   * only: the engine never reads a carrier back from a worker.
    */
   context?: Record<string, unknown> | undefined;
   /**
@@ -1966,13 +1967,6 @@ export interface WorkflowDecision {
   output?: unknown;
   /** Terminal error (status === 'failed'). */
   error?: StepError;
-  /**
-   * The context carrier of the turn this decision answers ({@link WorkflowTask.context}), echoed back
-   * by the worker. The engine applies the decision inside it (its `rehydrate` bridge), so the steps
-   * and children the turn dispatches carry the same carrier. Absent when the turn carried none or the
-   * worker does not echo it.
-   */
-  context?: Record<string, unknown> | undefined;
 }
 
 /**

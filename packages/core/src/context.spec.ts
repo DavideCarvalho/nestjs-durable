@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { WorkflowEngine } from './engine';
 import type {
   HistoryEvent,
@@ -218,30 +218,119 @@ describe('context carrier on a dispatched workflow turn', () => {
     }
   });
 
-  it("applies a decision inside the carrier it echoes, so the turn's steps carry it", async () => {
+  /** An engine whose context lives in `als`, with one dispatched turn of run `r1` started inside
+   *  `started` (or outside any context when omitted). */
+  async function engineWithTurn(
+    options: {
+      started?: Record<string, unknown>;
+      rehydrate?: (carrier: Record<string, unknown> | undefined, fn: () => unknown) => unknown;
+      tenancy?: ConstructorParameters<typeof WorkflowEngine>[0]['tenancy'];
+      onContext?: () => void;
+    } = {},
+  ) {
     const als = new AsyncLocalStorage<Record<string, unknown>>();
     const store = new InMemoryStateStore();
     const { transport, turns, steps, handlers } = turnTransport();
     const engine = new WorkflowEngine({
       store,
       transport,
-      context: () => als.getStore() ?? { traceId: 'fresh' },
-      rehydrate: (carrier, fn) => (carrier ? als.run(carrier, fn) : fn()),
+      context: () => {
+        options.onContext?.();
+        return als.getStore() ?? { traceId: 'fresh' };
+      },
+      rehydrate: (options.rehydrate ??
+        ((carrier, fn) => (carrier ? als.run(carrier, fn) : fn()))) as <T>(
+        carrier: Record<string, unknown> | undefined,
+        fn: () => T,
+      ) => T,
+      ...(options.tenancy ? { tenancy: options.tenancy } : {}),
     });
     const executor = new RemoteWorkflowExecutor(transport, 'ask');
     engine.register('ask', '1', async () => 'x', { group: 'ask', executor });
-    await startTurn(engine, turns, 'r1');
-    const run = await store.getRun('r1');
-    const taskId = run?.awaitingDecisionTaskId as string;
+    const start = () => startTurn(engine, turns, 'r1');
+    await (options.started ? als.run(options.started, start) : start());
+    const taskId = (await store.getRun('r1'))?.awaitingDecisionTaskId as string;
+    const decide = (over: Partial<WorkflowDecision> & Record<string, unknown> = {}) =>
+      handlers.decide?.({
+        taskId,
+        runId: 'r1',
+        status: 'continue',
+        commands: [{ kind: 'call', seq: 0, name: 'probe.run', input: {} }],
+        ...over,
+      } as WorkflowDecision);
+    return { als, store, turns, steps, taskId, decide };
+  }
 
-    // Outside any context, as a decision consumer runs: the step reads the echoed carrier.
-    await handlers.decide?.({
+  it("applies a decision under the carrier the engine stamped on that turn, so the turn's steps carry it", async () => {
+    const { turns, steps, decide } = await engineWithTurn({ started: { traceId: 'started-with' } });
+    expect(turns[0]?.context).toEqual({ traceId: 'started-with' });
+    // Outside any context, as a decision consumer runs.
+    await decide();
+    expect(steps.map((t) => t.context)).toEqual([{ traceId: 'started-with' }]);
+  });
+
+  it('never applies a decision under a carrier the worker sends back', async () => {
+    const { steps, decide } = await engineWithTurn({ started: { traceId: 'started-with' } });
+    await decide({
+      context: { traceId: 'forged', tenantId: 'other', userRef: { type: 'u', id: 1 } },
+    });
+    expect(steps.map((t) => t.context)).toEqual([{ traceId: 'started-with' }]);
+  });
+
+  it("applies a decision another instance dispatched under its own context, not the dispatcher's carrier", async () => {
+    const { store, taskId } = await engineWithTurn({ started: { traceId: 'started-with' } });
+    // A second instance on the same store consumes the decision: it holds no carrier for the turn.
+    const other = turnTransport();
+    const engine = new WorkflowEngine({
+      store,
+      transport: other.transport,
+      context: () => ({ traceId: 'other-instance' }),
+      rehydrate: (_carrier, fn) => fn(),
+    });
+    const executor = new RemoteWorkflowExecutor(other.transport, 'ask');
+    engine.register('ask', '1', async () => 'x', { group: 'ask', executor });
+    await other.handlers.decide?.({
       taskId,
       runId: 'r1',
       status: 'continue',
       commands: [{ kind: 'call', seq: 0, name: 'probe.run', input: {} }],
-      context: { traceId: 'started-with' },
     });
-    expect(steps.map((t) => t.context)).toEqual([{ traceId: 'started-with' }]);
+    expect(other.steps.map((t) => t.context)).toEqual([{ traceId: 'other-instance' }]);
+  });
+
+  it('logs a carrier the rehydrate bridge rejects and applies the decision without it', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { store, steps, decide } = await engineWithTurn({
+        started: { traceId: 'started-with' },
+        rehydrate: (carrier, fn) => {
+          if (carrier?.traceId === 'started-with') throw new Error('malformed carrier');
+          return fn();
+        },
+      });
+      await decide();
+      expect(steps.map((t) => t.context)).toEqual([{ traceId: 'fresh' }]);
+      expect((await store.getRun('r1'))?.status).toBe('suspended');
+      expect(warn.mock.calls.flat().join(' ')).toMatch(/r1.*context carrier.*malformed carrier/);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("applies a decision in the run's tenant", async () => {
+    const tenantAls = new AsyncLocalStorage<string>();
+    const seen: Array<string | undefined> = [];
+    const { decide } = await engineWithTurn({
+      tenancy: {
+        current: () => ({ id: 'acme', kind: 'company' }),
+        filter: () => ({ mode: 'all' }),
+        run: (tenant, fn) => tenantAls.run(tenant.id, fn),
+      },
+      onContext: () => seen.push(tenantAls.getStore()),
+    });
+    seen.length = 0;
+    // Outside any tenant, as a decision consumer runs: the step it dispatches sees the run's.
+    await decide();
+    expect(seen).toEqual(['acme']);
   });
 });

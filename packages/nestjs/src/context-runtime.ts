@@ -62,6 +62,28 @@ export async function resolveContextRuntime(): Promise<ContextRuntime | undefine
   }
 }
 
+/**
+ * nestjs-context's own `Context.serialize` — the active context as a carrier, filtered by the app's
+ * `carrier: [...]` allowlist or `serialize` override — when `accessor` IS nestjs-context's accessor.
+ * Undefined for an app's own accessor (its fields are read directly) or when the peer is absent.
+ */
+export async function resolveContextSerializer(
+  accessor: ContextAccessor,
+): Promise<(() => Record<string, unknown> | undefined) | undefined> {
+  try {
+    const specifier = '@dudousxd/nestjs-context';
+    const mod = (await import(specifier)) as {
+      Context?: { serialize?: () => Record<string, unknown> | undefined };
+      contextAccessor?: unknown;
+    };
+    const serialize = mod.Context?.serialize;
+    if (typeof serialize !== 'function' || mod.contextAccessor !== accessor) return undefined;
+    return () => serialize.call(mod.Context);
+  } catch {
+    return undefined;
+  }
+}
+
 /** Restores a context carrier around `fn`: the engine's and the worker runtime's `rehydrate`. */
 export type ContextRehydrateBridge = <T>(
   carrier: Record<string, unknown> | undefined,

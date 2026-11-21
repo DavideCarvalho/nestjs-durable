@@ -28,7 +28,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "peerDependencies": {
-    "@dudousxd/durable-worker": ">=0.23.0 <1.0.0",
+    "@dudousxd/durable-worker": ">=0.24.0 <1.0.0",
     "@dudousxd/nestjs-context": ">=0.1.0 <3.0.0",
     "@dudousxd/nestjs-durable-core": ">=0.107.0 <1.0.0",
     "@dudousxd/nestjs-durable-workflows-gateway": ">=0.1.0 <1.0.0",

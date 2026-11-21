@@ -110,7 +110,26 @@ export class StepWorker {
         );
       // The carrier is restored outside the wrappers, as the engine restores it around a local step.
       const rehydrate = this.options.rehydrate;
-      const output = await (rehydrate ? rehydrate(task.context, execute) : execute());
+      let started = false;
+      let output: unknown;
+      try {
+        output = await (rehydrate
+          ? rehydrate(task.context, () => {
+              started = true;
+              return execute();
+            })
+          : execute());
+      } catch (err) {
+        if (!rehydrate || started) throw err;
+        // The carrier could not be restored (an app deserializer rejected it); a retry would hit
+        // the same carrier, so the step fails for good.
+        throw Object.assign(
+          new Error(
+            `could not restore the step's context carrier: ${err instanceof Error ? err.message : String(err)}`,
+          ),
+          { code: 'context_rehydrate_failed', retryable: false },
+        );
+      }
       const result: StepResult = { ...base, status: 'completed', output };
       if (events.length > 0) result.events = events;
       return result;
