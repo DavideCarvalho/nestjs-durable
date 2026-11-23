@@ -253,4 +253,20 @@ describe('ctx.all (parallel child workflows, wait-all)', () => {
     expect(err.message).toContain('r.all.0.1');
     expect(err.message).toContain('r.all.0.2');
   });
+
+  it('GatherError names the first ten failed ids and counts the rest', () => {
+    const failures = Array.from({ length: 3329 }, (_, index) => ({
+      index,
+      id: `r.all.0.${index}`,
+      error: 'boom',
+    }));
+    const err = new GatherError(failures, 40000);
+    expect(err.message).toBe(
+      `ctx.all: 3329 of 40000 child(ren) failed: ${failures
+        .slice(0, 10)
+        .map((failure) => failure.id)
+        .join(', ')} and 3319 more`,
+    );
+    expect(err.failures).toHaveLength(3329);
+  });
 });

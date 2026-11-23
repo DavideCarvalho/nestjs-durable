@@ -256,10 +256,16 @@ export interface GatherItemFailure {
   details?: unknown;
 }
 
+/** How many failed ids a {@link GatherError} message names. The message is persisted as the run's
+ *  error, and a fan of thousands of children would otherwise store every id in it. */
+const GATHER_ERROR_NAMED_IDS = 10;
+
 export class GatherError extends Error {
   readonly failures: GatherItemFailure[];
   constructor(failures: GatherItemFailure[], total?: number) {
-    const ids = failures.map((f) => f.id).join(', ');
+    const named = failures.slice(0, GATHER_ERROR_NAMED_IDS).map((f) => f.id);
+    const unnamed = failures.length - named.length;
+    const ids = unnamed > 0 ? `${named.join(', ')} and ${unnamed} more` : named.join(', ');
     const denom = total ?? failures.length;
     super(`ctx.all: ${failures.length} of ${denom} child(ren) failed: ${ids}`);
     this.name = 'GatherError';
