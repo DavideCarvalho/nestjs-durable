@@ -2831,6 +2831,39 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       ]);
     });
 
+    // MySQL's filesort carries every selected column, JSON included, in a 256KB buffer by default:
+    // one run whose payload outgrows it fails the whole page with "Out of sort memory".
+    t('pages listRuns around a run whose payload is larger than the sort buffer', async () => {
+      const largeMessage = 'x'.repeat(400_000);
+      await store.createRun(run({ id: 'old', createdAt: new Date('2026-06-11T00:00:00.000Z') }));
+      await store.createRun(
+        run({
+          id: 'large',
+          status: 'failed',
+          tags: ['etl'],
+          error: { message: largeMessage },
+          createdAt: new Date('2026-06-11T00:00:01.000Z'),
+        }),
+      );
+      await store.createRun(
+        run({ id: 'new', tags: ['etl'], createdAt: new Date('2026-06-11T00:00:02.000Z') }),
+      );
+
+      const page = await store.listRuns({ limit: 2 });
+      expect(page.map((r) => r.id)).toEqual(['new', 'large']);
+      expect(page[1]?.error?.message).toBe(largeMessage);
+      expect((await store.listRuns({ limit: 2, offset: 1 })).map((r) => r.id)).toEqual([
+        'large',
+        'old',
+      ]);
+      if (supportsTagFilter) {
+        expect((await store.listRuns({ tag: 'etl', limit: 2 })).map((r) => r.id)).toEqual([
+          'new',
+          'large',
+        ]);
+      }
+    });
+
     // ---- search-attribute pushdown (range + equality + the missing-key contract) ------------
 
     t('round-trips searchAttributes and answers equality + range attribute queries', async () => {

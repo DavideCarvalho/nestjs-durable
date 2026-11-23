@@ -50,6 +50,10 @@ import {
  */
 const RETENTION_EXCLUDED = [LIFECYCLE_REGISTRY_WORKFLOW];
 
+/** How many run ids `listRuns` loads per `IN (...)`, so an unbounded listing stays under every
+ *  engine's bind-parameter limit. */
+const LIST_RUNS_LOAD_CHUNK = 500;
+
 /* The Prisma client is generated per-schema, so the adapter can't import a concrete one. Instead
    it depends on this structural surface — the three model delegates and the methods it uses. A
    real `PrismaClient` (with the models from prisma/schema.prisma added) satisfies it. Query-arg
@@ -841,14 +845,30 @@ export class PrismaStateStore implements StateStore {
   }
 
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
-    const orderBy = { createdAt: 'desc' as const }; // newest first — recent runs on top in the dashboard
-    const rows = await this.db.durableWorkflowRun.findMany({
+    // Sort and page over the ids alone, then load those rows. MySQL's filesort carries every selected
+    // column (JSON included) in `sort_buffer_size`, so ordering whole rows fails the entire page with
+    // "Out of sort memory" as soon as one run's input/output/error outgrows that buffer.
+    const page = await this.db.durableWorkflowRun.findMany({
       where: this.runWhere(query),
+      select: { id: true },
       take: query.limit,
       skip: query.offset,
-      orderBy,
+      orderBy: { createdAt: 'desc' }, // newest first — recent runs on top in the dashboard
     });
-    return rows.map(fromRunRow);
+    const ids = page.map((row) => row.id);
+    const byId = new Map<string, RunRow>();
+    for (let at = 0; at < ids.length; at += LIST_RUNS_LOAD_CHUNK) {
+      const chunk = ids.slice(at, at + LIST_RUNS_LOAD_CHUNK);
+      for (const row of await this.db.durableWorkflowRun.findMany({
+        where: { id: { in: chunk } },
+      })) {
+        byId.set(row.id, row);
+      }
+    }
+    return ids.flatMap((id) => {
+      const row = byId.get(id);
+      return row ? [fromRunRow(row)] : [];
+    });
   }
 
   async countRuns(query: Omit<RunQuery, 'limit' | 'offset'>): Promise<number> {

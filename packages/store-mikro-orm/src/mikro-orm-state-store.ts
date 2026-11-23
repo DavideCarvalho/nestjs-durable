@@ -125,6 +125,10 @@ function tableRef(
  */
 const RETENTION_EXCLUDED = [LIFECYCLE_REGISTRY_WORKFLOW];
 
+/** How many run ids `listRuns` loads per `IN (...)`, so an unbounded listing stays under every
+ *  engine's bind-parameter limit. */
+const LIST_RUNS_LOAD_CHUNK = 500;
+
 /** Options for scoping a `MikroOrmStateStore` to a single tenant namespace. */
 export interface MikroOrmStateStoreOptions {
   /**
@@ -796,19 +800,28 @@ export class MikroOrmStateStore implements StateStore {
     //  - attributes: each filter becomes a raw EXISTS against the normalized side-table, so the DB
     //    filters AND paginates — no full scan + in-process filter (ANDed: one EXISTS per filter).
     // Use a QueryBuilder with a fixed root alias `r` so the raw correlations are stable across drivers.
-    if (query.tag || query.tags || query.attributes?.length) {
-      const qb = this.runQueryBuilder(em, query, where).orderBy(orderBy);
-      if (query.limit != null) qb.limit(query.limit);
-      if (query.offset != null) qb.offset(query.offset);
-      const rows = await qb.getResultList();
-      return rows.map(fromRunEntity);
+    //
+    // Sort and page over the ids alone, then load those rows. MySQL's filesort carries every selected
+    // column (JSON included) in `sort_buffer_size`, so ordering whole rows fails the entire page with
+    // "Out of sort memory" as soon as one run's input/output/error outgrows that buffer.
+    const idCol = em.getMetadata().get(WorkflowRunEntity).properties.id?.fieldNames?.[0] ?? 'id';
+    const qb = this.runQueryBuilder(em, query, where)
+      .select([`r.${idCol}`])
+      .orderBy(orderBy);
+    if (query.limit != null) qb.limit(query.limit);
+    if (query.offset != null) qb.offset(query.offset);
+    const ids = (await qb.execute<{ id: string }[]>('all', true)).map((row) => row.id);
+    const byId = new Map<string, WorkflowRunEntity>();
+    for (let at = 0; at < ids.length; at += LIST_RUNS_LOAD_CHUNK) {
+      const chunk = ids.slice(at, at + LIST_RUNS_LOAD_CHUNK);
+      for (const row of await em.find(WorkflowRunEntity, { id: { $in: chunk } })) {
+        byId.set(row.id, row);
+      }
     }
-    const rows = await em.find(WorkflowRunEntity, where, {
-      ...(query.limit != null ? { limit: query.limit } : {}),
-      ...(query.offset != null ? { offset: query.offset } : {}),
-      orderBy,
+    return ids.flatMap((id) => {
+      const row = byId.get(id);
+      return row ? [fromRunEntity(row)] : [];
     });
-    return rows.map(fromRunEntity);
   }
 
   /** A QueryBuilder over `durable_workflow_runs` (root alias `r`) carrying `where` plus the two
